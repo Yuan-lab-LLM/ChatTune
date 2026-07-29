@@ -1,4 +1,4 @@
-![MedFlow ChatTune](docs/assets/medflow-chattune-logo.png)
+![MedFlow ChatTune](docs/assets/medflow-chattune-logo-banner.svg)
 
 # MedFlow ChatTune
 

@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="180" viewBox="0 0 1200 180" fill="none">
+  <defs>
+    <linearGradient id="iconGradient" x1="0" y1="0" x2="98" y2="104" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#4CB8F4"/>
+      <stop offset="0.55" stop-color="#5A9AF0"/>
+      <stop offset="1" stop-color="#7668EA"/>
+    </linearGradient>
+    <linearGradient id="medflowGradient" x1="0" y1="0" x2="230" y2="0" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#45B9F0"/>
+      <stop offset="1" stop-color="#4A91ED"/>
+    </linearGradient>
+    <linearGradient id="chatTuneGradient" x1="0" y1="0" x2="245" y2="0" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#646FEA"/>
+      <stop offset="1" stop-color="#8B5BE8"/>
+    </linearGradient>
+  </defs>
+
+  <g transform="translate(320 34)">
+    <path d="M50 4C23 4 4 22 4 47C4 64 13 77 28 85L20 106L46 92H50C77 92 96 74 96 48C96 22 77 4 50 4Z"
+          fill="white" stroke="url(#iconGradient)" stroke-width="7" stroke-linejoin="round"/>
+    <circle cx="50" cy="48" r="27" fill="#EEF8FF"/>
+    <rect x="43" y="26" width="14" height="44" rx="3" fill="url(#iconGradient)"/>
+    <rect x="28" y="41" width="44" height="14" rx="3" fill="url(#iconGradient)"/>
+
+    <text x="118" y="72"
+          font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif"
+          font-size="53" font-weight="700" letter-spacing="-1.2" fill="url(#medflowGradient)">MedFlow</text>
+    <text x="336" y="72"
+          font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif"
+          font-size="53" font-weight="700" letter-spacing="-1.2" fill="url(#chatTuneGradient)">ChatTune</text>
+  </g>
+</svg>
