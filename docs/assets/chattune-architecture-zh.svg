@@ -1,0 +1,173 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2880" height="1360" viewBox="0 0 1440 680" fill="none" shape-rendering="geometricPrecision">
+  <defs>
+    <linearGradient id="canvas" x1="36" y1="26" x2="1398" y2="654" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FCFDFF"/>
+      <stop offset="0.52" stop-color="#FAFAFF"/>
+      <stop offset="1" stop-color="#F7FCFB"/>
+    </linearGradient>
+    <linearGradient id="orchestrator" x1="310" y1="185" x2="590" y2="435" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F1F0FF"/>
+      <stop offset="1" stop-color="#F8F4FF"/>
+    </linearGradient>
+    <linearGradient id="lifecycle" x1="650" y1="155" x2="1170" y2="465" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#FBFCFF"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="160%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#496487" flood-opacity="0.09"/>
+    </filter>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0L9 4.5L0 9L2.5 4.5L0 0Z" fill="#97A6BA"/>
+    </marker>
+    <marker id="feedbackArrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0L9 4.5L0 9L2.5 4.5L0 0Z" fill="#18A999"/>
+    </marker>
+    <style>
+      text { font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; font-kerning: normal; text-rendering: optimizeLegibility; }
+      .title { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; font-size: 29px; font-weight: 650; fill: #172033; letter-spacing: -0.35px; }
+      .subtitle { font-size: 15px; font-weight: 400; fill: #6D7B91; }
+      .section { font-size: 11.5px; font-weight: 650; letter-spacing: 1.1px; }
+      .heading { font-size: 19px; font-weight: 650; fill: #1F2937; letter-spacing: 0.1px; }
+      .body { font-size: 13px; font-weight: 400; fill: #718096; }
+      .label { font-size: 13px; font-weight: 550; fill: #334155; }
+      .small { font-size: 12px; font-weight: 450; fill: #64748B; }
+      .stage { font-size: 13px; font-weight: 550; fill: #344054; }
+      .number { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; font-size: 12px; font-weight: 650; fill: white; text-anchor: middle; dominant-baseline: central; }
+      .icon { stroke-linecap: round; stroke-linejoin: round; fill: none; stroke-width: 2; }
+    </style>
+  </defs>
+
+  <rect x="1" y="1" width="1438" height="678" rx="26" fill="url(#canvas)" stroke="#DDE5EF" stroke-width="2"/>
+  <circle cx="1328" cy="35" r="92" fill="#7C6DF2" fill-opacity="0.035"/>
+  <circle cx="1383" cy="94" r="58" fill="#13A89E" fill-opacity="0.035"/>
+
+  <text x="48" y="52" class="title">MedFlow ChatTune</text>
+  <text x="48" y="78" class="subtitle">通过自然语言描述目标，由智能体完成数据处理、模型微调、评估、发布与部署。</text>
+
+  <path d="M45 112H1395" stroke="#E7ECF3"/>
+
+  <!-- Main flow: only three arrows -->
+  <path d="M255 310H301" stroke="#97A6BA" stroke-width="2" marker-end="url(#arrow)"/>
+  <path d="M590 310H641" stroke="#97A6BA" stroke-width="2" marker-end="url(#arrow)"/>
+  <path d="M1170 310H1211" stroke="#97A6BA" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- Input -->
+  <g filter="url(#shadow)">
+    <rect x="55" y="205" width="200" height="220" rx="22" fill="#F4F9FF" stroke="#CAE2FA"/>
+    <text x="82" y="238" class="section" fill="#3478C5">自然语言入口</text>
+    <circle cx="155" cy="285" r="35" fill="#E7F2FF"/>
+    <path d="M137 271H173V293H155L145 302V293H137V271Z" class="icon" stroke="#3478C5"/>
+    <circle cx="147" cy="282" r="2" fill="#3478C5"/>
+    <circle cx="155" cy="282" r="2" fill="#3478C5"/>
+    <circle cx="163" cy="282" r="2" fill="#3478C5"/>
+    <text x="155" y="346" text-anchor="middle" class="heading">描述任务目标</text>
+    <text x="155" y="364" text-anchor="middle" class="body">用户 / 管理员</text>
+    <rect x="82" y="376" width="146" height="29" rx="9" fill="#FFFFFF" stroke="#D4E5F7"/>
+    <text x="155" y="395" text-anchor="middle" class="label">MedFlow Studio</text>
+  </g>
+
+  <!-- Orchestrator -->
+  <g filter="url(#shadow)">
+    <rect x="310" y="185" width="280" height="250" rx="24" fill="url(#orchestrator)" stroke="#D6D0FF"/>
+    <text x="338" y="219" class="section" fill="#6B5FDB">CHATTUNE 智能体</text>
+    <circle cx="450" cy="275" r="42" fill="#7C6DF2"/>
+    <circle cx="450" cy="275" r="8" fill="white"/>
+    <circle cx="432" cy="257" r="4" fill="white" fill-opacity="0.9"/>
+    <circle cx="468" cy="257" r="4" fill="white" fill-opacity="0.9"/>
+    <circle cx="432" cy="293" r="4" fill="white" fill-opacity="0.9"/>
+    <circle cx="468" cy="293" r="4" fill="white" fill-opacity="0.9"/>
+    <path d="M444 269L435 260M456 269L465 260M444 281L435 290M456 281L465 290" class="icon" stroke="white"/>
+    <text x="450" y="342" text-anchor="middle" class="heading">理解并编排任务</text>
+    <text x="450" y="365" text-anchor="middle" class="body">澄清意图 · 补齐参数 · 选择工具</text>
+    <g>
+      <rect x="340" y="390" width="64" height="27" rx="8" fill="white" stroke="#DED9FF"/>
+      <rect x="418" y="390" width="64" height="27" rx="8" fill="white" stroke="#DED9FF"/>
+      <rect x="496" y="390" width="64" height="27" rx="8" fill="white" stroke="#DED9FF"/>
+      <text x="372" y="408" text-anchor="middle" class="small">意图</text>
+      <text x="450" y="408" text-anchor="middle" class="small">参数</text>
+      <text x="528" y="408" text-anchor="middle" class="small">工具</text>
+    </g>
+  </g>
+
+  <!-- Lifecycle -->
+  <g filter="url(#shadow)">
+    <rect x="650" y="155" width="520" height="310" rx="24" fill="url(#lifecycle)" stroke="#DCE3ED"/>
+    <text x="680" y="192" class="section" fill="#55657A">模型全生命周期</text>
+    <text x="680" y="222" class="heading">从原始数据到可部署模型</text>
+    <text x="680" y="244" class="body">专业 Agent 执行各阶段，ChatTune 持续维护上下文与状态。</text>
+
+    <path d="M715 302H1105" stroke="#D6DEEA" stroke-width="3"/>
+    <g>
+      <circle cx="715" cy="302" r="22" fill="#E7F2FF" stroke="#BFDDF8"/>
+      <circle cx="812" cy="302" r="22" fill="#F0EEFF" stroke="#D7D1FF"/>
+      <circle cx="910" cy="302" r="22" fill="#FFF3E6" stroke="#F6D8B2"/>
+      <circle cx="1008" cy="302" r="22" fill="#EAF9F6" stroke="#CDEDE7"/>
+      <circle cx="1105" cy="302" r="22" fill="#ECF9EF" stroke="#CAE8D2"/>
+      <circle cx="715" cy="302" r="12" fill="#3478C5"/>
+      <circle cx="812" cy="302" r="12" fill="#6B5FDB"/>
+      <circle cx="910" cy="302" r="12" fill="#D88937"/>
+      <circle cx="1008" cy="302" r="12" fill="#18A999"/>
+      <circle cx="1105" cy="302" r="12" fill="#36A25B"/>
+      <text x="715" y="302" class="number">1</text>
+      <text x="812" y="302" class="number">2</text>
+      <text x="910" y="302" class="number">3</text>
+      <text x="1008" y="302" class="number">4</text>
+      <text x="1105" y="302" class="number">5</text>
+    </g>
+    <text x="715" y="347" text-anchor="middle" class="stage">数据处理</text>
+    <text x="812" y="347" text-anchor="middle" class="stage">模型微调</text>
+    <text x="910" y="347" text-anchor="middle" class="stage">模型评估</text>
+    <text x="1008" y="347" text-anchor="middle" class="stage">模型发布</text>
+    <text x="1105" y="347" text-anchor="middle" class="stage">推理部署</text>
+
+    <g>
+      <rect x="711" y="385" width="72" height="28" rx="9" fill="#F6F7FA" stroke="#E2E7EE"/>
+      <rect x="791" y="385" width="76" height="28" rx="9" fill="#F6F7FA" stroke="#E2E7EE"/>
+      <rect x="875" y="385" width="64" height="28" rx="9" fill="#F6F7FA" stroke="#E2E7EE"/>
+      <rect x="947" y="385" width="68" height="28" rx="9" fill="#F6F7FA" stroke="#E2E7EE"/>
+      <rect x="1023" y="385" width="86" height="28" rx="9" fill="#F6F7FA" stroke="#E2E7EE"/>
+      <text x="747" y="403" text-anchor="middle" class="small">LoRA</text>
+      <text x="829" y="403" text-anchor="middle" class="small">全参 SFT</text>
+      <text x="907" y="403" text-anchor="middle" class="small">DPO</text>
+      <text x="981" y="403" text-anchor="middle" class="small">GRPO</text>
+      <text x="1066" y="403" text-anchor="middle" class="small">Benchmark</text>
+    </g>
+  </g>
+
+  <!-- Outputs -->
+  <g filter="url(#shadow)">
+    <rect x="1220" y="205" width="165" height="220" rx="22" fill="#F2FAF7" stroke="#CDEADF"/>
+    <text x="1247" y="238" class="section" fill="#18816F">闭环产物</text>
+    <circle cx="1302" cy="283" r="34" fill="#E2F6EF"/>
+    <path d="M1285 272H1298L1304 278H1319V297H1285V272Z" class="icon" stroke="#18816F"/>
+    <path d="M1293 285L1299 291L1311 279" class="icon" stroke="#18A999"/>
+    <text x="1302" y="346" text-anchor="middle" class="heading">验证后的资产</text>
+    <text x="1302" y="368" text-anchor="middle" class="body">模型 · 报告</text>
+    <text x="1302" y="388" text-anchor="middle" class="body">Benchmark</text>
+  </g>
+
+  <!-- Feedback -->
+  <path d="M1302 425V487H450V444" stroke="#18A999" stroke-width="1.8" stroke-dasharray="6 6" fill="none" marker-end="url(#feedbackArrow)"/>
+  <rect x="710" y="472" width="330" height="30" rx="15" fill="#F0FAF8" stroke="#CFEDE8"/>
+  <text x="875" y="491" text-anchor="middle" class="small" fill="#168E82">指标与产物回流，驱动下一轮模型迭代</text>
+
+  <!-- Foundation -->
+  <g>
+    <text x="310" y="558" class="section" fill="#64748B">受控运行底座</text>
+    <rect x="310" y="575" width="164" height="44" rx="12" fill="#F5F9FF" stroke="#D9E6F4"/>
+    <rect x="484" y="575" width="164" height="44" rx="12" fill="#F7F6FF" stroke="#E1DDF7"/>
+    <rect x="658" y="575" width="164" height="44" rx="12" fill="#FFF9F2" stroke="#F1E3D2"/>
+    <rect x="832" y="575" width="164" height="44" rx="12" fill="#F2FAF8" stroke="#D5ECE7"/>
+    <rect x="1006" y="575" width="164" height="44" rx="12" fill="#F3FAF5" stroke="#D8EBDD"/>
+    <circle cx="330" cy="597" r="4" fill="#3478C5"/>
+    <circle cx="504" cy="597" r="4" fill="#6B5FDB"/>
+    <circle cx="678" cy="597" r="4" fill="#D88937"/>
+    <circle cx="852" cy="597" r="4" fill="#18A999"/>
+    <circle cx="1026" cy="597" r="4" fill="#36A25B"/>
+    <text x="342" y="601" class="label">Runtime Bridge</text>
+    <text x="516" y="601" class="label">Docker 任务</text>
+    <text x="690" y="601" class="label">GPU 配额</text>
+    <text x="864" y="601" class="label">vLLM 推理服务</text>
+    <text x="1038" y="601" class="label">监控与审计</text>
+  </g>
+</svg>
