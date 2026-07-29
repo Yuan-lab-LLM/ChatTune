@@ -1,0 +1,12 @@
+.as-project-row:hover {
+    background: var(--zinc-100);
+}
+
+.as-project-row:active {
+    background: var(--zinc-200);
+}
+
+.home-stat-card svg,
+.home-stat-card svg path {
+    fill: currentColor;
+}

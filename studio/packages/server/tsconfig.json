@@ -1,0 +1,22 @@
+{
+    "include": ["src/**/*", "../shared/src/**/*"],
+    "exclude": ["node_modules"],
+    "compilerOptions": {
+        "target": "es2016",
+        "experimentalDecorators": true,
+        "emitDecoratorMetadata": true,
+        "module": "commonjs",
+        "moduleResolution": "node10",
+        "baseUrl": ".",
+        "paths": {
+            "@/*": ["./src/*"]
+        },
+        "outDir": "../../dist",
+        "rootDir": "..",
+        "esModuleInterop": true,
+        "forceConsistentCasingInFileNames": true,
+        "strict": true,
+        "strictPropertyInitialization": false,
+        "skipLibCheck": true
+    }
+}

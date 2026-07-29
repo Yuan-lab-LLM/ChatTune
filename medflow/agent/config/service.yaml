@@ -1,0 +1,39 @@
+PORTS:
+  VLLM_OPENAI_PORT: 7111
+  INFERENCE_PORT: 7013
+  UI_PORT: 7860
+  DATA_ANNOTATION_PORT: 7016
+  #VOICE_PORT: 9007
+
+ENV:
+  HOST_IP: 127.0.0.1
+  CUDA_VISIBLE_DEVICES: 4,5,6,7
+  MODEL_NAME: ""
+  MODEL_PATH: /home/workspace/medical_models/
+  START_SCRIPT: ../scripts/start-service.sh
+  #LOG_DIR: ../agent/logs/
+  LOG_DIR: /home/workspace/tests/logs/
+  TEST_DIR: ../test/
+  #BENCHMARK_DIR: ../benchmark/medical
+  #GENERAL_BENCHMARK_DIR: ../benchmark/general
+  BENCHMARK_DIR: /home/workspace/tests/medical
+  GENERAL_BENCHMARK_DIR: /home/workspace/tests/general
+  HUMANEVAL_EXECUTOR: docker
+  HUMANEVAL_DOCKER_IMAGE: qingnang-evaluator:local
+  HUMANEVAL_TIMEOUT: 5
+  HUMANEVAL_MEMORY: 512m
+  HUMANEVAL_CPUS: 1
+  HUMANEVAL_PIDS_LIMIT: 64
+  LCB_EXECUTOR: official_docker
+  LCB_DOCKER_IMAGE: qingnang-evaluator:local
+  LCB_TIMEOUT: 8
+  LCB_NUM_PROCESS: 1
+  LCB_MEMORY: 1g
+  LCB_CPUS: 1
+  LCB_PIDS_LIMIT: 128
+  MASTER_PORT: 50121
+
+RUNTIME:
+  TENSOR_PARALLEL_SIZE: 4
+  GPU_MEMORY_UTILIZATION: 0.8
+  MAX_TOKENS: 4096

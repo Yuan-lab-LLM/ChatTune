@@ -1,0 +1,207 @@
+# Copyright (c) 2025,  IEIT SYSTEMS Co.,Ltd.  All rights reserved
+
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import signal
+import datetime
+import uvicorn
+import argparse
+
+import asyncio
+from fastapi import FastAPI, Query, Body, HTTPException, Depends
+from fastapi.encoders import jsonable_encoder
+from openai import OpenAI, AsyncOpenAI
+from concurrent.futures import ThreadPoolExecutor
+
+from multiprocessing import  freeze_support
+
+from quality.quality_common_ds import QualityAPIRequestInput
+from quality.quality_inspect import QualityInspect
+from quality.quality_modify import QualityModify
+from quality.util import handle_quality
+from fastapi.responses import JSONResponse, StreamingResponse
+
+
+from diagnosis_treatment.client_info_request_handler import ClientInfoRequestHandler
+from diagnosis_treatment.basic_medical_record_request_handler import BasicMedicalRecordRequestHandler
+from diagnosis_treatment.register_diagnosis_request_handler import RegisterDiagnosisRequestHandler
+from diagnosis_treatment.diagnosis_request_handler import DiagnosisRequestHandler
+from diagnosis_treatment.examine_assay_request_handler import ExamineAssayRequestHandler
+from diagnosis_treatment.therapy_scheme_request_handler import TherapySchemeRequestHandler
+from diagnosis_treatment.distribute_request_handler import DistributeRequestHandler
+from diagnosis_treatment.return_visit_request_handler import ReturnVisitRequestHandler
+from diagnosis_treatment.hospital_guide_request_handler import HospitalGuideRequestHandler
+from diagnosis_treatment.doctor_medical_record_request_handler import DoctorMedicalRecordRequestHandler
+from diagnosis_treatment.in_patient_request_handler import InPatientRequestHandler
+from diagnosis_treatment.prompt_factory import *
+from quality.quality_configs import QualityConfigs
+
+from follow_up.hospital_follow_up_data_models import FollowUpAPIRequest,FollowUpAPIResponse
+from follow_up.hospital_follow_up_request_handler import HospitalFollowUpRequestHandler
+
+from common.prompt_config import get_config, load_config
+
+def args_parser():
+    parser = argparse.ArgumentParser(description='Chatbot Interface with Customizable Parameters')
+    parser.add_argument('--model-url', type=str, default='http://localhost:8000/v1', help='Model URL')
+    parser.add_argument('--model', type=str, required=True, help='Model name for the chatbot')
+    parser.add_argument('--database', type=str, default="../data/processed/database", help='Database name')
+    parser.add_argument('--fastbm25', action='store_true', help='If True, enable fastbm25 query.')
+    parser.add_argument('--fastbm25-path', type=str, default="../data/processed/fastbm25", help='fastbm25 data')
+    parser.add_argument('--log', action='store_true', help='If True, save log to ./medical_xxx.log.')
+    parser.add_argument('--max-round', type=int, default=30, help='The maximum number of conversations.')
+    parser.add_argument('--max-tokens', type=int, default=2048, help='Maximum number of tokens to generate per output sequence.')
+    parser.add_argument("--host", type=str, required=True)
+    parser.add_argument("--port", type=int, default=8001)
+    parser.add_argument('--quality', type=str, default="../data/raw/json/quality/quality.json", help='quality data')
+    parser.add_argument('--department-path', type=str, default="../data/raw/json/department/department.json", help='department path')
+    parser.add_argument('--api-key', type=str, default='EMPTY', help='api key')
+    args = parser.parse_args()
+    return args
+
+
+def quality_config_init():
+    g_quality_configs = QualityConfigs(args.quality)
+    g_async_client = AsyncOpenAI(api_key = args.api_key, base_url = args.model_url)
+
+
+app = FastAPI()
+args = args_parser()
+g_quality_configs = QualityConfigs(args.quality)
+g_async_client = AsyncOpenAI(api_key = args.api_key, base_url = args.model_url)
+
+
+def thread_pool_executor(requestv, *receive, **kreceive):
+    loop = asyncio.get_running_loop()
+    def signal_handler():
+            print("Received SIGINT, cancelling tasks...")
+            executor.shutdown(wait=False)
+            loop.stop()
+    # 注册信号处理函数
+    try:
+        loop.add_signal_handler(signal.SIGINT, signal_handler)
+    except NotImplementedError:
+        pass  # Ignore if not implemented. Means this program is running in windows.
+    return loop.run_in_executor(executor, requestv, *receive, **kreceive)
+
+
+async def process_follow_up(request_input, process_method, args, prompt_conf = None):
+    follow_up_obj = HospitalFollowUpRequestHandler(receive=request_input, args=args, prompt_conf=prompt_conf)
+    results = await process_method(follow_up_obj)
+    json_compatible_data = jsonable_encoder(results, exclude_none=True)
+    return JSONResponse(content=json_compatible_data)
+
+
+@app.post("/follow_up/questionnaire")
+async def follow_up_questionnaire(request_input: FollowUpAPIRequest, args=Depends(args_parser)):
+    return await process_follow_up(request_input, lambda obj: obj.process_to_generate_new_questionnaire(), args, get_config())
+
+
+@app.post("/follow_up/chat")
+async def follow_up_questionnaire(request_input: FollowUpAPIRequest, args=Depends(args_parser)):
+    return await process_follow_up(request_input, lambda obj: obj.process_to_generate_chat(), args, get_config())
+
+
+@app.post("/follow_up/report")
+async def follow_up_questionnaire(request_input: FollowUpAPIRequest, args=Depends(args_parser)):
+    return await process_follow_up(request_input, lambda obj: obj.process_to_generate_report(), args, get_config())
+
+
+@app.post("/quality_inspect")
+async def qulity_inspect(
+   input_request_input: QualityAPIRequestInput
+):
+    input_request = input_request_input.input  
+    if input_request.control_quality_config_name is not None:
+        quality_config_real = g_quality_configs.get_quality_config_by_name(input_request.control_quality_config_name)
+        if quality_config_real is None:
+            raise HTTPException(status_code=400, detail=f"config_name {input_request.control_quality_config_name} not found")
+    else:
+        quality_config_real = g_quality_configs.get_default_quality_config()
+    quality_inspect = QualityInspect(input_request, quality_config_real, args.api_key, args.model_url, args.model, async_client=g_async_client)
+    results = await quality_inspect.async_process_queries()
+    json_compatible_data = jsonable_encoder(results, exclude_none = True)
+    return JSONResponse(content=json_compatible_data)    
+
+
+@app.post("/quality_modify")
+async def qulity_modify(
+   input_request_input: QualityAPIRequestInput
+):
+    input_request = input_request_input.input
+    input_chat = input_request_input.chat
+    historical_conversations = None
+
+    if input_chat:
+        historical_conversations = input_chat.historical_conversations
+    quality_modify = QualityModify(input_request, historical_conversations, args.api_key, args.model_url, args.model, async_client=g_async_client, prompt_conf = get_config())
+    #results = await quality_modify.async_process_queries()
+    #json_compatible_data = jsonable_encoder(results, exclude_none = True)
+    #return JSONResponse(content=json_compatible_data)
+
+    async def event_stream():
+        async for chunk in quality_modify.async_process_queries():
+            yield chunk
+
+    return StreamingResponse(event_stream(), media_type="application/json")
+
+
+@app.post("/inference")
+async def request_inference(
+    request_type: str = Query(...),
+    data: dict = Body(...),
+    scheme: str = Query(None),
+    sub_scheme: str = Query(None),
+    enable_think: bool = Query(False),
+):
+    args = args_parser()
+    handler_classes = {
+        "v0": DistributeRequestHandler,
+        "v1": ClientInfoRequestHandler,
+        "v2": BasicMedicalRecordRequestHandler,
+        "v3": RegisterDiagnosisRequestHandler,
+        "v4": DiagnosisRequestHandler,
+        "v5": ExamineAssayRequestHandler,
+        "v6": TherapySchemeRequestHandler,
+        "v7": ReturnVisitRequestHandler,
+        "v8": HospitalGuideRequestHandler,
+        "v9": DoctorMedicalRecordRequestHandler,
+        "inpatient": InPatientRequestHandler
+    }
+    if request_type in handler_classes:
+        handler_class = handler_classes.get(request_type)
+        if handler_class:
+            handler = handler_class(data, args, scheme, sub_scheme,request_type, enable_think)
+            results = await thread_pool_executor(handler.handle_request)
+    else:
+        results = HTTPException(status_code=400, detail="Invalid request_type")
+    return results
+
+#curl_num = 0
+#tmp_engine = None
+executor = ThreadPoolExecutor(200) # max_workers = 1024
+log_name = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
+
+
+@app.on_event("startup")
+async def startup_event():
+    args = args_parser()
+    load_config()
+    quality_config_init()
+
+
+if __name__ == '__main__':
+    freeze_support()
+    args = args_parser()
+    prompt_conf = get_config()
+    uvicorn.run(app="inference:app", host=args.host, port=args.port, timeout_keep_alive=30, workers=32,reload=False)

@@ -1,0 +1,6 @@
+ROLE: both
+HOST: 127.0.0.1
+PORT: 8899
+LLM_URL: http://127.0.0.1:6000/v1
+LLM_MODEL: example-model-name
+LLM_API_KEY: EMPTY

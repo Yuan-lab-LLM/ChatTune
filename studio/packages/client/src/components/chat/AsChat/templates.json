@@ -1,0 +1,662 @@
+{
+  "categories": [
+    {
+      "id": "beginner",
+      "name": "Beginner",
+      "icon": "BookOpen",
+      "templates": [
+        {
+          "id": "beginner-train",
+          "title": "Beginner",
+          "content": "我想用<数据集名称>这个数据训练模型",
+          "description": "beginner-train",
+          "icon": "BookOpen",
+          "keywords": [
+            "beginner",
+            "新手",
+            "训练",
+            "数据集",
+            "模型"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "data",
+      "name": "Data",
+      "icon": "Database",
+      "templates": [
+        {
+          "id": "data-preprocessing",
+          "title": "data-preprocessing",
+          "content": "执行数据预处理操作，数据类型为sft，数据格式为diagnosis",
+          "description": "data-preprocessingDesc",
+          "icon": "Settings",
+          "keywords": [
+            "预处理",
+            "preprocessing",
+            "数据",
+            "data"
+          ]
+        },
+        {
+          "id": "data-advanced-filtering",
+          "title": "data-advanced-filtering",
+          "content": "执行数据高级筛选处理，数据在<数据集路径>",
+          "description": "data-advanced-filteringDesc",
+          "icon": "Filter",
+          "keywords": [
+            "高级筛选",
+            "filtering",
+            "数据",
+            "筛选"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "train",
+      "name": "Training",
+      "icon": "Dumbbell",
+      "templates": [
+        {
+          "id": "lora-train",
+          "title": "lora-train",
+          "content": "运行lora训练，学习率改为0.1，梯度累计数改为16",
+          "description": "lora-trainingDesc",
+          "icon": "Zap",
+          "keywords": [
+            "lora",
+            "训练",
+            "train",
+            "lr",
+            "acc"
+          ]
+        },
+        {
+          "id": "lora-batch-train",
+          "title": "lora-batch-train",
+          "content": "运行lora批量训练",
+          "description": "lora-batch-trainingDesc",
+          "icon": "Layers",
+          "keywords": [
+            "lora",
+            "批量训练",
+            "batch",
+            "train"
+          ]
+        },
+        {
+          "id": "full-param-batch-train",
+          "title": "full-param-batch-train",
+          "content": "执行全参批量训练",
+          "description": "full-param-batch-trainingDesc",
+          "icon": "Database",
+          "keywords": [
+            "全参",
+            "full-param",
+            "批量训练",
+            "batch"
+          ]
+        },
+        {
+          "id": "enhanced-train",
+          "title": "enhanced-train",
+          "content": "运行增强训练，模型位置在<模型路径>，数据集在<数据集路径>，数据集名称是<数据集名称>",
+          "description": "enhanced-trainingDesc",
+          "icon": "Rocket",
+          "keywords": [
+            "增强训练",
+            "enhanced",
+            "模型",
+            "数据集"
+          ]
+        },
+        {
+          "id": "grpo-train",
+          "title": "grpo-train",
+          "content": "启动grpo训练，模型路径是<模型路径>,train_files是<训练文件路径>,val_files是<验证文件路径>，显卡是<GPU编号列表>",
+          "description": "grpo-trainingDesc",
+          "icon": "Activity",
+          "keywords": [
+            "grpo",
+            "GRPO",
+            "训练",
+            "Qwen2.5",
+            "parquet",
+            "CUDA"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "assessment",
+      "name": "Assessment",
+      "icon": "BarChart3",
+      "templates": [
+        {
+          "id": "dual-model-assessment",
+          "title": "dual-model-assessment",
+          "content": "运行双模型评估，第一个模型在<第一个模型路径>，第二个模型在<第二个模型路径>",
+          "description": "dual-model-assessmentDesc",
+          "icon": "GitCompare",
+          "keywords": [
+            "双模型",
+            "dual-model",
+            "评估",
+            "assessment",
+            "对比"
+          ]
+        },
+        {
+          "id": "single-model-assessment",
+          "title": "single-model-assessment",
+          "content": "执行单模型评估，模型路径为<模型路径>",
+          "description": "single-model-assessmentDesc",
+          "icon": "Activity",
+          "keywords": [
+            "单模型",
+            "single-model",
+            "评估",
+            "assessment"
+          ]
+        },
+        {
+          "id": "checkpoint-assessment",
+          "title": "checkpoint-assessment",
+          "content": "执行checkpoint评估，路径为<模型路径>",
+          "description": "checkpoint-assessmentDesc",
+          "icon": "CheckCircle",
+          "keywords": [
+            "checkpoint",
+            "ckpt",
+            "评估",
+            "assessment"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "inference",
+      "name": "Inference",
+      "icon": "Cpu",
+      "templates": [
+        {
+          "id": "view-inference-config",
+          "title": "view-inference-config",
+          "content": "查看推理配置文件",
+          "description": "view-inference-configDesc",
+          "icon": "FileText",
+          "keywords": [
+            "推理",
+            "inference",
+            "配置",
+            "config",
+            "查看"
+          ]
+        },
+        {
+          "id": "list-inference-models",
+          "title": "list-inference-models",
+          "content": "推理可用模型",
+          "description": "list-inference-modelsDesc",
+          "icon": "List",
+          "keywords": [
+            "推理",
+            "inference",
+            "模型",
+            "models",
+            "列表"
+          ]
+        },
+        {
+          "id": "start-inference-service",
+          "title": "start-inference-service",
+          "content": "启动推理服务",
+          "description": "start-inference-serviceDesc",
+          "icon": "Play",
+          "keywords": [
+            "推理",
+            "inference",
+            "服务",
+            "service",
+            "启动"
+          ]
+        },
+        {
+          "id": "stop-inference-service",
+          "title": "stop-inference-service",
+          "content": "关闭推理服务",
+          "description": "stop-inference-serviceDesc",
+          "icon": "Square",
+          "keywords": [
+            "推理",
+            "inference",
+            "服务",
+            "service",
+            "关闭",
+            "停止"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "evaluation",
+      "name": "Evaluation",
+      "icon": "CheckCircle",
+      "templates": [
+        {
+          "id": "view-inference-test-scripts",
+          "title": "view-inference-test-scripts",
+          "content": "查看可用的推理功能测试脚本",
+          "description": "view-inference-test-scriptsDesc",
+          "icon": "FileText",
+          "keywords": [
+            "推理",
+            "inference",
+            "功能测试",
+            "测试",
+            "test",
+            "脚本",
+            "查看",
+            "可用",
+            "评测",
+            "evaluation"
+          ]
+        },
+        {
+          "id": "run-inference-test-scripts",
+          "title": "run-inference-test-scripts",
+          "content": "运行推理功能测试脚本",
+          "description": "run-inference-test-scriptsDesc",
+          "icon": "Play",
+          "keywords": [
+            "推理",
+            "inference",
+            "功能测试",
+            "测试",
+            "test",
+            "脚本",
+            "运行",
+            "执行",
+            "评测",
+            "evaluation"
+          ]
+        },
+        {
+          "id": "view-inference-benchmark-tests",
+          "title": "view-inference-benchmark-tests",
+          "content": "查看可用的推理基准测试",
+          "description": "view-inference-benchmark-testsDesc",
+          "icon": "List",
+          "keywords": [
+            "推理",
+            "inference",
+            "基准测试",
+            "benchmark",
+            "测试",
+            "查看",
+            "可用",
+            "评测",
+            "evaluation"
+          ]
+        },
+        {
+          "id": "run-inference-benchmark-tests",
+          "title": "run-inference-benchmark-tests",
+          "content": "运行推理基准测试",
+          "description": "run-inference-benchmark-testsDesc",
+          "icon": "Play",
+          "keywords": [
+            "推理",
+            "inference",
+            "基准测试",
+            "benchmark",
+            "测试",
+            "运行",
+            "执行",
+            "评测",
+            "evaluation"
+          ]
+        },
+        {
+          "id": "stop-inference-benchmark-tests",
+          "title": "stop-inference-benchmark-tests",
+          "content": "停止推理基准测试",
+          "description": "stop-inference-benchmark-testsDesc",
+          "icon": "Square",
+          "keywords": [
+            "推理",
+            "inference",
+            "基准测试",
+            "benchmark",
+            "测试",
+            "停止",
+            "关闭",
+            "评测",
+            "evaluation"
+          ]
+        },
+        {
+          "id": "view-inference-benchmark-results",
+          "title": "view-inference-benchmark-results",
+          "content": "查看推理基准测试的结果",
+          "description": "view-inference-benchmark-resultsDesc",
+          "icon": "BarChart3",
+          "keywords": [
+            "推理",
+            "inference",
+            "基准测试",
+            "benchmark",
+            "结果",
+            "查看",
+            "评测",
+            "evaluation"
+          ]
+        }
+        
+      ]
+    },
+    {
+      "id": "management",
+      "name": "Management",
+      "icon": "Settings",
+      "templates": [
+        {
+          "id": "mgmt-studio-help",
+          "title": "mgmt-studio-help",
+          "content": "/studio help",
+          "description": "mgmt-studio-helpDesc",
+          "icon": "Settings",
+          "keywords": [
+            "studio",
+            "help",
+            "帮助",
+            "命令"
+          ]
+        },
+        {
+          "id": "mgmt-dataset-view",
+          "title": "mgmt-dataset-view",
+          "content": "/studio datasets view",
+          "description": "mgmt-dataset-viewDesc",
+          "icon": "Database",
+          "keywords": [
+            "数据集",
+            "dataset",
+            "查看",
+            "列表"
+          ]
+        },
+        {
+          "id": "mgmt-dataset-query-list",
+          "title": "mgmt-dataset-query-list",
+          "content": "/studio datasets",
+          "description": "mgmt-dataset-query-listDesc",
+          "icon": "Database",
+          "keywords": [
+            "数据集",
+            "dataset",
+            "查询",
+            "列表"
+          ]
+        },
+        {
+          "id": "mgmt-dataset-refresh",
+          "title": "mgmt-dataset-refresh",
+          "content": "/studio datasets refresh",
+          "description": "mgmt-dataset-refreshDesc",
+          "icon": "Database",
+          "keywords": [
+            "数据集",
+            "dataset",
+            "刷新",
+            "reload"
+          ]
+        },
+        {
+          "id": "mgmt-dataset-download",
+          "title": "mgmt-dataset-download",
+          "content": "/studio datasets download <数据集名称>",
+          "description": "mgmt-dataset-downloadDesc",
+          "icon": "Database",
+          "keywords": [
+            "数据集",
+            "dataset",
+            "下载",
+            "download"
+          ]
+        },
+        {
+          "id": "mgmt-dataset-upload",
+          "title": "mgmt-dataset-upload",
+          "content": "/studio datasets upload",
+          "description": "mgmt-dataset-uploadDesc",
+          "icon": "Database",
+          "keywords": [
+            "数据集",
+            "dataset",
+            "上传",
+            "upload"
+          ]
+        },
+        {
+          "id": "mgmt-model-view",
+          "title": "mgmt-model-view",
+          "content": "/studio models view",
+          "description": "mgmt-model-viewDesc",
+          "icon": "Cpu",
+          "keywords": [
+            "模型",
+            "model",
+            "查看",
+            "列表"
+          ]
+        },
+        {
+          "id": "mgmt-model-query-list",
+          "title": "mgmt-model-query-list",
+          "content": "/studio models",
+          "description": "mgmt-model-query-listDesc",
+          "icon": "Cpu",
+          "keywords": [
+            "模型",
+            "model",
+            "查询",
+            "列表"
+          ]
+        },
+        {
+          "id": "mgmt-model-refresh",
+          "title": "mgmt-model-refresh",
+          "content": "/studio models refresh",
+          "description": "mgmt-model-refreshDesc",
+          "icon": "Cpu",
+          "keywords": [
+            "模型",
+            "model",
+            "刷新",
+            "reload"
+          ]
+        },
+        {
+          "id": "mgmt-eval-view",
+          "title": "mgmt-eval-view",
+          "content": "/studio evaluation view",
+          "description": "mgmt-eval-viewDesc",
+          "icon": "BarChart3",
+          "keywords": [
+            "评测",
+            "evaluation",
+            "查看",
+            "列表"
+          ]
+        },
+        {
+          "id": "mgmt-eval-query-list",
+          "title": "mgmt-eval-query-list",
+          "content": "/studio evaluation",
+          "description": "mgmt-eval-query-listDesc",
+          "icon": "BarChart3",
+          "keywords": [
+            "评测",
+            "evaluation",
+            "查询",
+            "列表"
+          ]
+        },
+        {
+          "id": "mgmt-eval-refresh",
+          "title": "mgmt-eval-refresh",
+          "content": "/studio evaluation refresh",
+          "description": "mgmt-eval-refreshDesc",
+          "icon": "BarChart3",
+          "keywords": [
+            "评测",
+            "evaluation",
+            "刷新",
+            "reload"
+          ]
+        },
+        {
+          "id": "mgmt-eval-download",
+          "title": "mgmt-eval-download",
+          "content": "/studio evaluation download <评测数据集名称>",
+          "description": "mgmt-eval-downloadDesc",
+          "icon": "BarChart3",
+          "keywords": [
+            "评测",
+            "evaluation",
+            "下载",
+            "download"
+          ]
+        },
+        {
+          "id": "mgmt-eval-upload",
+          "title": "mgmt-eval-upload",
+          "content": "/studio evaluation upload",
+          "description": "mgmt-eval-uploadDesc",
+          "icon": "BarChart3",
+          "keywords": [
+            "评测",
+            "evaluation",
+            "上传",
+            "upload"
+          ]
+        },
+        {
+          "id": "mgmt-system-query",
+          "title": "mgmt-system-query",
+          "content": "/studio system",
+          "description": "mgmt-system-queryDesc",
+          "icon": "Monitor",
+          "keywords": [
+            "系统",
+            "system",
+            "查询",
+            "状态"
+          ]
+        },
+        {
+          "id": "mgmt-gpu-status",
+          "title": "mgmt-gpu-status",
+          "content": "/studio gpu",
+          "description": "mgmt-gpu-statusDesc",
+          "icon": "Monitor",
+          "keywords": [
+            "GPU",
+            "显卡",
+            "状态",
+            "信息"
+          ]
+        }
+      ]
+    }
+  ],
+  "examples": [
+    {
+      "id": "example-lora",
+      "content": "运行lora训练，学习率改为0.1，梯度累计数改为16"
+    },
+    {
+      "id": "example-enhanced",
+      "content": "运行增强训练，模型位置在<模型路径>，数据集在<数据集路径>，数据集名称是<数据集名称>"
+    },
+    {
+      "id": "example-dual-eval",
+      "content": "运行双模型评估，第一个模型在<第一个模型路径>，第二个模型在<第二个模型路径>"
+    },
+    {
+      "id": "example-inference",
+      "content": "启动推理服务"
+    },
+    {
+      "id": "example-inference-test-view",
+      "content": "查看可用的推理功能测试脚本"
+    },
+    {
+      "id": "example-inference-test-run",
+      "content": "运行推理功能测试脚本"
+    },
+    {
+      "id": "example-inference-benchmark-view",
+      "content": "查看可用的推理基准测试"
+    },
+    {
+      "id": "example-inference-benchmark-run",
+      "content": "运行推理基准测试"
+    },
+    {
+      "id": "example-inference-benchmark-stop",
+      "content": "停止推理基准测试"
+    },
+    {
+      "id": "example-inference-benchmark-results",
+      "content": "查看推理基准测试的结果"
+    },    
+    {
+      "id": "example-preprocessing",
+      "content": "执行数据预处理操作，数据类型为sft，数据格式为diagnosis"
+    },
+    {
+      "id": "example-filtering",
+      "content": "执行数据高级筛选处理，数据在<数据集路径>"
+    },
+    {
+      "id": "example-dataset-query",
+      "content": "/studio datasets"
+    },
+    {
+      "id": "example-dataset-view",
+      "content": "/studio datasets view"
+    },
+    {
+      "id": "example-dataset-refresh",
+      "content": "/studio datasets refresh"
+    },
+    {
+      "id": "example-model-query",
+      "content": "/studio models"
+    },
+    {
+      "id": "example-model-view",
+      "content": "/studio models view"
+    },
+    {
+      "id": "example-evaluation-query",
+      "content": "/studio evaluation"
+    },
+    {
+      "id": "example-evaluation-view",
+      "content": "/studio evaluation view"
+    },
+    {
+      "id": "example-system-view",
+      "content": "/studio system view"
+    },
+    {
+      "id": "example-gpu-status",
+      "content": "/studio gpu"
+    }
+  ]
+}

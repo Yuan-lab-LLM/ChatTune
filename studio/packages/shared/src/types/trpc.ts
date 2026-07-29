@@ -1,0 +1,523 @@
+import { z } from "zod";
+import { ContentBlocks, ContentType, Status } from "./messageForm";
+import { Usage } from "./usage";
+
+export const RegisterReplyParamsSchema = z.object({
+  runId: z.string(),
+  replyId: z.string(),
+  replyRole: z.string(),
+  replyName: z.string(),
+  createdAt: z.string(),
+});
+export type RegisterReplyParams = z.infer<typeof RegisterReplyParamsSchema>;
+
+/**
+ * Zod schema for table request parameters.
+ * This schema validates the structure of the request parameters used for table-related operations.
+ */
+export const TableRequestParamsSchema = z.object({
+  pagination: z.object({
+    page: z.number().int().min(1),
+    pageSize: z.number().int().min(10),
+  }),
+  sort: z
+    .object({
+      field: z.string(),
+      order: z.enum(["asc", "desc"]),
+    })
+    .optional(),
+  filters: z.record(z.unknown()).optional(),
+});
+export type TableRequestParams = z.infer<typeof TableRequestParamsSchema>;
+
+export const SocketRoomName = {
+  ProjectListRoom: "ProjectListRoom",
+  OverviewRoom: "OverviewRoom",
+};
+
+export const SocketEvents = {
+  python: {
+    requestUserInput: "requestUserInput",
+  },
+  server: {
+    // To client:
+    //  dashboard room
+    pushOverviewData: "pushOverviewData",
+    pushOnlineUsersCount: "pushOnlineUsersCount",
+    forceLogout: "forceLogout",
+    pushSystemOverviewData: "pushSystemOverviewData",
+    pushGPUInfo: "pushGPUInfo",
+    //  projectList room
+    pushProjects: "pushProjects",
+    //  project room
+    pushRunsData: "pushRunsData",
+    //  run room
+    pushRunData: "pushRunData",
+    pushInputRequests: "pushInputRequests",
+    removeInputRequest: "removeInputRequest",
+    clearInputRequests: "clearInputRequests",
+    pushMessages: "pushMessages",
+    pushSpans: "pushSpans",
+    pushModelInvocationData: "pushModelInvocationData",
+    // To python:
+    //  send the user input
+    forwardUserInput: "forwardUserInput",
+    resetAgentContext: "resetAgentContext",
+  },
+  client: {
+    joinOverviewRoom: "joinOverviewRoom",
+    requestSystemOverviewData: "requestSystemOverviewData",
+    requestGPUInfo: "requestGPUInfo",
+    joinProjectListRoom: "joinProjectListRoom",
+    joinProjectRoom: "joinProjectRoom",
+    joinRunRoom: "joinRunRoom",
+    leaveRoom: "leaveRoom",
+    sendUserInputToServer: "sendUserInputToServer",
+    cancelRuntimeResponse: "cancelRuntimeResponse",
+    resetAgentContext: "resetAgentContext",
+    deleteProjects: "deleteProjects",
+    deleteRuns: "deleteRuns",
+  },
+};
+
+export interface InputRequestData {
+  requestId: string;
+  agentId: string;
+  agentName: string;
+  structuredInput: Record<string, unknown> | null;
+}
+
+// 在进入这个run页面的时候得到的数据
+export interface RunData {
+  id: string;
+  project: string;
+  name: string;
+  timestamp: string;
+  run_dir: string;
+  pid: number;
+  status: Status;
+  ownerUserId?: string | null;
+  nodeId?: string | null;
+}
+
+// 在进入project页面的时候获得的数据
+export interface ProjectData {
+  project: string;
+  running: number;
+  pending: number;
+  finished: number;
+  total: number;
+  createdAt: string;
+  [key: string]: unknown;
+}
+
+export interface MessageData {
+  id: string;
+  runId: string;
+  replyId: string;
+  name: string;
+  role: string;
+  content: ContentType;
+  metadata: object;
+  timestamp: string;
+}
+
+export interface Reply {
+  replyId: string;
+  replyName: string;
+  replyRole: string;
+  createdAt: string;
+  finishedAt?: string;
+  messages: Message[];
+}
+
+export interface Message {
+  id: string;
+  name: string;
+  role: string;
+  content: ContentType;
+  timestamp: string;
+  metadata: object;
+}
+
+// 训练指标数据结构
+export interface TrainingMetricsData {
+  step: number;
+  loss: number;
+  timestamp: string;
+}
+
+// 包含训练指标的消息 metadata
+export interface TrainingMetricsMetadata {
+  type: "training_metrics";
+  metrics: TrainingMetricsData;
+}
+
+export interface GPUInfo {
+  nodeId?: string;
+  nodeName?: string;
+  collectedAt?: string;
+  stale?: boolean;
+  ageSeconds?: number | null;
+  maxAgeSeconds?: number;
+  error?: string;
+  available: boolean;
+  name: string;
+  index: number;
+  memoryTotal: number;
+  memoryUsed: number;
+  memoryFree: number;
+  utilization: number;
+  temperature: number;
+  processes: {
+    pid: number;
+    name: string;
+    memoryUsed: number;
+  }[];
+}
+
+export type NodeStatus = "online" | "offline" | "unknown";
+
+export interface ResourceNodeInfo {
+  id: string;
+  name: string;
+  status: NodeStatus;
+  error?: string;
+}
+
+export interface NodeResourceResult<T> {
+  nodeId: string;
+  nodeName: string;
+  status: NodeStatus;
+  collectedAt?: string;
+  data?: T;
+  error?: string;
+}
+
+export interface SystemOverviewData {
+  onlineUsers: number;
+  serverUptime: string;
+  messageStats: {
+    today: number;
+    thisWeek: number;
+    thisMonth: number;
+  };
+  gpuInfo: GPUInfo[];
+}
+
+export interface OverviewData {
+  projectsWeekAgo: number;
+  projectsMonthAgo: number;
+  projectsYearAgo: number;
+  runsWeekAgo: number;
+  runsMonthAgo: number;
+  runsYearAgo: number;
+  modelInvocationsWeekAgo: number;
+  modelInvocationsMonthAgo: number;
+  modelInvocationsYearAgo: number;
+  tokensWeekAgo: number;
+  tokensMonthAgo: number;
+  tokensYearAgo: number;
+
+  totalProjects: number;
+  totalRuns: number;
+  totalModelInvocations: number;
+  totalTokens: number;
+
+  monthlyRuns: string; // JSON string
+
+  recentProjects: {
+    name: string;
+    lastUpdateTime: string;
+    runCount: number;
+  }[];
+}
+
+export interface ModelInvocationForm {
+  id: string;
+  runId: string;
+  modelName: string;
+  timestamp: string;
+  arguments: object;
+  response: object;
+  modelType: string;
+  configName: string;
+  usage: Usage;
+}
+
+export interface TokenStats {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
+
+export interface ModelInvocationData {
+  modelInvocations: number;
+  chat: {
+    modelInvocations: number;
+    avgTokens: TokenStats;
+    totalTokens: TokenStats;
+    modelInvocationsByModel: Array<{
+      modelName: string;
+      invocations: number;
+    }>;
+    avgTokensByModel: Array<{
+      modelName: string;
+      promptTokens: number;
+      completionTokens: number;
+    }>;
+    totalTokensByModel: Array<{
+      modelName: string;
+      promptTokens: number;
+      completionTokens: number;
+    }>;
+  };
+}
+
+export interface ResponseBody<T = unknown> {
+  success: boolean;
+  message: string;
+  data?: T;
+  warning?: string;
+}
+
+export type ManagementBizType =
+  | "dataset"
+  | "model"
+  | "medicalTest"
+  | "evaluationResult";
+
+export type RefreshTriggerType = "manual" | "schedule" | "bootstrap";
+
+export type RefreshJobStatus = "idle" | "running" | "success" | "failed";
+
+export interface ManagementCacheMeta {
+  bizType: ManagementBizType;
+  nodeId: string;
+  nodeName?: string;
+  containerName: string;
+  containerNames?: string[];
+  itemCount: number;
+  updatedAt: string | null;
+  lastRefreshStartedAt: string | null;
+  lastRefreshFinishedAt: string | null;
+  lastRefreshStatus: RefreshJobStatus;
+  isRefreshing: boolean;
+  lastErrorMessage?: string | null;
+}
+
+export interface ManagementCacheResponse<T> {
+  items: T[];
+  meta: ManagementCacheMeta;
+}
+
+export type EnvironmentCheckStatus = "ok" | "warning" | "error";
+
+export interface EnvironmentCheckItem {
+  key: string;
+  title: string;
+  status: EnvironmentCheckStatus;
+  summary: string;
+  details?: string;
+  suggestion?: string;
+  count?: number;
+}
+
+export interface EnvironmentCheckResult {
+  containerName: string;
+  checkedAt: string;
+  overallStatus: EnvironmentCheckStatus;
+  counts: {
+    datasets: number;
+    models: number;
+    medicalTests: number;
+    evaluationResults: number;
+    gpus: number;
+    availableGpus: number;
+  };
+  gpuInfo: GPUInfo[];
+  items: EnvironmentCheckItem[];
+}
+
+export interface TableData<T> {
+  list: T[];
+  total: number;
+  page: number;
+  pageSize: number;
+}
+
+interface Metric {
+  name: string;
+  type: "discrete";
+  enum: (string | number)[];
+}
+
+export interface EvaluationMeta {
+  id: string;
+  benchmark: string;
+  createdAt: string;
+  time: string;
+  repeat: number;
+  dir: string;
+}
+
+export interface EvaluationResult {
+  results: Record<string, Record<string, unknown>>;
+}
+
+export interface DiscreteMetricRes {
+  name: string;
+  type: "category" | "number";
+  value: string | number;
+  enum: (string | number)[];
+  multipleOf?: number;
+}
+
+export interface ContinuousMetricRes {
+  name: string;
+  type: "number";
+  minimum?: number;
+  maximum?: number;
+  multipleOf?: number;
+  exclusiveMinimum?: number;
+  exclusiveMaximum?: number;
+  description?: string;
+}
+
+export interface EvaluationMetaData {
+  id: string;
+  name: string;
+  status: string;
+  progress: number;
+  createdAt: string;
+  time: number;
+  metrics: Metric[];
+  repeat: number;
+  report_dir: string;
+}
+
+export interface Task {
+  id: string;
+  question: string;
+  ground_truth: string;
+  repeat: string;
+  status: Status;
+
+  answers: string | null;
+  result: Record<string, unknown>;
+}
+
+export interface EvaluationData {
+  // Metadata
+  id: string;
+  name: string;
+  status: string;
+  benchmark: string;
+  progress: number;
+  createdAt: string;
+  time: number;
+  metrics: Metric[];
+  repeat: number;
+  report_dir: string;
+  // Data
+  results: Record<string, unknown>;
+}
+
+// Dataset info for dataset management
+export interface DatasetFilePreview {
+  filename: string;
+  preview: string;
+}
+
+export interface DatasetInfo {
+  nodeId?: string;
+  nodeName?: string;
+  containerName?: string;
+  canDelete?: boolean;
+  name: string;
+  type: string;
+  path?: string;
+  description?: string;
+  createdAt?: string;
+  size?: string;
+  files?: string[];
+  filePreviews?: DatasetFilePreview[];
+  sampleContent?: string;
+  fileName?: string;
+}
+
+// Model info for model management
+export interface ModelInfo {
+  nodeId?: string;
+  nodeName?: string;
+  containerName?: string;
+  canDelete?: boolean;
+  name: string;
+  type?: string;
+  path?: string;
+  version?: string;
+  merged?: boolean;
+  checkpoints?: string[];
+  size?: string;
+  description?: string;
+  createdAt?: string;
+}
+
+// Medical test file info for evaluation management
+export interface MedicalTestFile {
+  nodeId?: string;
+  nodeName?: string;
+  containerName?: string;
+  canDelete?: boolean;
+  filename: string;
+  type: string;
+  size: string;
+  description: string;
+  category?: "medical" | "general";
+}
+
+// Evaluation result info for evaluation results
+export interface EvaluationResult {
+  nodeId?: string;
+  nodeName?: string;
+  containerName?: string;
+  canDelete?: boolean;
+  jobId: string;
+  model: string;
+  dataset: string;
+  status: string;
+  accuracy: number;
+  avgF1: number;
+  totalScore?: number;
+  startTime: string;
+  endTime?: string;
+  folderPath: string;
+}
+
+// TracePage trpc schemas
+export const GetTraceListParamsSchema = z.object({
+  serviceName: z.string().optional(),
+  operationName: z.string().optional(),
+  status: z.number().optional(),
+  startTime: z.string().optional(),
+  endTime: z.string().optional(),
+  limit: z.number().optional(),
+  offset: z.number().optional(),
+});
+export type GetTraceListParams = z.infer<typeof GetTraceListParamsSchema>;
+
+export const GetTraceParamsSchema = z.object({
+  traceId: z.string(),
+});
+export type GetTraceParams = z.infer<typeof GetTraceParamsSchema>;
+
+export const GetTraceStatisticParamsSchema = z.object({
+  startTime: z.string().optional(),
+  endTime: z.string().optional(),
+  serviceName: z.string().optional(),
+  operationName: z.string().optional(),
+});
+export type GetTraceStatisticParams = z.infer<
+  typeof GetTraceStatisticParamsSchema
+>;
+

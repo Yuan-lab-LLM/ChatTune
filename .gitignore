@@ -1,0 +1,40 @@
+# Runtime secrets and local environment
+runtime.env
+.env
+*.env.local
+
+# Runtime state
+.runtime/
+*.pid
+*.log
+*.db
+*.sqlite
+*.sqlite3
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+*.egg-info/
+
+# Node and build output
+node_modules/
+dist/
+build/
+
+# Local data, models, and temporary outputs
+data/logs/
+data/sessions/*.pkl
+data/workflows/
+*.pkl
+/models/
+/model/
+/datasets/
+/dataset/
+/outputs/
+.tmp/
+tmp/
+agent/tests/

@@ -1,0 +1,45 @@
+MedFlow Runtime MP
+
+This repository is a monorepo that includes several components with their own
+license files and notices:
+
+- agent/: MedFlow Agent API, orchestration code, resource APIs, and
+  MedFlow-specific AgentScope tool extensions, Apache-2.0. 
+- studio/: Studio web frontend and backend, Apache-2.0. See studio/LICENSE.
+- medflow/: MedFlow inference services, tests, and examples, Apache-2.0. See medflow/LICENSE.
+- agent-studio-runtime-bridge/: bridge service source code, distributed as part of this repository under Apache-2.0 unless a file states otherwise.
+
+Third-party dependencies:
+
+- AgentScope and AgentScope Runtime retain their upstream attribution, notices,
+  and license terms. Install them through the Python dependency declarations in
+  agent/requirements.txt.
+- Vendored or generated code may include third-party code under permissive or
+  file-specific licenses, including MIT, BSD, and MPL notices in source comments
+  or nested LICENSE files. Keep those notices intact when redistributing
+  modified versions.
+
+Datasets and benchmarks:
+
+- docker_scripts/builtin_datasets/evaluation contains dataset loader scripts
+  and local archives for benchmarks such as MMLU, C-Eval, CMMLU, MedQA,
+  MedMCQA, and CMB single.
+- These datasets and benchmark materials are governed by their own upstream
+  homepages, licenses, and terms. They are not automatically licensed under the
+  repository Apache-2.0 license.
+- The bundled loader metadata identifies MMLU as MIT, C-Eval and CMMLU as
+  Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International, and
+  MedQA / CMB single as UNKNOWN. Verify redistribution rights before publishing
+  or using those archives in a release.
+
+Models and external services:
+
+- Model weights, ModelScope resources, OpenAI-compatible LLM services,
+  container images, cloud services, and other external services referenced by
+  README files, documentation, scripts, or examples may have separate license
+  terms and access requirements. Open-sourcing this repository does not grant
+  rights to use or redistribute those external resources.
+
+Model weights, datasets, container images, and external services referenced by
+this repository may have separate license terms and access requirements. They
+are not automatically licensed by this repository unless explicitly stated.

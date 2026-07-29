@@ -1,0 +1,78 @@
+{
+    "name": "@medflow/studio",
+    "workspaces": [
+        "packages/*"
+    ],
+    "overrides": {
+        "@trpc/server": "^11.0.1",
+        "@trpc/client": "^11.0.1",
+        "@trpc/react-query": "^11.0.1"
+    },
+    "version": "1.0.8",
+    "engines": {
+        "node": ">=20.0.0",
+        "npm": ">=10.0.0"
+    },
+    "bin": {
+        "mf_studio": "./bin/cli.js"
+    },
+    "files": [
+        "dist"
+    ],
+    "main": "index.js",
+    "scripts": {
+        "dev:client": "npm run dev --workspace=packages/client",
+        "dev:server": "npm run dev --workspace=packages/server",
+        "dev": "concurrently \"npm run dev:client\" \"npm run dev:server\"",
+        "build": "rm -rf dist && npm run build:client && npm run build:server",
+        "build:client": "npm run build --workspace=packages/client",
+        "build:server": "npm run build --workspace=packages/server",
+        "prepublishOnly": "npm run build",
+        "format": "prettier --write . && eslint . --ext .js,.jsx,.ts,.tsx --fix",
+        "docs:dev": "vitepress dev docs",
+        "docs:build": "vitepress build docs",
+        "docs:preview": "vitepress preview docs"
+    },
+    "devDependencies": {
+        "@eslint/js": "^9.25.0",
+        "@types/figlet": "^1.7.0",
+        "@types/opener": "^1.4.3",
+        "concurrently": "^8.2.2",
+        "eslint": "^9.25.0",
+        "prettier": "^3.5.3",
+        "typescript": "^5.8.3",
+        "typescript-eslint": "^8.30.1",
+        "vitepress": "^2.0.0-alpha.13"
+    },
+    "dependencies": {
+        "@grpc/grpc-js": "^1.14.1",
+        "@opentelemetry/api": "^1.9.0",
+        "@trpc/server": "^11.0.1",
+        "better-sqlite3": "^12.6.0",
+        "cors": "^2.8.5",
+        "express": "^5.1.0",
+        "figlet": "^1.7.0",
+        "find-process": "^1.4.10",
+        "google-protobuf": "^3.21.4",
+        "html2canvas-pro": "^2.0.2",
+        "moment": "^2.30.1",
+        "opener": "^1.5.2",
+        "portfinder": "^1.0.36",
+        "protobufjs": "^7.5.3",
+        "socket.io": "^4.8.1",
+        "strip-ansi": "^7.1.0",
+        "typeorm": "^0.3.21",
+        "ws": "^8.18.1",
+        "zod": "^3.24.2"
+    },
+    "keywords": [
+        "MedFlow",
+        "LLM",
+        "Studio",
+        "Monitor",
+        "Tracing"
+    ],
+    "author": "Dawei Gao",
+    "license": "Apache-2.0",
+    "description": "MedFlow Studio is a powerful local monitoring and visualization tool designed to provide real-time insights into your system's performance and behavior."
+}

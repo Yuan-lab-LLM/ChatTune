@@ -1,0 +1,802 @@
+{
+  "all_department": [
+    {
+      "department_id": "6858ab4e085646ab3207.191121.",
+      "department_name": "精神科心理科门诊",
+      "introduction": "提供心理健康评估、心理咨询、心理治疗及精神疾病的诊断与治疗服务，帮助患者应对心理问题和精神障碍。",
+      "if_child": 0
+    },
+    {
+      "department_id": "f9f07f90284b46ab09dc.1d4b95f96e0746ae4ef4.",
+      "department_name": "中医治未病门诊",
+      "introduction": "通过中医理论和方法，对未病、欲病、已病不同阶段的人群进行健康评估、干预和调理，旨在预防疾病的发生和发展。中医治未病科则侧重于疾病预防和亚健康调理，通过体质辨识、健康调养、中医特色保健等手段，帮助未病但体质偏颇或处于亚健康状态的人群增强体质、防止疾病发生。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae37e47016d46aa2073.101711.",
+      "department_name": "神经内科门诊",
+      "introduction": "神经内科门诊主要负责诊断和治疗神经系统疾病，包括脑、脊髓、周围神经及肌肉的疾病，提供专业的医疗咨询和治疗方案。",
+      "if_child": 0
+    },
+    {
+      "department_id": "702fea9545af46ad047d.4f9d5a7b109946ac42b9.",
+      "department_name": "肿瘤医学中心一区门诊",
+      "introduction": "专注于肿瘤的早期诊断、综合治疗及康复管理，提供个性化治疗方案，致力于提高患者生存质量。",
+      "if_child": 0
+    },
+    {
+      "department_id": "702fea9545af46ad047d.4f9fee5610c946ac42b9.",
+      "department_name": "肿瘤医学中心二区门诊",
+      "introduction": "专注于肿瘤的早期诊断、综合治疗及康复管理，提供个性化治疗方案，致力于提高患者生存质量。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae37e47016d46aa2073.101611.",
+      "department_name": "内分泌科门诊",
+      "introduction": "内分泌科门诊主要负责诊断和治疗内分泌系统疾病，包括激素分泌异常、代谢紊乱等问题，旨在通过专业治疗恢复患者的内分泌平衡。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae697ab002b46ae19dd.112211.",
+      "department_name": "乳腺外科门诊",
+      "introduction": "乳腺外科门诊主要负责乳腺疾病的诊断、治疗及预防，包括乳腺良恶性肿瘤、乳腺炎等疾病的筛查、手术及术后管理。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5aeaa849017646aa2073.dfa991d0215f46ab4553.",
+      "department_name": "中医科门诊",
+      "introduction": "中医科门诊主要负责运用中医理论和方法，进行疾病的诊断、治疗和预防，包括中药治疗、针灸、推拿等传统中医疗法。中医科主要针对已确诊的疾病进行辨证施治，通过中药、针灸、推拿等传统疗法治疗现有病症",
+      "if_child": 0
+    },
+    {
+      "department_id": "685740a5084c46ab3207.141221.",
+      "department_name": "耳鼻喉科门诊",
+      "introduction": "耳鼻喉科门诊主要负责诊断和治疗耳、鼻、喉及相关头颈部位的疾病，包括听力障碍、鼻窦炎、咽喉炎等常见病症。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae37e47016d46aa2073.101311.",
+      "department_name": "消化内科门诊",
+      "introduction": "消化内科门诊主要负责诊断和治疗消化系统疾病，包括食管、胃、肠、肝、胆、胰腺等器官的疾病，提供内镜检查及相关治疗。",
+      "if_child": 0
+    },
+    {
+      "department_id": "702ef2dd44b746ad047d.141312.",
+      "department_name": "口腔科门诊",
+      "introduction": "负责口腔及颌面部疾病的诊断、治疗和预防，包括牙齿、牙周组织、口腔黏膜、舌、唾液腺等疾病的治疗。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae9662c017246aa2073.121211.",
+      "department_name": "产科门诊",
+      "introduction": "产科门诊主要负责孕妇的孕期检查、孕期健康指导、孕期疾病的预防与治疗，以及分娩前的评估和准备，确保母婴健康。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae697ab002b46ae19dd.111411.",
+      "department_name": "男性科门诊",
+      "introduction": "专注于男性生殖系统疾病的诊断、治疗及预防，包括性功能障碍、不育症等男性特有健康问题。",
+      "if_child": 0
+    },
+    {
+      "department_id": "685675a3084946ab3207.141132.",
+      "department_name": "眼科门诊",
+      "introduction": "眼科门诊主要负责诊断和治疗眼部疾病，包括视力检查、眼病诊断、手术治疗及术后随访等，旨在保护和改善患者的视力健康。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae9662c017246aa2073.121111.",
+      "department_name": "妇科一区门诊",
+      "introduction": "妇科门诊主要负责女性生殖系统疾病的诊断、治疗及预防，包括月经不调、妇科炎症、不孕不育等常见妇科问题的诊治。",
+      "if_child": 0
+    },
+    {
+      "department_id": "6856e777084a46ab3207.140111.",
+      "department_name": "皮肤科门诊",
+      "introduction": "皮肤科门诊主要负责诊断和治疗各种皮肤病、性病及皮肤美容问题，包括但不限于皮肤感染、过敏、自身免疫性皮肤病等。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae697ab002b46ae19dd.112011.",
+      "department_name": "甲状腺外科门诊",
+      "introduction": "专注于甲状腺及相关颈部疾病的诊断、手术治疗及术后管理，包括甲状腺肿瘤、甲状腺炎等疾病的治疗。",
+      "if_child": 0
+    },
+    {
+      "department_id": "507cfcf0761b46ae7f31.120111.",
+      "department_name": "营养科门诊",
+      "introduction": "负责评估患者的营养状况，制定个性化的营养治疗方案，指导患者合理膳食，预防和治疗营养相关疾病。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae37e47016d46aa2073.101411.",
+      "department_name": "血液科门诊",
+      "introduction": "血液科门诊主要负责诊断和治疗血液系统疾病，包括贫血、白血病、淋巴瘤等血液相关疾病，提供血液病的预防、诊断、治疗及随访服务。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae37e47016d46aa2073.101211.",
+      "department_name": "呼吸内科二区门诊",
+      "introduction": "呼吸内科门诊主要负责诊断和治疗呼吸系统疾病，包括但不限于感染、炎症、肿瘤等，提供专业的医疗服务和健康咨询。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae697ab002b46ae19dd.11121.",
+      "department_name": "胸外科门诊",
+      "introduction": "胸外科门诊主要负责诊断和治疗心脏、大血管及胸部疾病，包括先天性心脏病、冠心病、心脏瓣膜病、主动脉疾病及胸部肿瘤等。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae697ab002b46ae19dd.111811.",
+      "department_name": "肝胆胰脾、疝外科门诊",
+      "introduction": "专注于肝胆胰脾疾病的诊断与手术治疗，以及疝气的修复手术，提供专业的术前评估和术后康复指导。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae697ab002b46ae19dd.112311.",
+      "department_name": "神经外科门诊",
+      "introduction": "神经外科门诊主要负责诊断和治疗神经系统疾病，包括脑、脊髓及周围神经系统的外科治疗，提供术前评估和术后随访服务。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae697ab002b46ae19dd.111311.",
+      "department_name": "泌尿外科门诊",
+      "introduction": "泌尿外科门诊主要负责诊断和治疗泌尿系统及男性生殖系统的疾病，包括肾脏、输尿管、膀胱、尿道以及男性生殖器官的疾病。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae37e47016d46aa2073.101512.",
+      "department_name": "肾内科门诊",
+      "introduction": "肾内科门诊主要负责肾脏疾病的诊断、治疗及预防，包括急慢性肾炎、肾功能不全、尿路感染等肾脏相关疾病的诊治。主要负责未透析的肾脏病诊断、药物治疗和非透析的管理。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae37e47016d46aa2073.101511.",
+      "department_name": "风湿内科门诊",
+      "introduction": "风湿内科门诊主要负责诊断和治疗风湿性疾病，包括自身免疫性疾病、关节炎、系统性红斑狼疮等，旨在缓解症状、控制疾病进展和提高患者生活质量。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae697ab002b46ae19dd.111511.",
+      "department_name": "骨科门诊（关节）",
+      "introduction": "专注于关节疾病的诊断、治疗及康复，包括关节炎、关节损伤等，提供保守治疗和手术治疗方案。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae697ab002b46ae19dd.111611.",
+      "department_name": "骨科门诊（脊柱）",
+      "introduction": "专注于脊柱相关疾病的诊断、治疗及康复，包括脊柱畸形、脊柱退行性疾病、脊柱创伤等的非手术和手术治疗。",
+      "if_child": 0
+    },
+    {
+      "department_id": "702fea9545af46ad047d.fc97773c7e53663a5f37.",
+      "department_name": "肿瘤医学中心三区门诊",
+      "introduction": "专注于肿瘤的早期诊断、综合治疗及康复管理，提供个性化治疗方案，致力于提高患者生存质量。",
+      "if_child": 0
+    },
+    {
+      "department_id": "1f0f55bc398046ae05d0.101812.",
+      "department_name": "感染科门诊（含肝病）",
+      "introduction": "负责感染性疾病的诊断、治疗及预防，包括但不限于病毒性肝炎、艾滋病、结核病等传染病的诊疗工作。",
+      "if_child": 0
+    },
+    {
+      "department_id": "685990a4085c46ab3207.171121.",
+      "department_name": "康复医学科门诊",
+      "introduction": "康复医学科门诊主要负责评估和治疗因疾病、损伤或手术导致的运动功能障碍，通过物理治疗、作业治疗等手段帮助患者恢复日常生活能力。",
+      "if_child": 0
+    },
+    {
+      "department_id": "cc49cf9b7b4146ad7635.451123.",
+      "department_name": "伤口、造口护理门诊",
+      "introduction": "专注于伤口和造口的专业护理，包括慢性伤口、术后伤口、压疮、糖尿病足等复杂伤口的处理，以及造口术后的护理和指导。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae697ab002b46ae19dd.b1dd166a7b8080814ec9.",
+      "department_name": "骨质疏松康复门诊",
+      "introduction": "专注于骨质疏松症的预防、诊断、治疗及康复，提供个性化康复计划，帮助患者改善骨密度，减少骨折风险。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae697ab002b46ae19dd.f7bbba5c50bd46aa0d09.",
+      "department_name": "骨伤科门诊",
+      "introduction": "骨伤科门诊主要负责诊断和治疗骨骼、关节、肌肉、韧带等运动系统的损伤和疾病，包括骨折、脱位、软组织损伤等。",
+      "if_child": 0
+    },
+    {
+      "department_id": "ea9b1e6a5ab346ac5e15.eaa26c615ac746ac5e15.",
+      "department_name": "肝胆脾胰肿瘤外科门诊",
+      "introduction": "专注于肝胆脾胰系统肿瘤的诊断、手术治疗及综合治疗方案的制定，致力于提高患者生存质量和治疗效果。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae697ab002b46ae19dd.ad9875bb4b7246ad33d6.",
+      "department_name": "肛肠科门诊",
+      "introduction": "肛肠科门诊主要负责诊断和治疗肛门、直肠及结肠的疾病，包括炎症、肿瘤、功能障碍等，提供专业的医疗服务和健康指导。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae697ab002b46ae19dd.ad9d5ce30f6e46ab7b22.",
+      "department_name": "胃肠外科门诊",
+      "introduction": "胃肠外科门诊主要负责胃肠道疾病的诊断、治疗及手术，包括胃、肠、肛门等部位的良恶性疾病。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae9aac3017346aa2073.131112.",
+      "department_name": "儿科门诊",
+      "introduction": "儿科门诊主要负责儿童常见病、多发病的诊治，提供儿童健康咨询、预防接种指导及生长发育评估等服务。",
+      "if_child": 1
+    },
+    {
+      "department_id": "5ae9662c017246aa2073.35b278ed093f46af4fc3.",
+      "department_name": "产科门诊（初次建档）",
+      "introduction": "为孕妇提供初次孕期检查、健康评估、孕期指导及建档服务，确保母婴健康。",
+      "if_child": 0
+    },
+    {
+      "department_id": "cc49cf9b7b4146ad7635.40119.",
+      "department_name": "消化内科护理门诊",
+      "introduction": "提供消化系统疾病的护理服务，包括疾病预防、健康教育、病情监测及康复指导，旨在提高患者生活质量和促进健康恢复。",
+      "if_child": 0
+    },
+    {
+      "department_id": "efc87fb82db680814ec9.efb10381364446ae591f.",
+      "department_name": "全科医学科门诊",
+      "introduction": "提供全面的医疗服务，包括常见病、多发病的初步诊断、治疗及健康管理，为患者提供连续性和综合性的医疗照顾。当出现未明确病因的常见症状、慢性病稳定期随访、健康咨询、长期用药管理或体检指标异常、体检报告解读时，应优先推荐全科医学科。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae697ab002b46ae19dd.4f8c1dd1106f46ac42b9.",
+      "department_name": "甲状腺乳腺外科门诊",
+      "introduction": "专注于甲状腺和乳腺疾病的诊断、治疗及手术，包括良恶性肿瘤的筛查、手术切除及术后管理。",
+      "if_child": 0
+    },
+    {
+      "department_id": "ea9b1e6a5ab346ac5e15.5f36c2ed44f946ae482e.",
+      "department_name": "胃肠肿瘤外科门诊",
+      "introduction": "专注于胃肠道肿瘤的诊断、手术治疗及术后管理，包括胃癌、结直肠癌等恶性肿瘤的综合治疗。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae9aac3017346aa2073.131221.",
+      "department_name": "新生儿科门诊",
+      "introduction": "新生儿科门诊主要负责新生儿的健康检查、疾病预防、常见病和多发病的诊治，以及新生儿生长发育的监测和指导。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae697ab002b46ae19dd.ed173b9c455c46af5350.",
+      "department_name": "血管综合介入门诊",
+      "introduction": "血管综合介入门诊主要负责通过微创介入技术诊断和治疗血管性疾病，包括但不限于动脉硬化、血管畸形等，旨在恢复或改善患者血管功能。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5aeba734017846aa2073.55786ac6009446ac2d33.",
+      "department_name": "血透中心门诊",
+      "introduction": "为肾功能衰竭等需要血液透析治疗的患者提供专业的透析服务，包括透析治疗、病情监测及并发症管理。对于正在进行规律血液透析治疗的患者，其关于透析预约、通路维护、透析中/后不适、透析方案调整等需求，应直接推荐至血透中心。",
+      "if_child": 0
+    },
+    {
+      "department_id": "6db8448b127c46ae3bc3.209131.",
+      "department_name": "核医学门诊",
+      "introduction": "核医学门诊主要负责利用放射性核素进行疾病的诊断、治疗和研究，包括放射性同位素扫描、PET-CT检查及放射性核素治疗等。",
+      "if_child": 0
+    },
+    {
+      "department_id": "1f0f55bc398046ae05d0.101811.",
+      "department_name": "成人发热门诊",
+      "introduction": "成人发热门诊主要负责对成人发热患者进行初步诊断、治疗及病情评估，提供必要的医疗咨询和指导，确保患者得到及时有效的医疗服务。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae9662c017246aa2073.55477e37009146ac2d33.",
+      "department_name": "助产士门诊",
+      "introduction": "提供孕期咨询、产前检查、分娩准备指导及产后恢复建议，帮助孕妇安全度过孕期和分娩过程。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae9aac3017346aa2073.cae024a7233f46ae0f93.",
+      "department_name": "小儿外科门诊 ",
+      "introduction": "专注于诊断和治疗儿童（从新生儿到青少年）的外科疾病，包括先天性和后天性疾病，提供手术治疗和非手术治疗方案。",
+      "if_child": 1
+    },
+    {
+      "department_id": "cc49cf9b7b4146ad7635.451128.",
+      "department_name": "关节骨科护理门诊",
+      "introduction": "专注于关节骨科患者的术后护理、康复指导、疼痛管理及健康教育，旨在促进患者关节功能的恢复和提高生活质量。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae9aac3017346aa2073.6514fc120ef846aa56a6.",
+      "department_name": "儿童保健及生长发育专科门诊",
+      "introduction": "专注于儿童的健康管理、生长发育监测、营养指导及常见生长发育问题的诊断与治疗，旨在促进儿童全面健康发展。",
+      "if_child": 1
+    },
+    {
+      "department_id": "5ae9662c017246aa2073.ea99c665752a46ac7b83.",
+      "department_name": "生殖健康与不孕门诊",
+      "introduction": "专注于生殖系统健康的维护、不孕不育的诊断与治疗，提供生育咨询、辅助生殖技术等服务。",
+      "if_child": 0
+    },
+    {
+      "department_id": "dbe504415d1c46ae50b9.cccf5ce265be46ab323b.",
+      "department_name": "肺部结节门诊",
+      "introduction": "专注于肺部结节的诊断、评估和治疗，提供个性化的医疗方案，旨在早期发现和干预可能的肺部疾病。",
+      "if_child": 0
+    },
+    {
+      "department_id": "cc49cf9b7b4146ad7635.401122.",
+      "department_name": "糖尿病专科护理门诊",
+      "introduction": "提供糖尿病患者的专业护理服务，包括血糖监测、饮食指导、运动建议、胰岛素注射技巧教育和并发症预防等。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5aeba734017846aa2073.201114.",
+      "department_name": "用药咨询门诊(疼痛用药)",
+      "introduction": "提供疼痛相关药物的专业咨询，包括药物选择、剂量调整、副作用管理及用药指导，确保患者安全有效地使用药物。",
+      "if_child": 0
+    },
+    {
+      "department_id": "ea9b1e6a5ab346ac5e15.eaa1298b5abb46ac5e15.",
+      "department_name": "泌尿系肿瘤外科门诊",
+      "introduction": "专注于泌尿系统肿瘤的诊断、手术治疗及综合治疗，包括肾脏、膀胱、前列腺等部位的肿瘤。",
+      "if_child": 0
+    },
+    {
+      "department_id": "1f0f55bc398046ae05d0.09ded36d4ab746ab2abb.",
+      "department_name": "肠道门诊",
+      "introduction": "肠道门诊主要负责诊断和治疗与肠道相关的疾病，包括感染性肠病、炎症性肠病等，提供专业的医疗服务和健康指导。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae37e47016d46aa2073.181311.",
+      "department_name": "综合内科门诊",
+      "introduction": "综合内科门诊主要负责诊断和治疗内科系统的常见病、多发病，提供全面的内科医疗服务，包括疾病的预防、诊断、治疗及健康管理。当症状涉及多系统且难以用单一疾病解释、慢性病出现复杂并发症、或需要多专科协作评估的疑难病例时，应推荐综合内科。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae9662c017246aa2073.4c638e663a6a46cec61e.",
+      "department_name": "温馨产科门诊",
+      "introduction": "温馨产科门诊专注于孕妇的孕期检查、分娩指导及产后恢复，提供全方位的孕产期医疗服务和健康咨询，确保母婴健康。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5aeba734017846aa2073.201113.",
+      "department_name": "用药咨询门诊（抗凝用药）",
+      "introduction": "为患者提供抗凝药物的用药指导，包括药物选择、剂量调整、用药时间及可能的药物相互作用等咨询服务，确保用药安全有效。",
+      "if_child": 0
+    },
+    {
+      "department_id": "cc49cf9b7b4146ad7635.451121.",
+      "department_name": "老年护理门诊",
+      "introduction": "为老年人提供全面的健康评估、疾病预防、慢性病管理和康复护理服务，旨在提高老年人的生活质量和健康水平。",
+      "if_child": 0
+    },
+    {
+      "department_id": "fa7be7cb597346ae72ec.d8736a33586946aa1667.",
+      "department_name": "疼痛（麻醉）门诊",
+      "introduction": "专注于诊断和治疗各种急慢性疼痛症状，提供药物治疗、神经阻滞、物理治疗等综合治疗方案，旨在减轻患者疼痛，提高生活质量。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae697ab002b46ae19dd.112112.",
+      "department_name": "创面修复外科、烧伤整形科门诊",
+      "introduction": "诊治各类急慢性创面、烧伤及整形修复患者，提供创面愈合、瘢痕防治及功能外观重建服务。",
+      "if_child": 0
+    },
+    {
+      "department_id": "702fea9545af46ad047d.4f9d5a7b109946ac42b9.zly1.",
+      "department_name": "肿瘤医学中心一区综合门诊",
+      "introduction": "提供肿瘤的早期筛查、诊断、综合治疗及康复管理，专注于个性化治疗方案的设计与实施。",
+      "if_child": 0
+    },
+    {
+      "department_id": "702fea9545af46ad047d.4f9d5a7b109946ac42b9.zly2.",
+      "department_name": "头颈部肿瘤",
+      "introduction": "头颈部肿瘤科室专注于头颈部肿瘤的诊断、治疗及研究，包括手术、放疗、化疗等多种治疗手段的综合应用，旨在提高患者生存率和生活质量。",
+      "if_child": 0
+    },
+    {
+      "department_id": "702fea9545af46ad047d.4f9fee5610c946ac42b9.zle1.",
+      "department_name": "肿瘤医学中心二区综合门诊",
+      "introduction": "提供肿瘤的早期筛查、诊断、综合治疗及康复管理，专注于个性化治疗方案的设计与实施。",
+      "if_child": 0
+    },
+    {
+      "department_id": "702fea9545af46ad047d.4f9d5a7b109946ac42b9.zly3.",
+      "department_name": "妇科/乳腺肿瘤",
+      "introduction": "专注于女性生殖系统及乳腺疾病的预防、诊断、治疗和研究，特别是乳腺肿瘤的早期筛查和综合治疗。",
+      "if_child": 0
+    },
+    {
+      "department_id": "702fea9545af46ad047d.4f9d5a7b109946ac42b9.zly4.",
+      "department_name": "鼻咽肿瘤",
+      "introduction": "鼻咽肿瘤科室专注于鼻咽部肿瘤的诊断、治疗及研究，包括良性和恶性肿瘤的早期发现、精准治疗及术后康复管理。",
+      "if_child": 0
+    },
+    {
+      "department_id": "702fea9545af46ad047d.4f9d5a7b109946ac42b9.zly5.",
+      "department_name": "恶性黑色素瘤/骨肿瘤",
+      "introduction": "专注于恶性黑色素瘤和骨肿瘤的诊断、治疗及研究，提供个性化治疗方案，包括手术、化疗、放疗及靶向治疗等。",
+      "if_child": 0
+    },
+    {
+      "department_id": "702fea9545af46ad047d.4f9d5a7b109946ac42b9.zly6.",
+      "department_name": "泌尿生殖腺肿瘤",
+      "introduction": "专注于泌尿系统和生殖系统肿瘤的诊断、治疗及研究，包括肾脏、膀胱、前列腺、睾丸和卵巢等部位的肿瘤。",
+      "if_child": 0
+    },
+    {
+      "department_id": "702fea9545af46ad047d.4f9fee5610c946ac42b9.zle2.",
+      "department_name": "肺部肿瘤",
+      "introduction": "专注于肺部肿瘤的诊断、治疗及研究，包括肺癌的早期筛查、综合治疗方案的制定与实施，以及患者的康复管理。",
+      "if_child": 0
+    },
+    {
+      "department_id": "702fea9545af46ad047d.fc97773c7e53663a5f37.zls1.",
+      "department_name": "肿瘤医学中心三区综合门诊",
+      "introduction": "提供肿瘤的早期筛查、诊断、综合治疗及康复管理，专注于个性化治疗方案的设计与实施，旨在提高患者生存质量。",
+      "if_child": 0
+    },
+    {
+      "department_id": "702fea9545af46ad047d.fc97773c7e53663a5f37.zls2.",
+      "department_name": "肝胆道肿瘤",
+      "introduction": "专注于肝胆道系统肿瘤的诊断、治疗及研究，包括肝癌、胆管癌等恶性肿瘤的综合治疗。",
+      "if_child": 0
+    },
+    {
+      "department_id": "702fea9545af46ad047d.fc97773c7e53663a5f37.zls3.",
+      "department_name": "胰腺肿瘤",
+      "introduction": "胰腺肿瘤科室专注于胰腺肿瘤的诊断、治疗及研究，包括良性和恶性肿瘤的早期筛查、手术治疗、化疗、放疗及靶向治疗等综合治疗方案。",
+      "if_child": 0
+    },
+    {
+      "department_id": "702fea9545af46ad047d.fc97773c7e53663a5f37.zls4.",
+      "department_name": "食管肿瘤",
+      "introduction": "食管肿瘤科室专注于食管癌及其他食管相关肿瘤的诊断、治疗与研究，旨在通过综合治疗手段提高患者生存率和生活质量。",
+      "if_child": 0
+    },
+    {
+      "department_id": "702fea9545af46ad047d.fc97773c7e53663a5f37.zls5.",
+      "department_name": "胃肠肿瘤",
+      "introduction": "专注于胃肠道肿瘤的预防、诊断、治疗及研究，包括胃癌、肠癌等恶性肿瘤的综合治疗。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae697ab002b46ae19dd.112311.sjy1.",
+      "department_name": "脑与脊髓肿瘤专科",
+      "introduction": "专注于脑和脊髓肿瘤的诊断、治疗及研究，包括手术切除、放疗、化疗及靶向治疗等综合治疗手段。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae697ab002b46ae19dd.112311.sjy2.",
+      "department_name": "三叉神经痛与面肌抽搐专科",
+      "introduction": "专注于诊断和治疗三叉神经痛、面肌抽搐等面部神经相关疾病，提供药物治疗、手术治疗及康复指导。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae697ab002b46ae19dd.112311.sjy3.",
+      "department_name": "脑血管病专科",
+      "introduction": "专注于脑血管疾病的预防、诊断、治疗及康复，包括脑卒中、脑出血等疾病的综合管理。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae697ab002b46ae19dd.112311.sjy4.",
+      "department_name": "昏迷评估促醒专科",
+      "introduction": "专注于昏迷患者的评估、诊断及促醒治疗，采用多学科协作模式，旨在恢复患者意识状态，提高生活质量。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae37e47016d46aa2073.101711.sjn1.",
+      "department_name": "帕金森专科",
+      "introduction": "专注于帕金森病及其相关运动障碍疾病的诊断、治疗和康复，提供个性化的治疗方案和长期管理策略。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae37e47016d46aa2073.101711.sjn2.",
+      "department_name": "认识障碍专科",
+      "introduction": "专注于诊断、治疗和研究各种认识障碍疾病，包括记忆力减退、思维混乱等症状，旨在提高患者的生活质量。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae37e47016d46aa2073.101711.sjn3.",
+      "department_name": "癫痫专科",
+      "introduction": "癫痫专科主要负责癫痫及相关神经系统疾病的诊断、治疗与管理，包括药物治疗、手术治疗方案的制定及患者长期随访。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae697ab002b46ae19dd.5c1f3dc21c1446ab6a9d.nxg2.",
+      "department_name": "脑血管病介入综合门诊",
+      "introduction": "专注于脑血管疾病的诊断、治疗及预防，采用介入技术进行微创治疗，旨在提高治疗效果和患者生活质量。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae697ab002b46ae19dd.5c1f3dc21c1446ab6a9d.nxg1.",
+      "department_name": "脊髓血管疾病专科",
+      "introduction": "专注于脊髓血管疾病的诊断、治疗及康复，包括血管畸形、缺血性脊髓病等，采用微创手术和药物治疗相结合的方法。",
+      "if_child": 0
+    },
+    {
+      "department_id": "1f0f55bc398046ae05d0.4b94574a256046aa62fa.",
+      "department_name": "爱心门诊",
+      "introduction": "为HIV、乙肝等传染病患者提供规范诊疗、长期随访、心理支持和公共卫生服务，兼顾疾病治疗、健康管理与人文关怀，以改善患者生活质量并减少社会传播风险。专注于HIV、乙肝、丙肝等传染病的长期抗病毒治疗管理和随访",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae697ab002b46ae19dd.112311.sjy5.",
+      "department_name": "神经外科综合门诊",
+      "introduction": "神经外科综合门诊主要负责诊断和治疗神经系统疾病，包括脑、脊髓及周围神经系统的外伤、肿瘤、血管病变等，提供手术及非手术治疗方案。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae37e47016d46aa2073.101711.sjn4.",
+      "department_name": "神经内科综合门诊",
+      "introduction": "神经内科综合门诊主要负责诊断和治疗神经系统疾病，包括脑、脊髓、周围神经及肌肉等疾病，提供专业的医疗服务和健康咨询。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae37e47016d46aa2073.101711.sjn5.",
+      "department_name": "脑血管病专科",
+      "introduction": "专注于脑血管疾病的预防、诊断、治疗及康复，包括脑卒中、脑动脉瘤等疾病的综合管理。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae697ab002b46ae19dd.5c1f3dc21c1446ab6a9d.nxg3.",
+      "department_name": "脑出血专科",
+      "introduction": "专注于脑出血的预防、诊断、治疗及康复，采用先进技术进行微创手术和综合治疗，旨在降低死亡率和致残率。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae697ab002b46ae19dd.5c1f3dc21c1446ab6a9d.nxg4.",
+      "department_name": "脑梗塞专科",
+      "introduction": "专注于脑梗塞的预防、诊断、治疗及康复，致力于减少脑梗塞对患者生活质量的影响。",
+      "if_child": 0
+    },
+    {
+      "department_id": "1f0f55bc398046ae05d0.101812.grk1.",
+      "department_name": "感染综合",
+      "introduction": "负责诊断和治疗由细菌、病毒、真菌等微生物引起的各种感染性疾病，包括传染性和非传染性感染。",
+      "if_child": 0
+    },
+    {
+      "department_id": "1f0f55bc398046ae05d0.101812.grk2.",
+      "department_name": "肝病门诊",
+      "introduction": "肝病门诊主要负责肝脏相关疾病的诊断、治疗及预防，包括肝炎、肝硬化、脂肪肝等肝脏疾病的综合管理。",
+      "if_child": 0
+    },
+    {
+      "department_id": "1f0f55bc398046ae05d0.101812.grk3.",
+      "department_name": "脂肪肝",
+      "introduction": "脂肪肝科室主要负责诊断、治疗和管理脂肪肝相关疾病，包括非酒精性脂肪肝病和酒精性脂肪肝病，旨在通过综合治疗改善患者肝功能和生活质量。",
+      "if_child": 0
+    },
+    {
+      "department_id": "1f0f55bc398046ae05d0.101812.grk4.",
+      "department_name": "乙肝临床治愈",
+      "introduction": "专注于乙肝病毒的临床治疗与研究，旨在通过药物治疗、免疫调节等手段实现乙肝的临床治愈，减少肝硬化和肝癌的风险。",
+      "if_child": 0
+    },
+    {
+      "department_id": "fa7be7cb597346ae72ec.d8736a33586946aa1667.ttk1.",
+      "department_name": "疼痛门诊",
+      "introduction": "疼痛门诊专注于诊断和治疗各种急性和慢性疼痛，提供个性化的疼痛管理方案，旨在减轻患者痛苦，提高生活质量。",
+      "if_child": 0
+    },
+    {
+      "department_id": "fa7be7cb597346ae72ec.d8736a33586946aa1667.ttk2.",
+      "department_name": "麻醉门诊",
+      "introduction": "麻醉门诊主要负责为患者提供麻醉前的评估、咨询和准备，确保手术或检查过程中的安全与舒适，以及术后疼痛管理。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5aeaa849017646aa2073.1547d3fc083d46aa420f.",
+      "department_name": "中医护理门诊",
+      "introduction": "中医护理门诊主要负责运用中医理论和方法，提供个性化的护理服务，包括针灸、拔罐、推拿等传统中医疗法，以促进患者康复和健康管理。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae697ab002b46ae19dd.79359e624d7246ab7a94.",
+      "department_name": "儿童青少年脊柱弯曲异常门诊",
+      "introduction": "专注于诊断和治疗儿童及青少年的脊柱弯曲异常，包括脊柱侧弯、后凸等，提供早期筛查、个性化治疗方案及康复指导。",
+      "if_child": 1
+    },
+    {
+      "department_id": "702ef2dd44b746ad047d.113ebd49790446ae7e39.",
+      "department_name": "口腔正畸科",
+      "introduction": "口腔正畸科主要负责诊断、预防和治疗牙齿排列不齐、咬合异常等口腔颌面部畸形，通过矫正器等方式改善患者的口腔功能和面部美观。",
+      "if_child": 0
+    },
+    {
+      "department_id": "3698c225179e46ce1c4d.3544468630da46ad7fab.",
+      "department_name": "综合内科夜诊（成人）",
+      "introduction": "为成人提供夜间内科疾病的诊断与治疗服务，包括常见病、多发病的紧急处理及慢性病的管理。",
+      "if_child": 0
+    },
+    {
+      "department_id": "507cfcf0761b46ae7f31.120111.yyk1",
+      "department_name": "儿童营养门诊",
+      "introduction": "专注于儿童营养评估、指导与干预，提供个性化营养方案，预防和治疗营养相关疾病，促进儿童健康成长。",
+      "if_child": 1
+    },
+    {
+      "department_id": "507cfcf0761b46ae7f31.120111.yyk2",
+      "department_name": "肥胖门诊",
+      "introduction": "肥胖门诊专门负责诊断、治疗和管理肥胖及相关代谢性疾病，通过个性化治疗方案帮助患者控制体重，改善健康状况。",
+      "if_child": 0
+    },
+    {
+      "department_id": "507cfcf0761b46ae7f31.120111.yyk3",
+      "department_name": "围孕期营养门诊",
+      "introduction": "围孕期营养门诊主要负责为孕前、孕期及产后的女性提供专业的营养评估、指导和干预，以促进母婴健康，预防孕期相关疾病。",
+      "if_child": 0
+    },
+    {
+      "department_id": "507cfcf0761b46ae7f31.120111.yyk4",
+      "department_name": "综合营养门诊",
+      "introduction": "综合营养门诊主要负责评估患者的营养状况，制定个性化的营养治疗方案，预防和治疗营养相关疾病，促进健康生活方式。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae37e47016d46aa2073.75067b1b010c46ae3f2d.",
+      "department_name": "腹膜透析门诊",
+      "introduction": "腹膜透析门诊主要负责为慢性肾衰竭患者提供腹膜透析治疗方案的制定、调整及并发症的预防与处理，以及患者的长期随访和教育。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae9662c017246aa2073.d3818ad612d746ad3e84.",
+      "department_name": "早产专病门诊",
+      "introduction": "专注于早产儿的预防、诊断、治疗及长期随访，提供个性化的医疗方案，以降低早产儿并发症风险，促进其健康成长。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae37e47016d46aa2073.f5d6ca9b299d46ae47a5.",
+      "department_name": "戒烟门诊",
+      "introduction": "提供专业的戒烟咨询、评估和干预服务，帮助吸烟者制定个性化戒烟计划，提供药物和非药物治疗方法，以及戒烟后的跟踪支持。",
+      "if_child": 0
+    },
+    {
+      "department_id": "685990a4085c46ab3207.7ea0f9223b9846aa2bd1.",
+      "department_name": "颈肩腰腿痛康复专科",
+      "introduction": "专注于颈肩腰腿痛的诊断、治疗与康复，采用物理治疗、手法治疗及康复训练等方法，旨在缓解疼痛、恢复功能、提高生活质量。",
+      "if_child": 0
+    },
+    {
+      "department_id": "f9f07f90284b46ab09dc.944fed4906d146ce091d.",
+      "department_name": "中医治未病护理门诊",
+      "introduction": "通过中医理论和方法，对未病、欲病、已病不同阶段的人群进行健康评估、干预和护理，旨在预防疾病的发生和发展。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae9662c017246aa2073.b7430ef9101a46ad7655.",
+      "department_name": "遗传咨询门诊",
+      "introduction": "提供遗传疾病的诊断、风险评估、遗传咨询及家族遗传病的预防指导，帮助患者和家庭理解遗传疾病的影响和应对策略。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae9662c017246aa2073.201112.",
+      "department_name": "用药咨询门诊（孕产妇用药）",
+      "introduction": "为孕产妇提供用药安全咨询，评估药物对胎儿的影响，指导合理用药，确保母婴安全。",
+      "if_child": 0
+    },
+    {
+      "department_id": "702fea9545af46ad047d.04cfcd617b3d46ad06ca.",
+      "department_name": "肿瘤医学中心四区门诊",
+      "introduction": "专注于肿瘤的早期诊断、综合治疗及康复管理，提供个性化治疗方案，致力于提高患者生存质量。",
+      "if_child": 0
+    },
+    {
+      "department_id": "ea9b1e6a5ab346ac5e15.5f38106f461a46ae482e.",
+      "department_name": "脑肿瘤与微创神经外科门诊",
+      "introduction": "专注于脑肿瘤的诊断、治疗及微创神经外科手术，致力于通过先进技术减少手术创伤，提高患者生活质量。",
+      "if_child": 0
+    },
+    {
+      "department_id": "702fea9545af46ad047d.04cfcd617b3d46ad06ca.zlsq1",
+      "department_name": "肿瘤医学中心四区综合门诊",
+      "introduction": "提供肿瘤的早期筛查、诊断、综合治疗及康复管理，专注于个性化治疗方案的设计与实施。",
+      "if_child": 0
+    },
+    {
+      "department_id": "702fea9545af46ad047d.04cfcd617b3d46ad06ca.zlsq2",
+      "department_name": "呼吸系统恶性肿瘤",
+      "introduction": "专注于呼吸系统恶性肿瘤的诊断、治疗及研究，包括肺癌、胸膜间皮瘤等疾病的综合治疗。",
+      "if_child": 0
+    },
+    {
+      "department_id": "702fea9545af46ad047d.04cfcd617b3d46ad06ca.zlsq3",
+      "department_name": "消化系统恶性肿瘤",
+      "introduction": "专注于消化系统恶性肿瘤的预防、诊断、治疗及研究，包括食管癌、胃癌、肝癌、胰腺癌和结直肠癌等。",
+      "if_child": 0
+    },
+    {
+      "department_id": "702fea9545af46ad047d.04cfcd617b3d46ad06ca.zlsq4",
+      "department_name": "泌尿生殖系统恶性肿瘤",
+      "introduction": "专注于泌尿系统和生殖系统恶性肿瘤的诊断、治疗及研究，包括手术、化疗、放疗等综合治疗手段。",
+      "if_child": 0
+    },
+    {
+      "department_id": "702fea9545af46ad047d.04cfcd617b3d46ad06ca.zlsq5",
+      "department_name": "骨与软组织恶性肿瘤",
+      "introduction": "专注于骨与软组织恶性肿瘤的诊断、治疗及研究，包括手术、化疗、放疗等综合治疗方案的制定与实施。",
+      "if_child": 0
+    },
+    {
+      "department_id": "702fea9545af46ad047d.04cfcd617b3d46ad06ca.zlsq6",
+      "department_name": "皮肤恶性肿瘤",
+      "introduction": "专注于皮肤恶性肿瘤的诊断、治疗及预防，包括手术切除、放疗、化疗及靶向治疗等综合治疗手段。",
+      "if_child": 0
+    },
+    {
+      "department_id": "702fea9545af46ad047d.04cfcd617b3d46ad06ca.zlsq7",
+      "department_name": "创新性肿瘤临床研究",
+      "introduction": "专注于肿瘤的临床研究，探索新的治疗方法和技术，以提高肿瘤患者的生存率和生活质量。",
+      "if_child": 0
+    },
+    {
+      "department_id": "685675a3084946ab3207.2ef420a0231546aa639e.",
+      "department_name": "早产儿眼底筛查专科门诊",
+      "introduction": "专注于早产儿视网膜病变（ROP）的筛查、诊断及早期干预，旨在预防和治疗早产儿视网膜疾病，保护视力健康。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae697ab002b46ae19dd.609e5875332746ae0e95.",
+      "department_name": "心脏医学中心外科",
+      "introduction": "专注于心脏及大血管疾病的外科治疗，包括先天性心脏病、冠心病、心脏瓣膜病等的手术治疗，以及心脏移植等高级手术。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae37e47016d46aa2073.601264b112de46ab3a6d.",
+      "department_name": "心脏医学中心内科",
+      "introduction": "专注于心脏疾病的预防、诊断、治疗及康复，提供全面的心血管内科医疗服务。",
+      "if_child": 0
+    },
+    {
+      "department_id": "efc87fb82db680814ec9.a15cf29857e346ae7505.",
+      "department_name": "全科医学科教学门诊",
+      "introduction": "提供全面的初级医疗服务，包括疾病预防、诊断、治疗及健康管理，同时承担医学生的教学任务。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae697ab002b46ae19dd.5c1f3dc21c1446ab6a9d.",
+      "department_name": "脑血管病介入科门诊",
+      "introduction": "专注于通过介入技术诊断和治疗脑血管疾病，包括脑动脉瘤、脑血管畸形等，提供微创治疗方案以减少患者创伤。当患者反复头晕、头痛、一过性黑矇或意识丧失、突发肢体无力、言语不清、颅内动脉瘤、血管畸形等需介入治疗、不明原因晕厥时，应优先推荐脑血管病介入科门诊",
+      "if_child": 0
+    },
+    {
+      "department_id": "702ef2dd44b746ad047d.cc75cc8372bd46ae0e95.",
+      "department_name": "口腔颌面外科门诊",
+      "introduction": "负责口腔、颌面部及颈部疾病的诊断、治疗和手术，包括牙齿拔除、颌面部创伤修复、肿瘤切除等。",
+      "if_child": 0
+    },
+    {
+      "department_id": "5ae9aac3017346aa2073.7a515b7e769046ac0df7.",
+      "department_name": "儿科教学门诊",
+      "introduction": "儿科教学门诊主要负责儿童常见疾病的诊断与治疗，同时承担医学生和住院医师的临床教学与培训任务，旨在提高医疗服务质量与教学水平。",
+      "if_child": 1
+    },
+    {
+      "department_id": "5ae697ab002b46ae19dd.3b9f1d4460b946ac1b1c.",
+      "department_name": "运动损伤医学",
+      "introduction": "专注于预防、诊断、治疗运动或体育锻炼中引起的各种损伤和疾病，帮助患者恢复运动功能。",
+      "if_child": 0
+    },
+    {
+      "department_id": "685675a3084946ab3207.141131.",
+      "department_name": "视光/屈光手术门诊",
+      "introduction": "专注于眼睛屈光不正的诊断、治疗及手术矫正，包括近视、远视、散光等，提供个性化的视力矫正方案。",
+      "if_child": 0
+    },
+    {
+      "department_id": "685675a3084946ab3207.141131.",
+      "department_name": "日间化疗中心",
+      "introduction": "日间化疗中心主要为癌症患者提供日间化疗服务，包括化疗药物的配制、输注及化疗后的观察与护理，旨在减轻患者负担，提高生活质量。对于正在接受规律化疗、内分泌治疗或靶向治疗的肿瘤患者，若涉及化疗/内分泌治疗药物执行、输液通路维护（PICC/输液港）、治疗相关副作用处理（如浮肿、血栓等并发症的初步评估）耐药后方案更换、或既定方案的随访调整，应优先推荐至日间化疗中心",
+      "if_child": 0
+    },
+    {
+      "department_id": "685675a3084946ab3207.141131.",
+      "department_name": "屈光性白内障专科门诊",
+      "introduction": "专注于白内障的诊断、治疗及屈光性白内障手术，旨在通过先进的手术技术改善患者视力，减少对眼镜的依赖。",
+      "if_child": 0
+    }
+  ]
+}

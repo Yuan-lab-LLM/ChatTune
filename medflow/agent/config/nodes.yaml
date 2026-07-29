@@ -1,0 +1,14 @@
+NODES:
+  main:
+    ENABLED: true
+    NAME: main
+    HOST: <worker-a-host>
+    TOOL_URL: http://<worker-a-host>:8899/worker/tool
+    ROLE: worker
+
+  node1:
+    ENABLED: true
+    NAME: node1
+    HOST: <worker-b-host>
+    TOOL_URL: http://<worker-b-host>:8899/worker/tool
+    ROLE: worker
