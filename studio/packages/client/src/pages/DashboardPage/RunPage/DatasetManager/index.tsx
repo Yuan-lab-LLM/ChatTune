@@ -60,6 +60,7 @@ interface Props {
   onDownload?: (dataset: DatasetInfo) => void;
   onDelete?: (dataset: DatasetInfo) => Promise<void>;
   onUseForTraining?: (dataset: DatasetInfo) => void;
+  onUseForPreprocess?: (dataset: DatasetInfo) => void;
   onLoadPreviews?: (dataset: DatasetInfo) => Promise<void>;
   isInputDisabled?: boolean;
   inputDisabledHint?: string;
@@ -85,6 +86,7 @@ const DatasetManager = ({
   onDownload,
   onDelete,
   onUseForTraining,
+  onUseForPreprocess,
   onLoadPreviews,
   isInputDisabled = false,
   inputDisabledHint,
@@ -753,7 +755,9 @@ const DatasetManager = ({
                 const panelKey = `dataset-${index}`;
                 const isExpanded = activePanels.includes(panelKey);
                 const isPreviewLoading = previewLoadingIds.includes(panelKey);
-                const canTrainDirectly = dataset.type !== "raw";
+                const isRawDataset =
+                  (dataset.type || "").toLowerCase() === "raw";
+                const canTrainDirectly = !isRawDataset;
                 const datasetNodeId = dataset.nodeId?.trim();
                 const datasetContainerName = dataset.containerName?.trim();
                 const isOnCurrentRunNode =
@@ -768,9 +772,10 @@ const DatasetManager = ({
                   canTrainDirectly &&
                   isOnCurrentRunNode &&
                   isInCurrentTrainingContainer;
-                if (!canTrainDirectly) {
-                } else if (!canShowTrainAction) {
-                }
+                const canShowPreprocessAction =
+                  isRawDataset &&
+                  isOnCurrentRunNode &&
+                  isInCurrentTrainingContainer;
                 return (
                   <Card
                     key={index}
@@ -891,9 +896,11 @@ const DatasetManager = ({
                       </div>
                     </div>
 
-                    {(canShowTrainAction || !canTrainDirectly) && (
+                    {(canShowTrainAction ||
+                      canShowPreprocessAction ||
+                      isRawDataset) && (
                       <div className="mt-2 border-t border-border/20 pt-2">
-                        {canShowTrainAction ? (
+                        {canShowTrainAction || canShowPreprocessAction ? (
                           <div className="flex items-center justify-end">
                             <Tooltip
                               title={
@@ -910,12 +917,19 @@ const DatasetManager = ({
                                     : "cursor-pointer text-primary hover:text-primary/80"
                                 }`}
                                 onClick={() => {
+                                  if (canShowPreprocessAction) {
+                                    onUseForPreprocess?.(dataset);
+                                    return;
+                                  }
                                   onUseForTraining?.(dataset);
                                 }}
                               >
                                 <span>
-                                  {t("dataset.train.button") ||
-                                    "基于该数据启动训练"}
+                                  {canShowPreprocessAction
+                                    ? t("dataset.preprocess.button") ||
+                                      "Preprocess with this"
+                                    : t("dataset.train.button") ||
+                                      "基于该数据启动训练"}
                                 </span>
                                 <ArrowRight className="h-4 w-4" />
                               </button>

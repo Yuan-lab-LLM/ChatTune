@@ -31,13 +31,13 @@ export class UserGroupTable extends BaseEntity {
     @Column({ type: 'text', nullable: true })
     description?: string | null;
 
-    @Column({ default: 'tianrui_zh' })
+    @Column({ default: 'training_container' })
     defaultContainerName: string;
 
-    @Column({ default: 'seafarer_medical_ai_wxt' })
+    @Column({ default: 'evaluation_container' })
     defaultEvaluateContainerName: string;
 
-    @Column({ default: 'verl_grpo_wg' })
+    @Column({ default: 'grpo_container' })
     defaultGrpoContainerName: string;
 
     @CreateDateColumn({ type: 'datetime' })

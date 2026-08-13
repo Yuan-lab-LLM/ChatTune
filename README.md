@@ -14,6 +14,11 @@ Healthcare-ready out of the box and extensible to general-purpose model training
 
 [简体中文](README_ZH.md) · **English**
 
+## What's New
+
+- [2026-08-13] Inference is now managed through the resource pool, and the base training image was updated with LLaMA-Factory upgraded to 0.9.5.
+- [2026-07-29] Initial release.
+
 ## What is MedFlow ChatTune?
 
 MedFlow ChatTune is an open-source **conversational LLM fine-tuning agent** in the MedFlow product family. Instead of writing complex training scripts, users describe their goals in the web-based Studio and start data processing, fine-tuning, evaluation, publishing, inference deployment, and benchmark tasks through natural language.

@@ -52,7 +52,7 @@ bash runtime.sh init --profile single --iphost <本机IP>
 | `MEDFLOW_LOCAL_EVALUATE_CONTAINER` | 本机实际存在的评测/推理容器名，用于模型评测和推理相关任务。 |
 | `MEDFLOW_LOCAL_GRPO_CONTAINER` | 本机实际存在的 GRPO/verl 容器名，用于 GRPO/verl 训练任务。 |
 | `MODEL_NAME` / `MODEL_API_KEY` / `MODEL_BASE_URL` | Agent 调用的 OpenAI-compatible 模型名、API key 和服务地址。 |
-| `INFERENCE_AGENT_URL` | 在部署手册中启动的推理 Agent controller `/inference_agent` 地址。 |
+| `INFERENCE_AGENT_URL` | 在部署手册中启动的推理 Agent controller `/inference_agent` 地址；页面管理员运维动作使用 Studio 登录态判权，如启用推理 Agent `/admin/*`，应限制为仅可信 Studio Server 可访问。 |
 | `STUDIO_PUBLIC_URL` | 用户浏览器访问 Studio 的地址；跨机器访问时不要保留 `127.0.0.1`。 |
 | `STUDIO_URL` | Runtime/Agent 回调 Studio 后端的地址，默认后端端口为 `3000`；跨机器访问时改成宿主机可达 IP 或域名。 |
 | `MEDFLOW_RESOURCE_NODES` | Studio 资源池节点列表，单机通常包含本机节点的 `id`、`name`、`baseUrl`；`baseUrl` 要指向本机 Agent API。 |

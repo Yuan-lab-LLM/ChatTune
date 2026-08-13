@@ -68,6 +68,7 @@ interface Props {
   onDownload?: (dataset: DatasetInfo) => void;
   onDeleteDataset?: (dataset: DatasetInfo) => Promise<void>;
   onUseDatasetForTraining?: (dataset: DatasetInfo) => void;
+  onUseDatasetForPreprocess?: (dataset: DatasetInfo) => void;
   onLoadDatasetPreviews?: (dataset: DatasetInfo) => Promise<void>;
   isInputDisabled?: boolean;
   inputDisabledHint?: string;
@@ -151,6 +152,7 @@ const ProjectRunSider = ({
   onDownload,
   onDeleteDataset,
   onUseDatasetForTraining,
+  onUseDatasetForPreprocess,
   onLoadDatasetPreviews,
   isInputDisabled,
   inputDisabledHint,
@@ -636,6 +638,7 @@ const ProjectRunSider = ({
                   onDownload={onDownload}
                   onDelete={onDeleteDataset}
                   onUseForTraining={onUseDatasetForTraining}
+                  onUseForPreprocess={onUseDatasetForPreprocess}
                   onLoadPreviews={onLoadDatasetPreviews}
                   isInputDisabled={isInputDisabled}
                   inputDisabledHint={inputDisabledHint}

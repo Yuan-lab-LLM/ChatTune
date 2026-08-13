@@ -13,6 +13,7 @@ import {
     TrainingResourceLockTable,
 } from '../models/TrainingResource';
 import { remoteResourceClient, resourceNodeRegistry } from './resourceNodeService';
+import { ResourceAccessService } from './resourceAccessService';
 
 type NodeGpu = { index: number; available?: boolean; memoryUsed?: number };
 type PoolRuntimeNodeSummary = {
@@ -96,6 +97,8 @@ type TrainingResourceReleaseOptions = {
     force?: boolean;
     reason?: string | null;
     releaseResult?: string;
+    source?: 'admin' | 'runtime' | 'system';
+    actorUserId?: string | null;
 };
 type RuntimeStopProcessResult = {
     reservationId: string;
@@ -108,9 +111,39 @@ type RuntimeStopProcessResult = {
     gpuIdle?: boolean;
     message?: string;
 };
+type InferenceResourceContext = {
+    reservation_id: string;
+    resource_group_id: string;
+    training_pool_id: string;
+    runtime_node_id: string;
+    assigned_gpus: string[];
+    cuda_visible_devices: string;
+    tensor_parallel_size: number;
+    gpus_per_node: number;
+    expires_at: string;
+    nodes: Array<{
+        runtime_node_id: string;
+        assigned_gpus: string[];
+        cuda_visible_devices: string;
+        tensor_parallel_size: number;
+        gpus_per_node: number;
+        is_master: boolean;
+    }>;
+};
 
-const reservationTtlSeconds = () =>
+type RuntimeStopInferenceServiceResult = {
+    reservationId: string;
+    container?: string | null;
+    stopped?: boolean;
+    releaseReady?: boolean;
+    message?: string;
+    inferenceResponse?: unknown;
+};
+
+const trainingReservationTtlSeconds = () =>
     Math.max(60, Number(process.env.MEDFLOW_TRAINING_RESERVATION_TTL_SECONDS || 300));
+const inferenceReservationTtlSeconds = () =>
+    Math.max(300, Number(process.env.MEDFLOW_INFERENCE_RESERVATION_TTL_SECONDS || 86400));
 const resourceLockTtlSeconds = () =>
     Math.max(30, Number(process.env.MEDFLOW_TRAINING_RESOURCE_LOCK_TTL_SECONDS || 300));
 const gpuSnapshotRequestTimeoutMs = () =>
@@ -122,6 +155,38 @@ const activeReservationStatuses = [
     TrainingReservationStatus.RESERVED,
     TrainingReservationStatus.RUNNING,
 ];
+const isInferenceReservation = (reservation: Pick<TrainingReservationTable, 'taskCategory' | 'taskType' | 'taskTypeText'>) => {
+    const category = String(reservation.taskCategory || '').trim().toLowerCase();
+    const type = String(reservation.taskType || reservation.taskTypeText || '').trim().toLowerCase();
+    return category === 'inference' || type === 'inference';
+};
+const reservationTtlSeconds = (reservation?: Pick<TrainingReservationTable, 'taskCategory' | 'taskType' | 'taskTypeText'>) =>
+    reservation && isInferenceReservation(reservation)
+        ? inferenceReservationTtlSeconds()
+        : trainingReservationTtlSeconds();
+const reservationExpiredReason = (reservation: Pick<TrainingReservationTable, 'taskCategory' | 'taskType' | 'taskTypeText'>) =>
+    isInferenceReservation(reservation) ? '推理资源租约已过期' : '训练资源租约已过期';
+const reservationAuditDetails = (reservation: TrainingReservationTable, extra?: Record<string, unknown>) => ({
+    groupId: reservation.groupId,
+    poolId: reservation.poolId,
+    homeNodeId: reservation.homeNodeId,
+    status: reservation.status,
+    taskCategory: reservation.taskCategory || null,
+    taskType: reservation.taskType || reservation.taskTypeText || null,
+    expiresAt: reservation.expiresAt,
+    ...(extra || {}),
+});
+const recordReservationAuditEvent = async (
+    eventType: string,
+    reservation: TrainingReservationTable,
+    actorUserId?: string | null,
+    details?: Record<string, unknown>,
+) => ResourceAccessService.recordAuditEvent(
+    eventType,
+    reservation.id,
+    actorUserId || null,
+    reservationAuditDetails(reservation, details),
+);
 const normalizeAllowedGpuIndexes = (gpuIndexes?: number[]) => {
     if (!gpuIndexes?.length) return null;
     if (gpuIndexes.some((index) => !Number.isInteger(index) || index < 0)) {
@@ -268,20 +333,71 @@ export class TrainingResourceService {
         }
     }
 
+    private static async assignedGpuBusyByNode(reservationId: string) {
+        const reservationNodes = await TrainingReservationNodeTable.find({ where: { reservationId } });
+        const busyByNode: Array<{ nodeId: string; gpuIndexes: number[] }> = [];
+        await Promise.all(reservationNodes.map(async (node) => {
+            if (!node.gpuIndexes.length) return;
+            try {
+                const response = await remoteResourceClient.request<{ data: NodeGpu[] | { gpus?: NodeGpu[] } }>(
+                    node.nodeId,
+                    'gpus/snapshot',
+                    undefined,
+                    undefined,
+                    gpuSnapshotRequestTimeoutMs(),
+                );
+                const gpus = Array.isArray(response.data) ? response.data : response.data?.gpus;
+                if (!Array.isArray(gpus)) return;
+                const snapshotByIndex = new Map(gpus.map((gpu) => [gpu.index, gpu]));
+                const busyGpuIndexes = node.gpuIndexes.filter((index) => {
+                    const gpu = snapshotByIndex.get(index);
+                    return gpu && (
+                        gpu.available === false ||
+                        Number(gpu.memoryUsed || 0) >= gpuBusyMemoryThresholdMb()
+                    );
+                });
+                if (busyGpuIndexes.length) {
+                    busyByNode.push({ nodeId: node.nodeId, gpuIndexes: busyGpuIndexes });
+                }
+            } catch (error) {
+                console.warn(`[TrainingResource] Failed to inspect expired reservation GPUs: ${reservationId}/${node.nodeId}`, error);
+            }
+        }));
+        return busyByNode;
+    }
+
     private static async activeReservations(where: { groupId?: string; poolId?: string }) {
         const candidates = await TrainingReservationTable.find({
             where: { ...where, status: In(activeReservationStatuses) },
         });
         const now = Date.now();
-        const expired = candidates.filter((item) => new Date(item.expiresAt).getTime() <= now);
-        await Promise.all(expired.map(async (item) => {
+        const active: TrainingReservationTable[] = [];
+        await Promise.all(candidates.map(async (item) => {
+            if (new Date(item.expiresAt).getTime() > now) {
+                active.push(item);
+                return;
+            }
+            const busyByNode = await this.assignedGpuBusyByNode(item.id);
+            if (busyByNode.length) {
+                const busyDetails = busyByNode.map((node) => `${node.nodeId}[${node.gpuIndexes.join(',')}]`).join(' · ');
+                item.errorMessage = `${reservationExpiredReason(item)}，但已分配 GPU 仍有占用：${busyDetails}`;
+                item.expiredReason = item.errorMessage;
+                await item.save();
+                active.push(item);
+                return;
+            }
+            const reason = reservationExpiredReason(item);
             item.status = TrainingReservationStatus.FAILED;
-            item.errorMessage = '训练资源租约已过期';
-            item.expiredReason = '训练资源租约已过期';
+            item.errorMessage = reason;
+            item.expiredReason = reason;
             await item.save();
             await this.releaseReservationNodes(item.id);
+            await recordReservationAuditEvent('training_reservation_expired', item, null, {
+                reason,
+                releasedGpuAllocation: true,
+            });
         }));
-        return candidates.filter((item) => new Date(item.expiresAt).getTime() > now);
+        return active;
     }
 
     private static async assertNoActiveReservations(where: { groupId?: string; poolId?: string }) {
@@ -446,12 +562,20 @@ export class TrainingResourceService {
         ]);
         const groupNames = new Map(groups.map((group) => [group.id, group.name]));
         const poolNames = new Map(pools.map((pool) => [pool.id, pool.name]));
-        return reservations.map((reservation) => ({
-            ...reservation,
-            groupName: groupNames.get(reservation.groupId) || reservation.groupId,
-            poolName: poolNames.get(reservation.poolId) || reservation.poolId,
-            nodes: reservationNodes.filter((node) => node.reservationId === reservation.id),
-        }));
+        return reservations.map((reservation) => {
+            const isEnded = [
+                TrainingReservationStatus.RELEASED,
+                TrainingReservationStatus.FAILED,
+            ].includes(reservation.status);
+            return {
+                ...reservation,
+                groupName: groupNames.get(reservation.groupId) || reservation.groupId,
+                poolName: poolNames.get(reservation.poolId) || reservation.poolId,
+                nodes: reservationNodes.filter((node) => node.reservationId === reservation.id),
+                endedAt: reservation.releasedAt || (isEnded ? reservation.updatedAt?.toISOString?.() || String(reservation.updatedAt) : null),
+                endReason: reservation.expiredReason || reservation.errorMessage || reservation.releaseResult || null,
+            };
+        });
     }
 
     static async upsertPool(input: { id?: string; name: string; description?: string }) {
@@ -909,13 +1033,17 @@ export class TrainingResourceService {
             taskCategory: input.taskCategory?.trim() || null,
             taskType: input.taskType?.trim() || null,
             taskTypeText: input.taskTypeText?.trim() || null,
-            expiresAt: new Date(Date.now() + reservationTtlSeconds() * 1000).toISOString(),
+            expiresAt: new Date(Date.now() + reservationTtlSeconds(input) * 1000).toISOString(),
             errorMessage: null,
             expiredReason: null,
             lastRenewedAt: null,
             releaseResult: null,
             releasedAt: null,
         }).save();
+        await recordReservationAuditEvent('training_reservation_created', reservation, requestedByUserId, {
+            requestedNodeCount: input.nodeCount,
+            gpusPerNode: input.gpusPerNode,
+        });
 
         const allocationNodes: AllocationNode[] = selectedCandidates.map(({ node, gpuIndexes }) => ({
             nodeId: node.nodeId,
@@ -971,7 +1099,11 @@ export class TrainingResourceService {
         if (user.role !== UserRole.ADMIN && reservation.requestedByUserId !== user.id) {
             throw new Error('无权释放其他用户的训练预约');
         }
-        return this.releaseReservation(reservation, options);
+        return this.releaseReservation(reservation, {
+            ...options,
+            source: options.source || 'admin',
+            actorUserId: options.actorUserId ?? user.id,
+        });
     }
 
     static async stopProcessAndRelease(user: SafeAuthUser, reservationId: string) {
@@ -982,6 +1114,9 @@ export class TrainingResourceService {
         }
         if (!activeReservationStatuses.includes(reservation.status)) {
             throw new Error('当前训练预约状态不允许停止进程并释放');
+        }
+        if (isInferenceReservation(reservation)) {
+            return this.stopInferenceServiceAndRelease(reservation, user);
         }
         const stopResponse = await remoteResourceClient.request<{ data: RuntimeStopProcessResult }>(
             reservation.homeNodeId,
@@ -1003,6 +1138,65 @@ export class TrainingResourceService {
         const released = await this.releaseReservation(reservation, {
             reason: '管理员停止进程并释放预约',
             releaseResult: 'stopped_and_released',
+            source: 'admin',
+            actorUserId: user.id,
+        });
+        return { reservation: released, stopResult };
+    }
+
+    private static async inferenceResourceContext(reservation: TrainingReservationTable): Promise<InferenceResourceContext> {
+        const reservationNodes = await TrainingReservationNodeTable.find({ where: { reservationId: reservation.id } });
+        if (!reservationNodes.length) {
+            throw new Error('推理预约缺少资源节点分配，无法停止推理服务');
+        }
+        const masterNode = reservationNodes.find((node) => node.isMaster) || reservationNodes[0];
+        const assignedGpus = masterNode.gpuIndexes.map((index) => String(index));
+        const nodes = reservationNodes.map((node) => {
+            const nodeGpus = node.gpuIndexes.map((index) => String(index));
+            return {
+                runtime_node_id: node.nodeId,
+                assigned_gpus: nodeGpus,
+                cuda_visible_devices: nodeGpus.join(','),
+                tensor_parallel_size: nodeGpus.length,
+                gpus_per_node: reservation.gpusPerNode,
+                is_master: node.isMaster,
+            };
+        });
+        return {
+            reservation_id: reservation.id,
+            resource_group_id: reservation.groupId,
+            training_pool_id: reservation.poolId,
+            runtime_node_id: masterNode.nodeId,
+            assigned_gpus: assignedGpus,
+            cuda_visible_devices: assignedGpus.join(','),
+            tensor_parallel_size: assignedGpus.length,
+            gpus_per_node: reservation.gpusPerNode,
+            expires_at: reservation.expiresAt,
+            nodes,
+        };
+    }
+
+    private static async stopInferenceServiceAndRelease(reservation: TrainingReservationTable, user: SafeAuthUser) {
+        const resourceContext = await this.inferenceResourceContext(reservation);
+        const stopResponse = await remoteResourceClient.request<{ data: RuntimeStopInferenceServiceResult }>(
+            reservation.homeNodeId,
+            'inference-reservations/stop-service',
+            {
+                method: 'POST',
+                body: JSON.stringify({ reservationId: reservation.id, resourceContext }),
+            },
+            undefined,
+            Math.max(1000, Number(process.env.MEDFLOW_RESOURCE_STOP_PROCESS_TIMEOUT_MS || 60000)),
+        );
+        const stopResult = stopResponse.data;
+        if (!stopResult || stopResult.stopped !== true || stopResult.releaseReady === false) {
+            throw new Error(stopResult?.message || 'Runtime 未确认推理服务已停止');
+        }
+        const released = await this.releaseReservation(reservation, {
+            reason: '管理员停止推理服务并释放预约',
+            releaseResult: 'stopped_and_released',
+            source: 'admin',
+            actorUserId: user.id,
         });
         return { reservation: released, stopResult };
     }
@@ -1013,7 +1207,12 @@ export class TrainingResourceService {
         if (reservation.homeNodeId !== runtimeNodeId) {
             throw new Error('当前 Runtime 无权释放该训练预约');
         }
-        return this.releaseReservation(reservation);
+
+        return this.releaseReservation(reservation, {
+            reason: 'Runtime 主动释放预约',
+            source: 'runtime',
+            releaseResult: 'success',
+        });
     }
 
     private static async releaseReservation(
@@ -1048,6 +1247,20 @@ export class TrainingResourceService {
             reservation.expiredReason = options.reason.trim();
         }
         await reservation.save();
+        const eventType = failures.length
+            ? 'training_reservation_release_failed'
+            : reservation.releaseResult === 'stopped_and_released'
+                ? 'training_reservation_stopped_and_released'
+                : reservation.releaseResult === 'force_released'
+                    ? 'training_reservation_force_released'
+                    : 'training_reservation_released';
+        await recordReservationAuditEvent(eventType, reservation, options.actorUserId || null, {
+            source: options.source || (options.force ? 'admin' : 'runtime'),
+            releaseResult: reservation.releaseResult,
+            releasedAt,
+            reason: reservation.expiredReason || reservation.errorMessage || null,
+            failures,
+        });
         return reservation;
     }
 
@@ -1076,11 +1289,20 @@ export class TrainingResourceService {
             throw new Error('当前训练预约状态不允许续期');
         }
         const now = new Date().toISOString();
-        const expiresAt = new Date(Date.now() + reservationTtlSeconds() * 1000).toISOString();
+        const previousExpiresAt = reservation.expiresAt;
+        const expiresAt = new Date(Date.now() + reservationTtlSeconds(reservation) * 1000).toISOString();
         reservation.status = TrainingReservationStatus.RUNNING;
         reservation.expiresAt = expiresAt;
         reservation.lastRenewedAt = now;
         await reservation.save();
+        await recordReservationAuditEvent('training_reservation_renewed', reservation, null, {
+            runtimeNodeId,
+            renewedAt: now,
+            previousExpiresAt,
+            expiresAt,
+        });
         return reservation;
     }
 }
+
+

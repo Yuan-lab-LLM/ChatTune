@@ -24,6 +24,13 @@ type BridgeChatRequest = {
   grpo_container?: string;
   resource_group_id?: string;
   training_pool_id?: string;
+  user_role?: string;
+  ownerUserId?: string;
+  owner_user_id?: string;
+  ownerAliases?: string[];
+  owner_aliases?: string[];
+  contextUsername?: string;
+  context_username?: string;
   input?: RuntimeMessage[];
 };
 
@@ -119,6 +126,19 @@ function backendAt(index: number, routeKey: string): SelectedBackend {
 
 function toRuntimeRequest(body: BridgeChatRequest) {
   const { userId, sessionId } = getRequestIdentity(body);
+  const ownerUserId = String(body.owner_user_id || body.ownerUserId || "").trim();
+  const ownerAliases = Array.isArray(body.owner_aliases)
+    ? body.owner_aliases
+    : Array.isArray(body.ownerAliases)
+      ? body.ownerAliases
+      : [];
+  const ownerAliasesText = ownerAliases
+    .map((value) => String(value || "").trim())
+    .filter(Boolean)
+    .join(",");
+  const contextUsername = String(
+    body.context_username || body.contextUsername || "",
+  ).trim();
   const input =
     body.input && body.input.length > 0
       ? body.input
@@ -135,14 +155,14 @@ function toRuntimeRequest(body: BridgeChatRequest) {
           },
         ];
   const runtimeContextMessage: RuntimeMessage | null =
-    body.training_container || body.evaluation_container || body.grpo_container || body.resource_group_id || body.training_pool_id
+    body.training_container || body.evaluation_container || body.grpo_container || body.resource_group_id || body.training_pool_id || body.user_role || ownerUserId || ownerAliasesText || contextUsername
       ? {
           role: "system",
           type: "message",
           content: [
             {
               type: "text",
-              text: `${RUNTIME_CONTEXT_MARKER} training_container=${body.training_container || ""} evaluation_container=${body.evaluation_container || ""} grpo_container=${body.grpo_container || ""} resource_group_id=${body.resource_group_id || ""} training_pool_id=${body.training_pool_id || ""}`,
+              text: `${RUNTIME_CONTEXT_MARKER} training_container=${body.training_container || ""} evaluation_container=${body.evaluation_container || ""} grpo_container=${body.grpo_container || ""} resource_group_id=${body.resource_group_id || ""} training_pool_id=${body.training_pool_id || ""} user_role=${body.user_role || ""} owner_user_id=${ownerUserId} owner_aliases=${ownerAliasesText} context_username=${contextUsername}`,
             },
           ],
         }
@@ -160,6 +180,10 @@ function toRuntimeRequest(body: BridgeChatRequest) {
     grpo_container: body.grpo_container,
     resource_group_id: body.resource_group_id,
     training_pool_id: body.training_pool_id,
+    user_role: body.user_role,
+    owner_user_id: ownerUserId,
+    owner_aliases: ownerAliases,
+    context_username: contextUsername,
     input: requestInput,
   };
   return runtimeRequest;

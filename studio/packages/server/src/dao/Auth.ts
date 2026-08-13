@@ -32,7 +32,13 @@ export interface SafeAuthUser {
     } | null;
 }
 
-const SESSION_DAYS = 7;
+const SESSION_DAYS = Math.max(
+    1,
+    Number(process.env.MEDFLOW_SESSION_DAYS || 7) || 7,
+);
+const SESSION_MAX_AGE_SECONDS = Math.floor(SESSION_DAYS * 24 * 60 * 60);
+const sessionExpiresAt = (fromMs = Date.now()) =>
+    new Date(fromMs + SESSION_MAX_AGE_SECONDS * 1000).toISOString();
 const ONLINE_WINDOW_MS = 90_000;
 const LAST_SEEN_WRITE_INTERVAL_MS = 15_000;
 const LOGIN_FAILURE_WINDOW_MS = Number(
@@ -71,6 +77,10 @@ export class AuthUserDisabledError extends Error {
 }
 
 export class AuthDao {
+    static sessionMaxAgeSeconds() {
+        return SESSION_MAX_AGE_SECONDS;
+    }
+
     private static loginFailureKey(username: string) {
         return username.trim().toLowerCase();
     }
@@ -236,14 +246,13 @@ export class AuthDao {
         await this.clearLoginFailures(username);
 
         const now = new Date();
-        const expiresAt = new Date(now);
-        expiresAt.setDate(expiresAt.getDate() + SESSION_DAYS);
+        const expiresAt = sessionExpiresAt(now.getTime());
 
         const session = AuthSessionTable.create({
             token: crypto.randomBytes(32).toString('hex'),
             userId: user.id,
             createdAt: now.toISOString(),
-            expiresAt: expiresAt.toISOString(),
+            expiresAt,
             lastSeenAt: now.toISOString(),
         });
         await session.save();
@@ -270,11 +279,13 @@ export class AuthDao {
             return null;
         }
 
+        const nowMs = Date.now();
         const lastSeenAt = session.lastSeenAt
             ? new Date(session.lastSeenAt).getTime()
             : 0;
-        if (Date.now() - lastSeenAt >= LAST_SEEN_WRITE_INTERVAL_MS) {
-            session.lastSeenAt = new Date().toISOString();
+        if (nowMs - lastSeenAt >= LAST_SEEN_WRITE_INTERVAL_MS) {
+            session.lastSeenAt = new Date(nowMs).toISOString();
+            session.expiresAt = sessionExpiresAt(nowMs);
             await session.save();
         }
 

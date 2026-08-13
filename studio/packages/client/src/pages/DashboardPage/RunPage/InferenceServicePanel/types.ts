@@ -10,16 +10,19 @@ export interface InferenceConfig {
     HOST_IP?: string;
     CUDA_VISIBLE_DEVICES?: string;
     MODEL_NAME?: string;
+    MODEL_PARAM_B?: string;
     MODEL_PATH?: string;
     START_SCRIPT?: string;
     LOG_DIR?: string;
     TEST_DIR?: string;
     BENCHMARK_DIR?: string;
     GENERAL_BENCHMARK_DIR?: string;
+    MASTER_PORT?: number;
   };
   runtime: {
     TENSOR_PARALLEL_SIZE?: number;
     GPU_MEMORY_UTILIZATION?: number;
+    GPU_UTILIZATION_THRESHOLD?: number;
     MAX_TOKENS?: number;
   };
 }
@@ -28,7 +31,21 @@ export interface InferenceConfig {
 export interface ServiceStatus {
   name: string;
   port: number;
-  status: 'running' | 'stopped';
+  status: 'running' | 'stopped' | 'starting' | 'failed' | 'degraded';
   rawStatus?: string;
   description?: string;
+  serviceKey?: string;
+  displayName?: string;
+  instanceId?: string;
+  node?: string;
+  gpus?: string[];
+  model?: string;
+  ports?: Record<string, number | string>;
+  reservationId?: string;
+  ownerUserId?: string;
+  startedAt?: string;
+  logDir?: string;
+  isInstance?: boolean;
+  isPortStatus?: boolean;
 }
+

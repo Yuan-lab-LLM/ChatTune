@@ -49,7 +49,7 @@ bash runtime.sh init --profile center --nodes node-b=http://<worker-b-host>:8099
 | `MEDFLOW_LOCAL_EVALUATE_CONTAINER` | 中心本机实际存在的评测/推理容器名，用于中心本机 Agent 的模型评测和推理相关任务。 |
 | `MEDFLOW_LOCAL_GRPO_CONTAINER` | 中心本机实际存在的 GRPO/verl 容器名，用于中心本机 Agent 的 GRPO/verl 训练任务。 |
 | `MODEL_NAME` / `MODEL_API_KEY` / `MODEL_BASE_URL` | 中心本机 Agent 调用的 OpenAI-compatible 模型名、API key 和服务地址。 |
-| `INFERENCE_AGENT_URL` | 中心本机 Agent 使用的推理 Agent controller `/inference_agent` 地址。 |
+| `INFERENCE_AGENT_URL` | 中心本机 Agent 使用的推理 Agent controller `/inference_agent` 地址；页面管理员运维动作使用 Studio 登录态判权，如启用推理 Agent `/admin/*`，应限制为仅可信 Studio Server 可访问。 |
 | `STUDIO_PUBLIC_URL` | 用户浏览器访问中心 Studio 的地址。 |
 | `STUDIO_URL` | Runtime/Agent 回调中心 Studio 后端的地址。 |
 
@@ -73,7 +73,7 @@ bash runtime.sh init --profile node --node-id node-b --center-url http://<center
 | `MEDFLOW_RESOURCE_API_TOKEN` | 中心输出中该节点的资源 API token，必须匹配中心 `MEDFLOW_RESOURCE_NODES` 中对应节点的 `resourceApiToken`。 |
 | `MEDFLOW_RUNTIME_NODE_TOKEN` | 中心输出中该节点的 Runtime 节点 token，必须匹配中心 `MEDFLOW_STUDIO_RUNTIME_NODE_TOKENS` 中对应节点的值。 |
 | `MODEL_NAME` / `MODEL_API_KEY` / `MODEL_BASE_URL` | 该节点 Agent 调用的 OpenAI-compatible 模型名、API key 和服务地址。 |
-| `INFERENCE_AGENT_URL` | 该节点任务使用的推理 Agent controller `/inference_agent` 地址。 |
+| `INFERENCE_AGENT_URL` | 该节点任务使用的推理 Agent controller `/inference_agent` 地址；页面管理员运维动作使用 Studio 登录态判权，如启用推理 Agent `/admin/*`，应限制为仅可信 Studio Server 可访问。 |
 
 ## 启动顺序
 

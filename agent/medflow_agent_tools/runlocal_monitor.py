@@ -83,6 +83,7 @@ DEFAULT_STALE_MINUTES = 10
 DEFAULT_MIN_HISTORY_FOR_LLM = 2
 STARTING_TEXT = "训练正在启动中，请稍后查看实际训练loss和step/epoch"
 DEFAULT_LOG_ROOT = "/home/workspace/log"
+TRAINING_METRICS_WANDB_CACHE_TTL_SECONDS = 60
 
 _RUNTIME_DIR = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "..", "runtime"),
@@ -97,6 +98,7 @@ _LLM_LOOP_THREAD: Optional[threading.Thread] = None
 _LLM_LOOP_LOCK = threading.Lock()
 _LLM_LOOP_READY = threading.Event()
 _LAST_OK_BY_CONTAINER: Dict[str, Dict[str, Any]] = {}
+_WANDB_RUN_CACHE: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
 
 
 def _wandb_display_text(metrics: Dict[str, Any]) -> Optional[str]:
@@ -581,6 +583,107 @@ def _find_wandb_run_dir_by_id(container: str, root: str, run_id: str) -> Optiona
     if code == 0 and out:
         return out.splitlines()[0].strip()
     return None
+
+
+
+def _training_metrics_wandb_cache_key(
+    container: Optional[str],
+    pid: Optional[str],
+    train_type: Optional[str],
+) -> Optional[Tuple[str, str, str]]:
+    if not container or not pid:
+        return None
+    normalized_train_type = normalize_train_type(train_type) or "unknown"
+    return (str(container), str(pid), normalized_train_type)
+
+
+def _wandb_output_log_exists(container: str, run_dir: Optional[str]) -> bool:
+    if not container or not run_dir:
+        return False
+    output_log_path = f"{str(run_dir).rstrip('/')}/files/output.log"
+    code, _, _ = _docker_exec(container, ["test", "-f", output_log_path], timeout=5)
+    return code == 0
+
+
+def _get_cached_wandb_run(
+    container: str,
+    pid: Optional[str],
+    train_type: Optional[str],
+    current_run_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    key = _training_metrics_wandb_cache_key(container, pid, train_type)
+    if not key:
+        return None
+    entry = _WANDB_RUN_CACHE.get(key)
+    if not entry:
+        return None
+    if float(entry.get("expires_at") or 0) < time.time():
+        _WANDB_RUN_CACHE.pop(key, None)
+        return None
+    run_dir = str(entry.get("wandb_run_dir") or "").rstrip("/")
+    if not run_dir:
+        _WANDB_RUN_CACHE.pop(key, None)
+        return None
+    cached_run_id = str(entry.get("wandb_url_run_id") or "").strip()
+    if current_run_id and cached_run_id and cached_run_id != str(current_run_id):
+        _WANDB_RUN_CACHE.pop(key, None)
+        return None
+    if not _wandb_output_log_exists(container, run_dir):
+        _WANDB_RUN_CACHE.pop(key, None)
+        return None
+    run = _run_record_from_dir(run_dir)
+    if not run:
+        _WANDB_RUN_CACHE.pop(key, None)
+        return None
+    run["_wandb_root"] = str(entry.get("wandb_root") or "").strip()
+    run["_wandb_root_source"] = str(entry.get("wandb_root_source") or "cache").strip() or "cache"
+    run["_cache_hit"] = True
+    return run
+
+
+def _remember_wandb_run(
+    container: str,
+    pid: Optional[str],
+    train_type: Optional[str],
+    wandb_run_dir: Optional[str],
+    wandb_root: Optional[str],
+    wandb_root_source: Optional[str],
+    wandb_url_run_id: Optional[str],
+) -> None:
+    key = _training_metrics_wandb_cache_key(container, pid, train_type)
+    if not key or not wandb_run_dir:
+        return
+    run_dir = str(wandb_run_dir).rstrip("/")
+    _WANDB_RUN_CACHE[key] = {
+        "wandb_run_dir": run_dir,
+        "wandb_root": str(wandb_root or "").strip(),
+        "wandb_root_source": str(wandb_root_source or "").strip(),
+        "wandb_url_run_id": str(wandb_url_run_id or _extract_wandb_run_id(None, run_dir) or "").strip(),
+        "expires_at": time.time() + TRAINING_METRICS_WANDB_CACHE_TTL_SECONDS,
+        "cached_at": datetime.now().isoformat(),
+    }
+
+
+def _find_wandb_run_from_url(
+    container: str,
+    wandb_url: Optional[str],
+    root_candidates: List[Tuple[str, str]],
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    run_id = _extract_run_id_from_wandb_url(wandb_url)
+    if not run_id:
+        return None, "wandb_url_run_id_missing"
+    for candidate_root, candidate_source in root_candidates:
+        matched_run_dir = _find_wandb_run_dir_by_id(container, candidate_root, run_id)
+        if not matched_run_dir:
+            continue
+        run = _run_record_from_dir(matched_run_dir)
+        if not run:
+            continue
+        run["_wandb_root"] = candidate_root
+        run["_wandb_root_source"] = candidate_source
+        run["_wandb_url_run_id"] = run_id
+        return run, "wandb_url_match"
+    return None, "wandb_url_run_not_found"
 
 
 def _extract_param(cmd: str, name: str) -> Optional[str]:
@@ -3701,49 +3804,85 @@ def monitor_training(
                 wandb_root = cmd_wandb_root
                 wandb_root_source = "process_cmd"
 
+        training_log_path = None
+        wandb_url = _read_wandb_url_file(pid) if pid else None
+        wandb_url_source = "pid_file" if wandb_url else None
+        wandb_url_file = _wandb_url_file(pid) if pid else None
+        wandb_url_file_exists = bool(wandb_url_file and os.path.exists(wandb_url_file))
+        wandb_url_pid_file_hit = bool(wandb_url)
+        if wandb_url and wandb_url_file and os.path.exists(wandb_url_file):
+            try:
+                file_mtime = os.path.getmtime(wandb_url_file)
+                if not _should_use_pid_file_url(training_process_exists, pid_started_at, file_mtime):
+                    wandb_url = None
+                    wandb_url_source = None
+            except Exception:
+                pass
+        if wandb_url:
+            current_run_id = _extract_run_id_from_wandb_url(wandb_url)
+            if current_run_id:
+                existing_run_ids = _list_pid_url_run_ids(pid)
+                if current_run_id in existing_run_ids:
+                    wandb_url = None
+                    wandb_url_source = None
+        wandb_url_run_id = _extract_run_id_from_wandb_url(wandb_url)
+
         wandb_runs: List[Dict[str, Any]] = []
-        seen_wandb_run_paths: set[str] = set()
-        for candidate_root, candidate_source in _wandb_root_candidates(
+        wandb_root_candidates = _wandb_root_candidates(
             wandb_root,
             wandb_root_source,
             user_supplied_wandb_root,
-        ):
-            candidate_runs = _list_wandb_runs(container_name, candidate_root)
-            logger.info(
-                "[train-monitor] wandb_runs_discovered "
-                "container=%s pid=%s wandb_root=%s wandb_root_source=%s "
-                "wandb_runs_count=%s candidate_runs=%s",
+        )
+        wandb_run = _get_cached_wandb_run(
+            container_name,
+            pid,
+            train_type_value,
+            wandb_url_run_id,
+        )
+        wandb_select_reason = "cache_hit" if wandb_run else "no_runs"
+        if not wandb_run and wandb_url_run_id:
+            wandb_run, wandb_select_reason = _find_wandb_run_from_url(
                 container_name,
-                pid,
-                candidate_root,
-                candidate_source,
-                len(candidate_runs),
-                [run.get("name") for run in candidate_runs[:5]],
+                wandb_url,
+                wandb_root_candidates,
             )
-            for candidate_run in candidate_runs:
-                run_path = str(candidate_run.get("path") or "").strip()
-                if not run_path or run_path in seen_wandb_run_paths:
-                    continue
-                seen_wandb_run_paths.add(run_path)
-                annotated_run = dict(candidate_run)
-                annotated_run["_wandb_root"] = candidate_root
-                annotated_run["_wandb_root_source"] = candidate_source
-                wandb_runs.append(annotated_run)
-        wandb_run = None
-        wandb_select_reason = "no_runs"
-        if pid:
-            wandb_run, wandb_select_reason = _find_wandb_run_by_pid(
-                container_name,
-                wandb_runs,
-                pid,
-            )
-        if not wandb_run and pid_source == "input" and (pid_record or pid_matches_proc or run_start_time):
-            wandb_run, wandb_select_reason = select_wandb_run_by_start_time(
-                wandb_runs,
-                run_start_time,
-                time_window_minutes,
-                allow_early_seconds=0 if pid_alive else 60,
-            )
+        if not wandb_run:
+            seen_wandb_run_paths: set[str] = set()
+            for candidate_root, candidate_source in wandb_root_candidates:
+                candidate_runs = _list_wandb_runs(container_name, candidate_root)
+                logger.info(
+                    "[train-monitor] wandb_runs_discovered "
+                    "container=%s pid=%s wandb_root=%s wandb_root_source=%s "
+                    "wandb_runs_count=%s candidate_runs=%s",
+                    container_name,
+                    pid,
+                    candidate_root,
+                    candidate_source,
+                    len(candidate_runs),
+                    [run.get("name") for run in candidate_runs[:5]],
+                )
+                for candidate_run in candidate_runs:
+                    run_path = str(candidate_run.get("path") or "").strip()
+                    if not run_path or run_path in seen_wandb_run_paths:
+                        continue
+                    seen_wandb_run_paths.add(run_path)
+                    annotated_run = dict(candidate_run)
+                    annotated_run["_wandb_root"] = candidate_root
+                    annotated_run["_wandb_root_source"] = candidate_source
+                    wandb_runs.append(annotated_run)
+            if pid:
+                wandb_run, wandb_select_reason = _find_wandb_run_by_pid(
+                    container_name,
+                    wandb_runs,
+                    pid,
+                )
+            if not wandb_run and pid_source == "input" and (pid_record or pid_matches_proc or run_start_time):
+                wandb_run, wandb_select_reason = select_wandb_run_by_start_time(
+                    wandb_runs,
+                    run_start_time,
+                    time_window_minutes,
+                    allow_early_seconds=0 if pid_alive else 60,
+                )
         pid_ok, pid_reason = validate_pid_binding(
             pid_source,
             pid_record,
@@ -3897,27 +4036,6 @@ def monitor_training(
             if isinstance(count, int) and count > history_limit:
                 output_log_full_data = _read_output_log(container_name, output_log_path, count)
 
-        training_log_path = None
-        wandb_url = _read_wandb_url_file(pid) if pid else None
-        wandb_url_source = "pid_file" if wandb_url else None
-        wandb_url_file = _wandb_url_file(pid) if pid else None
-        wandb_url_file_exists = bool(wandb_url_file and os.path.exists(wandb_url_file))
-        wandb_url_pid_file_hit = bool(wandb_url)
-        if wandb_url and wandb_url_file and os.path.exists(wandb_url_file):
-            try:
-                file_mtime = os.path.getmtime(wandb_url_file)
-                if not _should_use_pid_file_url(training_process_exists, pid_started_at, file_mtime):
-                    wandb_url = None
-                    wandb_url_source = None
-            except Exception:
-                pass
-        if wandb_url:
-            current_run_id = _extract_run_id_from_wandb_url(wandb_url)
-            if current_run_id:
-                existing_run_ids = _list_pid_url_run_ids(pid)
-                if current_run_id in existing_run_ids:
-                    wandb_url = None
-                    wandb_url_source = None
         if not wandb_url and pid and pid_alive:
             training_log_path = _find_log_file_by_pid(container_name, pid)
             if training_log_path:
@@ -3996,7 +4114,7 @@ def monitor_training(
         )
         effective_output_log_data = _select_effective_log_data(output_log_data, training_log_data)
         wandb_run_dir_corrected = None
-        if wandb_url_run_id:
+        if wandb_url_run_id and not (wandb_run_dir and wandb_url_run_id in wandb_run_dir):
             matched_run_dir = _find_wandb_run_dir_by_id(container_name, wandb_root, wandb_url_run_id)
             if not matched_run_dir:
                 for candidate_root in (DEFAULT_LOG_WANDB_ROOT, DEFAULT_WANDB_ROOT, DEFAULT_INSINFER_WANDB_ROOT):
@@ -4626,6 +4744,16 @@ def monitor_training(
             },
             "analysis_text": analysis_text,
         }
+        _remember_wandb_run(
+            container_name,
+            pid,
+            train_type_value,
+            wandb_run_dir,
+            wandb_root,
+            wandb_root_source,
+            wandb_url_run_id,
+        )
+
         # 缓存最近一次成功指标，避免偶发异常导致用户无结果可查
         if container_name:
             _LAST_OK_BY_CONTAINER[container_name] = {

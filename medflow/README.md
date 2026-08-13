@@ -255,10 +255,10 @@ bash test-returnvisit.sh <server ip> <server port>
 bash test-doctormedicalrecord.sh <server ip> <server port>
 
 # Generation of Inpatient Documents
-bash test inpatient.sh <server ip> <server port>
+bash test-inpatient.sh <server ip> <server port>
 
 # Follow-up
-bash test followup.sh <server ip> <server port>
+bash test-followup.sh <server ip> <server port>
 ```
 
 **Webui Experience**

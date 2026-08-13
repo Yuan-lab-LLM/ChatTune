@@ -1,6 +1,6 @@
-# MedFlow Runtime MP 文档
+# MedFlow ChatTune 文档
 
-本目录包含 MedFlow Runtime MP 的开源文档。建议按下面顺序阅读和执行：
+本目录包含 MedFlow ChatTune 的开源文档。建议按下面顺序阅读和执行：
 
 1. [部署指南](DEPLOYMENT_ZH.md)：先准备容器、镜像、工作区挂载、训练数据、GRPO 数据、模型目录和推理服务配置。
 2. [快速开始](QUICKSTART_ZH.md)：容器准备好后，初始化 `runtime.env`，检查配置并启动单机 Runtime。

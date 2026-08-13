@@ -261,10 +261,13 @@
     "reservationIdLabel": "预约 ID",
     "forceRelease": "强制释放预约",
     "stopAndRelease": "停止进程并释放预约",
+    "stopInferenceAndRelease": "停止推理服务并释放预约",
     "forceReleaseConfirm": "强制释放只会解除 Studio 资源预约，不会停止训练进程。若训练仍在运行，可能导致 GPU 被重复分配、任务抢显存或 OOM。仅在确认训练已停止或预约异常残留时继续。",
     "forceReleaseSuccess": "GPU 资源预约已强制释放",
     "stopAndReleaseConfirm": "停止进程并释放预约会先让 Runtime 在容器中检查并停止该预约对应的 PID，确认进程退出后才释放 Studio 预约。若进程仍在运行，这会中断任务。确认继续？",
+    "stopInferenceAndReleaseConfirm": "停止推理服务并释放预约会先让 Runtime 关闭当前推理服务，确认停止后再释放 Studio 预约。若推理服务仍在使用，这会中断服务。确认继续？",
     "stopAndReleaseSuccess": "训练进程已停止，GPU 资源预约已释放",
+    "stopInferenceAndReleaseSuccess": "推理服务已停止，GPU 资源预约已释放",
     "expandDiagnostics": "排障详情",
     "collapseDiagnostics": "收起详情",
     "statusLabel": "预约状态",
@@ -272,6 +275,8 @@
     "expiresAtLabel": "Runtime 到期时间",
     "lastRenewedAtLabel": "Runtime 续期时间",
     "releasedAtLabel": "释放时间",
+    "endedAtLabel": "结束时间",
+    "endReasonLabel": "结束原因",
     "expiredReasonLabel": "过期原因",
     "errorReasonLabel": "异常原因",
     "releaseResultLabel": "释放结果",
@@ -279,18 +284,29 @@
     "nodeLabel": "节点",
     "gpuIndexesLabel": "GPU 卡号",
     "noDiagnosticValue": "暂无记录",
+    "notEnded": "未结束",
     "taskCategoryLabel": "任务大类",
     "taskTypeLabel": "任务类型",
     "taskCategory": {
       "training": "训练",
       "assessment": "评估",
-      "evaluation": "评估"
+      "evaluation": "评估",
+      "inference": "推理"
     },
     "releaseResult": {
       "success": "GPU 释放成功",
       "force_released": "管理员强制释放预约成功",
-      "stopped_and_released": "管理员停止进程并释放成功",
+      "stopped_and_released": "管理员停止任务并释放预约成功",
       "failed": "GPU 释放失败"
+    },
+    "reason": {
+      "runtime_released": "Runtime 主动释放预约",
+      "admin_force_released": "管理员强制释放预约",
+      "admin_stopped_process_and_released": "管理员停止进程并释放预约",
+      "admin_stopped_inference_and_released": "管理员停止推理服务并释放预约",
+      "training_lease_expired": "训练资源租约已过期",
+      "inference_lease_expired": "推理资源租约已过期",
+      "lease_expired_gpu_busy": "租约已过期，但已分配 GPU 仍有占用"
     },
     "cancel": "取消",
     "activeReservationsBlockConfig": "存在活跃资源预约，当前配置暂不可修改",
@@ -324,7 +340,8 @@
       "full": "全参 SFT",
       "enhanced": "增强训练",
       "scheduled": "定时训练",
-      "grpo": "GRPO"
+      "grpo": "GRPO",
+      "inference": "推理服务"
     },
     "stopAndReleaseGpuIdleSuccess": "训练进程 GPU 占用已释放，GPU 资源预约已释放",
     "releaseSuccess": "GPU 资源预约已释放",
@@ -428,6 +445,37 @@
     "serviceStatus": "服务状态",
     "running": "运行中",
     "stopped": "已停止",
+    "statusLabels": {
+      "running": "运行中",
+      "stopped": "已停止",
+      "starting": "启动中",
+      "failed": "失败",
+      "degraded": "降级"
+    },
+    "servicePortDescription": "{{description}} · 端口 {{port}}",
+    "forceStop": "强制停止",
+    "forceStopConfirm": "确认强制停止推理实例 {{instanceId}}？",
+    "stopFailed": "停止失败",
+    "stopSubmitted": "停止请求已提交",
+    "stopInstanceFailed": "停止推理实例失败",
+    "services": {
+      "VLLM_OPENAI_PORT": {
+        "name": "VLLM OpenAI API",
+        "description": "vLLM OpenAI 兼容 API 服务"
+      },
+      "INFERENCE_PORT": {
+        "name": "推理服务",
+        "description": "主推理服务"
+      },
+      "UI_PORT": {
+        "name": "UI 服务",
+        "description": "Web UI 服务"
+      },
+      "DATA_ANNOTATION_PORT": {
+        "name": "数据标注服务",
+        "description": "数据标注工具服务"
+      }
+    },
     "noStatusData": "暂无服务状态数据",
     "clickRefresh": "点击刷新按钮获取最新状态",
     "quickActions": "快捷操作",
@@ -1597,12 +1645,16 @@
       "crossContainerTitle": "数据集不在当前训练容器",
       "crossContainerDesc": "数据集 {{dataset}} 来自容器 {{datasetContainer}}，当前运行实例使用训练容器 {{runContainer}}。请先将数据集同步到当前训练容器后再启动训练。"
     },
+    "preprocess": {
+      "button": "Preprocess with this",
+      "inputHint": "预处理命令已填入，点击右下角发送即可开始"
+    },
     "expand": "查看文件",
     "collapse": "收起",
     "container-input-title": "输入容器名称",
     "container-name": "Docker 容器名称",
     "container-required": "请输入容器名称",
-    "container-default-hint": "默认使用 tianrui_zh，可直接确认或修改。系统将记住您最近使用的容器名称。",
+    "container-default-hint": "默认使用 training_container，可直接确认或修改。系统将记住您最近使用的容器名称。",
     "name": "数据集名称",
     "name-required": "请输入数据集名称",
     "name-invalid": "只能包含字母、数字、下划线和横线",
@@ -1691,7 +1743,7 @@
     "container-input-title": "输入容器名称",
     "container-name": "Docker 容器名称",
     "container-required": "请输入容器名称",
-    "container-default-hint": "默认使用 tianrui_zh，可直接确认或修改。系统将记住您最近使用的容器名称。",
+    "container-default-hint": "默认使用 training_container，可直接确认或修改。系统将记住您最近使用的容器名称。",
     "merged": "Training Complete",
     "not-merged": "Training Incomplete",
     "delete": {
@@ -1863,7 +1915,7 @@
     "query-available": "查询可用评测",
     "container-name": "Docker 容器名称",
     "container-required": "请输入容器名称",
-    "container-default-hint": "默认使用 tianrui_zh，可直接确认或修改。系统将记住您最近使用的容器名称。"
+    "container-default-hint": "默认使用 training_container，可直接确认或修改。系统将记住您最近使用的容器名称。"
   },
   "wizard": {
     "steps": {
@@ -1963,7 +2015,7 @@
       },
       "monitor": {
         "task": "“监控训练”：查看后台训练进程和最新状态。",
-        "container": "“容器为 tianrui_zh”：告诉系统去哪个容器里读取训练状态。"
+        "container": "“容器为 training_container”：告诉系统去哪个容器里读取训练状态。"
       }
     },
     "completion": {
@@ -1990,7 +2042,7 @@
         "step1": "点击左侧'查询可用数据集'按钮",
         "step1Desc": "位于数据管理面板中",
         "step2": "输入容器名称",
-        "step2Desc": "默认使用：tianrui_zh",
+        "step2Desc": "默认使用：training_container",
         "step3": "查看数据集列表",
         "step3Desc": "找到 medical-example 数据集"
       },

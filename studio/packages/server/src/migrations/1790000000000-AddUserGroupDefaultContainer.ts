@@ -11,7 +11,7 @@ export class AddUserGroupDefaultContainer1790000000000 implements MigrationInter
                 new TableColumn({
                     name: 'defaultContainerName',
                     type: 'varchar',
-                    default: "'tianrui_zh'",
+                    default: "'training_container'",
                 }),
             );
         }

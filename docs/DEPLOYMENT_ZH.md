@@ -1,6 +1,6 @@
 # 部署指南
 
-本文只说明 MedFlow Runtime MP 发布包中的容器、镜像和工作区挂载准备。完成本页后，再进入 [快速开始](QUICKSTART_ZH.md) 初始化并启动 Runtime。
+本文只说明 MedFlow ChatTune 发布包中的容器、镜像和工作区挂载准备。完成本页后，再进入 [快速开始](QUICKSTART_ZH.md) 初始化并启动 Runtime。
 
 ## 组件
 
@@ -20,6 +20,14 @@
 | GRPO/verl 镜像 | https://pan.quark.cn/s/c6ad41207360 | 提取码：vJJx |
 | 基础模型资源 | https://modelscope.cn/models/MedFlow/Qingnang-32B-0630/ | Qingnang-32B-0630 基础模型 |
 | 评测 Benchmark 数据 | https://pan.quark.cn/s/5ba6589d7933 | 提取码：b8Pp |
+
+### 训练镜像补丁包
+
+后续训练镜像的发布将以补丁包形式进行。下载对应的 `.run` 包后，只需要执行 `bash xx.run` 完成安装；除非发布说明另有要求，不需要重新获取完整训练镜像包。
+
+| 资源 | 链接 | 备注 |
+| --- | --- | --- |
+| 训练镜像补丁包-0813 | https://pan.quark.cn/s/db69395cbde7 | 提取码：6K2h |
 
 ## 容器类型 
 
@@ -41,7 +49,7 @@
 
 ## Agent 容器挂载
 
-容器创建时， `HOST_WORKSPACE` 应指向本项目代码目录，也就是 MedFlow Runtime MP 发布包/项目根目录。
+容器创建时， `HOST_WORKSPACE` 应指向本项目代码目录，也就是 MedFlow ChatTune 发布包/项目根目录。
 
 ## 通用训练容器挂载
 
@@ -190,6 +198,12 @@ NODES:
 
 每个 `TOOL_URL` 都要指向对应 worker 的 `/worker/tool` 接口；如果某台 worker 暂不使用，设为 `ENABLED: false` 或从文件中删除。
 
+## 推理 Agent Admin 权限
+
+推理 Agent 的 `/admin/*` 接口用于清理 stale 资源、查看和强制停止服务实例、Benchmark 与测试任务。该能力应只通过 Studio 管理员入口触发：前端不传 admin token，Studio Server 先校验当前登录用户是否为管理员，再调用推理 Agent。
+
+在 `agent.yaml` 中设置 `ADMIN.ENABLED: true` 可开启这些接口。生产环境应通过 Docker 网络、反向代理或防火墙限制 `/admin/*` 只允许 Studio Server 访问。如果不需要推理 Agent admin 运维接口，可设置 `ADMIN.ENABLED: false`。普通 `/inference_agent` 和 `/worker/tool` 请求不受影响。
+
 ## 启动推理 Agent
 
 ```bash
@@ -206,4 +220,3 @@ curl -X POST http://<worker-a-host>:8899/inference_agent \
 ```
 
 若返回模型调用错误，应检查 `AGENT_LLM_URL` 或 `LLM_URL` 指向的 OpenAI-compatible 模型服务是否可访问，并确认 `AGENT_LLM_MODEL` / `LLM_MODEL`、`AGENT_LLM_API_KEY` / `LLM_API_KEY` 与该服务匹配；若工具执行失败，应检查 worker 节点、`nodes.yaml`、推理服务配置和端口连通性。
-

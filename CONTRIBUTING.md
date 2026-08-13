@@ -1,6 +1,6 @@
-# Contributing to MedFlow Runtime MP
+# Contributing to MedFlow ChatTune
 
-Thank you for helping improve MedFlow Runtime MP. This project is released under Apache-2.0, and contributions are accepted under the same license unless explicitly stated otherwise.
+Thank you for helping improve MedFlow ChatTune. This project is released under Apache-2.0, and contributions are accepted under the same license unless explicitly stated otherwise.
 
 ## Development Guidelines
 

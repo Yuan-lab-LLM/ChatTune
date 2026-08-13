@@ -76,23 +76,12 @@ agents:
       - 高级筛选：在已有数据基础上继续筛选、清洗或挑选出更合适的数据。
       你可以直接回复：预处理 或 高级筛选。
       
-      当需要执行数据预处理时，必需参数包括：
-      - data_type:预处理数据类型，如sft/dpo，分别适用于批量训练、增强训练
-      - strategy: 预处理数据格式，如inspection/diagnosis/prescription，分别代表想要训练模型生成检查单能力的数据、诊断能力的数据、处方能力的数据
-      重要：如果用户只说“想做数据预处理”，但没有明确给出 `data_type` 和 `strategy`，你必须先使用 `[参数请求]` 向用户确认，禁止自行猜测成 sft、dpo、inspection、diagnosis 或 prescription 中的任意一种。
-      当你向用户追问 `data_type` 和 `strategy` 时，请尽量解释这些选项分别代表什么、适合什么场景，帮助新手理解后再选择。
-      如果用户在这个阶段回复“有什么区别”“怎么选”“你推荐哪种”“哪种更适合”等问题，不要重复原来的追问；请先用通俗中文解释 `sft/dpo` 和 `inspection/diagnosis/prescription` 的区别、适用场景，以及对新手的建议，然后再请用户选择。此时仍然保留前缀 `[参数请求]`。
-      推荐格式：[参数请求] 开始数据预处理前，我还需要先确认两项信息。
-      - `data_type`：
-        `sft`：常规监督微调数据，通常用于 LoRA 或全参训练。
-        `dpo`：偏好优化数据，通常用于后续增强训练。
-      - `strategy`：
-        `inspection`：让模型学习生成检查相关内容。
-        `diagnosis`：让模型学习生成诊断相关内容。
-        `prescription`：让模型学习生成处方相关内容。
-      你可以直接回复，例如：`data_type=sft，strategy=diagnosis`。
-      只有在用户已经明确提供 `data_type` 和 `strategy` 后，才能开始执行数据预处理。
-      `input_folder` 不是数据预处理的必填项；如果用户没有提供，就默认使用系统已有的默认输入路径。只有当默认路径处理失败、用户明确指定了其他数据位置、或用户主动要求使用自定义数据目录时，才再追问 `input_folder`。
+      当需要执行数据预处理时，不要在调用工具前固定追问 `data_type` 和 `strategy`；必须先调用数据预处理工具，让工具检测输入目录格式后再决定缺参。
+      `input_folder` 不是数据预处理的必填项：如果用户提供了 `input_folder`，调用工具检测该目录；如果用户没有提供，调用工具使用系统默认输入根目录，并检测其中最新数据集/最新文件的格式。
+      工具会识别 OpenAI、ShareGPT、SFT、DPO、text 等通用格式，以及医疗 raw 原始格式。通用格式缺少参数时只追问 `data_type`；医疗 raw 或未知格式才追问 `data_type` 和 `strategy`。
+      - `data_type`：`sft` 表示常规监督微调数据，通常用于 LoRA 或全参训练；`dpo` 表示偏好优化数据，通常用于后续增强训练。
+      - `strategy`：仅医疗 raw 原始格式需要，`inspection` 表示检查相关内容，`diagnosis` 表示诊断相关内容，`prescription` 表示处方相关内容。
+      如果工具返回 `[参数请求]`，请原样保留工具要求的参数范围：通用格式只问 `data_type`，不要额外要求 `strategy`；raw 才问 `data_type` 和 `strategy`。
       
       当需要执行数据高级筛选时，必需参数包括：
       - input_folder:需高级筛选的数据路径

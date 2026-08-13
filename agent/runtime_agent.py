@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from contextvars import ContextVar
 from functools import wraps
 from datetime import datetime, timedelta
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import requests
+import yaml
 
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -244,7 +246,11 @@ from medflow_agent_tools import (
     run_script_by_name_assessment_monitor,
     run_script_by_name_evaluate_monitor
 )
-from medflow_agent_tools.runlocal_train import _release_resource_allocation
+from medflow_agent_tools.runlocal_train import (
+    _local_gpu_snapshot_for_runtime_request,
+    _release_resource_allocation,
+    _runtime_training_resource_request,
+)
 
 def _model_generate_kwargs() -> Dict[str, Any]:
     generate_kwargs = config.model.generate_kwargs
@@ -557,7 +563,333 @@ REQUEST_TRAINING_POOL_ID: ContextVar[str] = ContextVar(
     "request_training_pool_id",
     default="",
 )
+REQUEST_USER_ROLE: ContextVar[str] = ContextVar(
+    "request_user_role",
+    default="",
+)
+REQUEST_INFERENCE_OWNER_USER_ID: ContextVar[str] = ContextVar(
+    "request_inference_owner_user_id",
+    default="",
+)
+REQUEST_INFERENCE_OWNER_ALIASES: ContextVar[tuple[str, ...]] = ContextVar(
+    "request_inference_owner_aliases",
+    default=(),
+)
 
+INFERENCE_RESOURCE_RESERVATIONS: Dict[str, Dict[str, Any]] = {}
+INFERENCE_RESOURCE_RESERVATIONS_LOCK = threading.Lock()
+INFERENCE_RESOURCE_HEARTBEATS: Dict[str, threading.Event] = {}
+INFERENCE_RESOURCE_HEARTBEATS_LOCK = threading.Lock()
+
+
+def _inference_gpus_per_node() -> int:
+    for env_name in ("MEDFLOW_INFERENCE_GPUS_PER_NODE", "AGENT3_INFERENCE_GPUS_PER_NODE"):
+        raw_value = str(os.getenv(env_name) or "").strip()
+        if raw_value:
+            try:
+                return max(1, int(raw_value))
+            except ValueError:
+                logger.warning("Ignore invalid %s=%s", env_name, raw_value)
+    service_config = Path(__file__).resolve().parent.parent / "medflow" / "agent" / "config" / "service.yaml"
+    try:
+        payload = yaml.safe_load(service_config.read_text(encoding="utf-8")) or {}
+        runtime = payload.get("RUNTIME") if isinstance(payload.get("RUNTIME"), dict) else {}
+        return max(1, int(runtime.get("TENSOR_PARALLEL_SIZE") or 1))
+    except Exception:
+        return 1
+
+
+def _inference_command_needs_resource_context(command: str) -> bool:
+    normalized = str(command or "").lower()
+    return any(
+        keyword in normalized
+        for keyword in (
+            "启动推理服务",
+            "重启推理服务",
+            "service_start",
+            "service_restart",
+            "start inference",
+            "restart inference",
+        )
+    )
+
+
+def _inference_command_may_stop_service(command: str) -> bool:
+    normalized = str(command or "").lower()
+    return any(
+        keyword in normalized
+        for keyword in (
+            "停止推理服务",
+            "关闭推理服务",
+            "关闭推理",
+            "停止推理",
+            "重启推理服务",
+            "service_stop",
+            "service_instance_stop",
+            "service_restart",
+            "stop inference",
+            "restart inference",
+        )
+    )
+
+def _inference_protocol_is_service_stop(protocol: Any) -> bool:
+    if not isinstance(protocol, dict):
+        return False
+    return (
+        str(protocol.get("type") or "").strip().lower() == "job_stopped"
+        and str(protocol.get("jobType") or protocol.get("job_type") or "").strip().lower() == "inference_service"
+        and str(protocol.get("action") or "").strip().lower() == "service_stop"
+    )
+
+
+def _inference_payload_is_service_stop(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    return _inference_protocol_is_service_stop(payload.get("protocol"))
+
+
+def _inference_stop_response_is_success(command: str, data: Any) -> bool:
+    if not isinstance(data, dict) or not _inference_command_may_stop_service(command):
+        return False
+    response_data = data.get("data") if isinstance(data.get("data"), dict) else {}
+    service_stop = response_data.get("service_stop")
+    if isinstance(service_stop, dict):
+        return service_stop.get("stopped") is True and service_stop.get("release_ready") is not False
+    inference_stop = response_data.get("inference_service_stop")
+    if isinstance(inference_stop, dict):
+        nested_stop = inference_stop.get("service_stop")
+        if isinstance(nested_stop, dict):
+            return nested_stop.get("stopped") is True and nested_stop.get("release_ready") is not False
+    text = str(data.get("result") or data.get("message") or "")
+    status = str(data.get("status") or "").lower()
+    if status not in {"error", "failed", "timeout"}:
+        return True
+    return any(
+        keyword in text
+        for keyword in (
+            "已处于非活动状态",
+            "无需重复停止",
+            "已停止",
+            "无需重复操作",
+            "未检测到存活进程",
+            "not active",
+            "already stopped",
+            "already inactive",
+            "no running process",
+        )
+    )
+def _inference_resource_env(runtime_node_id: str = "") -> Dict[str, str]:
+    return {
+        "MEDFLOW_RESOURCE_NODE_ID": runtime_node_id or os.getenv("MEDFLOW_RESOURCE_NODE_ID", ""),
+        "MEDFLOW_RESOURCE_GROUP_ID": _current_resource_group_id(),
+        "MEDFLOW_TRAINING_POOL_ID": _current_training_pool_id(),
+    }
+
+
+def _default_inference_resource_context(
+    *,
+    resource_group_id: str = "",
+    training_pool_id: str = "",
+) -> Optional[Dict[str, Any]]:
+    runtime_node_id = str(os.getenv("MEDFLOW_RESOURCE_NODE_ID") or "").strip()
+    resource_group_id = str(resource_group_id or _current_resource_group_id() or "").strip()
+    training_pool_id = str(training_pool_id or _current_training_pool_id() or "").strip()
+    if not runtime_node_id:
+        return None
+    context: Dict[str, Any] = {"runtime_node_id": runtime_node_id}
+    if resource_group_id:
+        context["resource_group_id"] = resource_group_id
+    if training_pool_id:
+        context["training_pool_id"] = training_pool_id
+    return context
+
+
+def _inference_request_resource_context(
+    command: str,
+    *,
+    resource_group_id: str = "",
+    training_pool_id: str = "",
+) -> Optional[Dict[str, Any]]:
+    prepared = _prepare_inference_resource_context(
+        command,
+        resource_group_id=resource_group_id,
+        training_pool_id=training_pool_id,
+    )
+    
+    if prepared:
+        return prepared
+    return _default_inference_resource_context(
+        resource_group_id=resource_group_id,
+        training_pool_id=training_pool_id,
+    )
+
+def _prepare_inference_resource_context(
+    command: str,
+    *,
+    resource_group_id: str = "",
+    training_pool_id: str = "",
+) -> Optional[Dict[str, Any]]:
+    resource_group_id = str(resource_group_id or _current_resource_group_id() or "").strip()
+    training_pool_id = str(training_pool_id or _current_training_pool_id() or "").strip()
+    if not resource_group_id or not _inference_command_needs_resource_context(command):
+        return None
+
+    runtime_node_id = str(os.getenv("MEDFLOW_RESOURCE_NODE_ID") or "").strip()
+    if not runtime_node_id:
+        raise RuntimeError("资源池已启用但缺少 MEDFLOW_RESOURCE_NODE_ID，无法为推理服务申请资源")
+
+    gpus_per_node = _inference_gpus_per_node()
+    request_data: Dict[str, Any] = {
+        "groupId": resource_group_id,
+        "runtimeNodeId": runtime_node_id,
+        "nodeCount": 1,
+        "gpusPerNode": gpus_per_node,
+        "taskCategory": "inference",
+        "taskType": "inference",
+        "taskTypeText": "推理服务",
+    }
+    if training_pool_id:
+        request_data["poolId"] = training_pool_id
+    gpu_snapshot = _local_gpu_snapshot_for_runtime_request()
+    if gpu_snapshot:
+        request_data["runtimeGpuSnapshot"] = gpu_snapshot
+
+    allocation = _runtime_training_resource_request("reserveTrainingResourcesForRuntime", request_data)
+    if not isinstance(allocation, dict):
+        raise RuntimeError("推理资源申请返回格式无效")
+
+    nodes = allocation.get("nodes") if isinstance(allocation.get("nodes"), list) else []
+    node_payload = nodes[0] if nodes and isinstance(nodes[0], dict) else {}
+    assigned_gpus = node_payload.get("gpuIndexes") or allocation.get("gpuIndexes") or []
+    assigned_gpus = [str(gpu) for gpu in assigned_gpus if str(gpu).strip() != ""]
+    reservation_id = str(
+        allocation.get("reservationId")
+        or allocation.get("reservation_id")
+        or node_payload.get("reservationId")
+        or ""
+    ).strip()
+    if not reservation_id or not assigned_gpus:
+        raise RuntimeError("推理资源申请失败：未返回 reservation 或 GPU 分配")
+
+    resource_context = {
+        "resource_group_id": resource_group_id,
+        "training_pool_id": training_pool_id,
+        "reservation_id": reservation_id,
+        "runtime_node_id": str(node_payload.get("runtimeNodeId") or runtime_node_id),
+        "assigned_gpus": assigned_gpus,
+        "cuda_visible_devices": ",".join(assigned_gpus),
+        "tensor_parallel_size": len(assigned_gpus),
+        "gpus_per_node": gpus_per_node,
+        "expires_at": allocation.get("expiresAt") or allocation.get("expires_at"),
+        "nodes": nodes,
+    }
+    with INFERENCE_RESOURCE_RESERVATIONS_LOCK:
+        INFERENCE_RESOURCE_RESERVATIONS[reservation_id] = resource_context
+    return resource_context
+
+
+def _inference_reservation_heartbeat_seconds() -> int:
+    try:
+        return max(15, int(os.getenv("MEDFLOW_INFERENCE_RESERVATION_HEARTBEAT_SECONDS", "60")))
+    except ValueError:
+        return 60
+
+
+def _inference_reservation_max_heartbeat_failures() -> int:
+    try:
+        return max(1, int(os.getenv("MEDFLOW_INFERENCE_RESERVATION_MAX_HEARTBEAT_FAILURES", "3")))
+    except ValueError:
+        return 3
+
+
+def _stop_inference_resource_heartbeat(reservation_id: str) -> None:
+    reservation_id = str(reservation_id or "").strip()
+    if not reservation_id:
+        return
+    with INFERENCE_RESOURCE_HEARTBEATS_LOCK:
+        stop_event = INFERENCE_RESOURCE_HEARTBEATS.pop(reservation_id, None)
+    if stop_event:
+        stop_event.set()
+
+
+def _start_inference_resource_heartbeat(resource_context: Optional[Dict[str, Any]]) -> None:
+    if not isinstance(resource_context, dict):
+        return
+    reservation_id = str(resource_context.get("reservation_id") or "").strip()
+    runtime_node_id = str(resource_context.get("runtime_node_id") or "").strip()
+    if not reservation_id or not runtime_node_id:
+        return
+    with INFERENCE_RESOURCE_HEARTBEATS_LOCK:
+        if reservation_id in INFERENCE_RESOURCE_HEARTBEATS:
+            return
+        stop_event = threading.Event()
+        INFERENCE_RESOURCE_HEARTBEATS[reservation_id] = stop_event
+
+    interval = _inference_reservation_heartbeat_seconds()
+    max_failures = _inference_reservation_max_heartbeat_failures()
+
+    def heartbeat() -> None:
+        failures = 0
+        try:
+            while not stop_event.wait(interval):
+                with INFERENCE_RESOURCE_RESERVATIONS_LOCK:
+                    active_context = INFERENCE_RESOURCE_RESERVATIONS.get(reservation_id)
+                if active_context is not resource_context and active_context != resource_context:
+                    return
+                try:
+                    renewal = _runtime_training_resource_request(
+                        "renewTrainingResourcesForRuntime",
+                        {
+                            "reservationId": reservation_id,
+                            "runtimeNodeId": runtime_node_id,
+                        },
+                    )
+                    if isinstance(renewal, dict):
+                        resource_context["expires_at"] = renewal.get("expiresAt") or renewal.get("expires_at") or resource_context.get("expires_at")
+                    failures = 0
+                except Exception:
+                    failures += 1
+                    logger.exception("Failed to renew inference GPU reservation %s", reservation_id)
+                    if failures >= max_failures:
+                        logger.error(
+                            "Releasing inference GPU reservation after %s consecutive renewal failures",
+                            failures,
+                        )
+                        _release_inference_resource_context(resource_context)
+                        return
+        finally:
+            with INFERENCE_RESOURCE_HEARTBEATS_LOCK:
+                existing = INFERENCE_RESOURCE_HEARTBEATS.get(reservation_id)
+                if existing is stop_event:
+                    INFERENCE_RESOURCE_HEARTBEATS.pop(reservation_id, None)
+
+    threading.Thread(
+        target=heartbeat,
+        name=f"medflow-inference-reservation-{reservation_id[:8]}",
+        daemon=True,
+    ).start()
+
+def _release_inference_resource_context(resource_context: Optional[Dict[str, Any]]) -> None:
+    if not isinstance(resource_context, dict):
+        return
+    reservation_id = str(resource_context.get("reservation_id") or "").strip()
+    if not reservation_id:
+        return
+    _stop_inference_resource_heartbeat(reservation_id)
+    with INFERENCE_RESOURCE_RESERVATIONS_LOCK:
+        INFERENCE_RESOURCE_RESERVATIONS.pop(reservation_id, None)
+    try:
+        _release_resource_allocation(reservation_id, _inference_resource_env(str(resource_context.get("runtime_node_id") or "")))
+    except Exception:
+        logger.exception("Failed to release inference reservation %s", reservation_id)
+
+
+def _release_known_inference_reservations() -> None:
+    with INFERENCE_RESOURCE_RESERVATIONS_LOCK:
+        contexts = list(INFERENCE_RESOURCE_RESERVATIONS.values())
+        INFERENCE_RESOURCE_RESERVATIONS.clear()
+    for resource_context in contexts:
+        _release_inference_resource_context(resource_context)
 
 def _current_training_container() -> str:
     return REQUEST_TRAINING_CONTAINER.get() or DEFAULT_DOCKER_CONTAINER
@@ -579,6 +911,7 @@ def _current_training_pool_id() -> str:
     return REQUEST_TRAINING_POOL_ID.get() or os.getenv("MEDFLOW_TRAINING_POOL_ID", "")
 
 
+
 def _is_grpo_training_query(script_query: str) -> bool:
     normalized = str(script_query or "").lower()
     return any(keyword in normalized for keyword in ["grpo", "grpo_train"])
@@ -589,6 +922,54 @@ def _is_special_training_query(script_query: str) -> bool:
     return any(keyword in normalized for keyword in ["grpo", "多机", "multinode"])
 
 
+def _owner_aliases_from_any(value: Any) -> list[str]:
+    if isinstance(value, (list, tuple, set)):
+        values = value
+    else:
+        values = str(value or "").split(",")
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        text = str(item or "").strip()
+        if text and text not in seen:
+            result.append(text)
+            seen.add(text)
+    return result
+
+
+def _current_user_role() -> str:
+    return REQUEST_USER_ROLE.get().strip().lower()
+
+
+def _current_inference_owner_user_id() -> str:
+    return REQUEST_INFERENCE_OWNER_USER_ID.get().strip()
+
+
+def _current_inference_owner_aliases() -> list[str]:
+    return list(REQUEST_INFERENCE_OWNER_ALIASES.get() or ())
+
+
+def _inference_owner_payload(default_user_id: str = "") -> tuple[str, list[str]]:
+    owner_user_id = _current_inference_owner_user_id() or str(default_user_id or "").strip()
+    aliases = _owner_aliases_from_any(_current_inference_owner_aliases())
+    if owner_user_id.startswith("auth:"):
+        aliases.append(owner_user_id.split(":", 1)[1])
+    if default_user_id:
+        aliases.append(str(default_user_id).split("#", 1)[0].strip())
+    return owner_user_id, _owner_aliases_from_any(aliases)
+
+
+def _workflow_inference_owner_kwargs(context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    context = context or {}
+    owner_user_id = str(context.get("inference_owner_user_id") or "").strip()
+    owner_aliases = _owner_aliases_from_any(context.get("inference_owner_aliases"))
+    if not owner_user_id:
+        owner_user_id, current_aliases = _inference_owner_payload()
+        owner_aliases = owner_aliases or current_aliases
+    return {
+        "owner_user_id": owner_user_id or "workflow-manager",
+        "owner_aliases": owner_aliases,
+    }
 @wraps(run_script_by_name_data)
 def run_group_data(*args, **kwargs):
     container = _current_training_container()
@@ -710,6 +1091,12 @@ _WORKFLOW_EVENT_CONSUMER_ID = f"agent3-{os.getpid()}-{int(time.time())}"
 
 
 def _workflow_inference_has_async_start_signal(text: str) -> bool:
+    import re
+    #deepseek
+    # 匹配“提交”（无论是否带成功） 或 “启动中/后台启动” 或 “执行结果”
+    pattern = r"(重启|启动).*提交|正在.*启动|后台启动|执行结果"
+    if re.search(pattern, (text or "")):
+        return True
     return any(
         keyword in (text or "")
         for keyword in ["任务已启动", "已启动", "启动进度", "当前状态如下"]
@@ -1402,6 +1789,9 @@ def _workflow_check_existing_stage_output(workflow: Dict[str, Any], stage_name: 
         deployed = _workflow_deployed_model_status(
             context["published_model_path"],
             _workflow_evaluation_container(workflow),
+            resource_group_id=str(context.get("resource_group_id") or "").strip(),
+            training_pool_id=str(context.get("training_pool_id") or "").strip(),
+            **_workflow_inference_owner_kwargs(context),
         )
         if deployed:
             return deployed
@@ -1410,6 +1800,9 @@ def _workflow_check_existing_stage_output(workflow: Dict[str, Any], stage_name: 
         result = _workflow_inference_command(
             _benchmark_status_command(workflow),
             _workflow_evaluation_container(workflow),
+            resource_group_id=str(context.get("resource_group_id") or "").strip(),
+            training_pool_id=str(context.get("training_pool_id") or "").strip(),
+            **_workflow_inference_owner_kwargs(context),
         )
         status = result.get("status")
         if status == "finished":
@@ -1720,9 +2113,25 @@ def _workflow_inference_matches_target(current: Dict[str, Any], target_model_pat
 def _workflow_deployed_model_status(
     target_model_path: str,
     evaluation_container: Optional[str] = None,
+    *,
+    resource_group_id: str = "",
+    training_pool_id: str = "",
+    owner_user_id: str = "",
+    owner_aliases: Any = None,
 ) -> Optional[Dict[str, Any]]:
-    current = _workflow_inference_command("查看推理配置", evaluation_container)
-    checked = _workflow_inference_command("查看推理服务状态", evaluation_container)
+    inference_kwargs = {}
+    if owner_user_id or owner_aliases:
+        inference_kwargs.update({
+            "owner_user_id": owner_user_id,
+            "owner_aliases": owner_aliases,
+        })
+    if resource_group_id or training_pool_id:
+        inference_kwargs.update({
+            "resource_group_id": resource_group_id,
+            "training_pool_id": training_pool_id,
+        })
+    current = _workflow_inference_command("查看推理配置", evaluation_container, **inference_kwargs)
+    checked = _workflow_inference_command("查看推理服务状态", evaluation_container, **inference_kwargs)
     if not checked.get("all_running"):
         return None
     if not _workflow_inference_matches_target(current, target_model_path):
@@ -1765,6 +2174,9 @@ def _workflow_deploy_service_status(workflow: Dict[str, Any]) -> Dict[str, Any]:
     checked = _workflow_inference_command(
         "查看推理服务状态",
         _workflow_evaluation_container(workflow),
+        resource_group_id=str(context.get("resource_group_id") or "").strip(),
+        training_pool_id=str(context.get("training_pool_id") or "").strip(),
+            **_workflow_inference_owner_kwargs(context),
     )
     all_running = checked.get("all_running") is True
     payload = {
@@ -1825,6 +2237,7 @@ def _workflow_structured_benchmark_query(
     script = r"""
 import json
 import os
+import re
 import sys
 
 root, job_id, benchmark, require_result_text, expected_model, aliases_json = sys.argv[1:7]
@@ -1858,10 +2271,95 @@ def normalize_status(meta, result):
         return "finished"
     return "running"
 
+def int_or_none(value):
+    try:
+        if value is None or value == "":
+            return None
+        return int(float(str(value).strip().rstrip("%")))
+    except (TypeError, ValueError):
+        return None
+
+def percent_or_none(value):
+    try:
+        if value is None or value == "":
+            return None
+        text = str(value).strip()
+        percent = float(text.rstrip("%"))
+        if "%" not in text and 0 <= percent <= 1:
+            percent *= 100
+        return round(percent, 1)
+    except (TypeError, ValueError):
+        return None
+
+def progress_text(processed, total, percent):
+    if processed is None or total is None:
+        return None
+    if percent is None and total:
+        percent = round(processed * 100 / total, 1)
+    if percent is None:
+        return f"{processed}/{total}"
+    return f"{processed}/{total} ({percent:.1f}%)"
+
+def progress_from_summary(result):
+    summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+    if not summary:
+        return {}
+    processed = int_or_none(summary.get("processed") or summary.get("done"))
+    total = int_or_none(summary.get("total"))
+    percent = percent_or_none(summary.get("progress") or summary.get("progress_percent"))
+    text = progress_text(processed, total, percent)
+    payload = {}
+    if processed is not None:
+        payload["processed"] = processed
+    if total is not None:
+        payload["total"] = total
+    if percent is not None:
+        payload["progress_percent"] = percent
+    if text:
+        payload["progress"] = text
+    elif summary.get("progress") is not None:
+        payload["progress"] = str(summary.get("progress"))
+    for key in ("correct", "accuracy", "avg_f1", "invalid", "invalid_rate"):
+        if key in summary:
+            payload[key] = summary[key]
+    metrics = summary.get("metrics")
+    if isinstance(metrics, dict):
+        for key in ("record_only", "executed", "passed", "failed", "timeout", "executor_error", "pass@1"):
+            if key in metrics:
+                payload[key] = metrics[key]
+    return payload
+
+def read_tail(path, max_bytes=65536):
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - max_bytes), os.SEEK_SET)
+            return handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+def progress_from_run_log(folder):
+    text = read_tail(os.path.join(folder, "run.log"))
+    matches = re.findall(r"\[(\d+)\s*/\s*(\d+)\]\s*done", text)
+    if not matches:
+        return {}
+    processed = int(matches[-1][0])
+    total = int(matches[-1][1])
+    percent = round(processed * 100 / total, 1) if total else None
+    return {
+        "processed": processed,
+        "total": total,
+        "progress_percent": percent,
+        "progress": progress_text(processed, total, percent),
+    }
+
 def payload_for(folder):
     meta = load(os.path.join(folder, "meta.json"))
     result = load(os.path.join(folder, "result.json"))
     status = normalize_status(meta, result)
+    result_path = os.path.join(folder, "result.json")
+    log_file = os.path.join(folder, "run.log")
     payload = {
         "status": status,
         "benchmark_status": status,
@@ -1872,20 +2370,28 @@ def payload_for(folder):
         "end_time": meta.get("end_time"),
         "folder_path": folder,
         "log_dir": folder,
-        "result_path": os.path.join(folder, "result.json"),
+        "log_file": log_file,
+        "result_path": result_path,
         "data": {"meta": meta},
     }
     if result:
         payload["data"]["result"] = result
+    summary_progress = progress_from_summary(result)
+    has_structured_progress = (
+        summary_progress.get("processed") is not None
+        and summary_progress.get("total") is not None
+    )
+    log_progress = {} if has_structured_progress else progress_from_run_log(folder)
+    payload.update({**log_progress, **summary_progress})
     return payload
 
 folders = []
 skipped = []
+target_names = {norm_name(value) for value in benchmark_aliases}
 if os.path.isdir(root):
     if job_id and os.path.isdir(os.path.join(root, job_id)):
         folders = [os.path.join(root, job_id)]
     else:
-        target_names = {norm_name(value) for value in benchmark_aliases}
         for name in os.listdir(root):
             folder = os.path.join(root, name)
             if not os.path.isdir(folder):
@@ -1982,15 +2488,282 @@ def _workflow_monitor_benchmark(workflow: Dict[str, Any]) -> Dict[str, Any]:
 def _workflow_benchmark_result(workflow: Dict[str, Any]) -> Dict[str, Any]:
     return _workflow_structured_benchmark_query(workflow, require_result=True)
 
+def _workflow_inference_resource_result_fields(result: Dict[str, Any]) -> Dict[str, Any]:
+    resource_context = result.get("resource_context")
+    if not isinstance(resource_context, dict):
+        return {}
+    reservation_id = str(resource_context.get("reservation_id") or "").strip()
+    if not reservation_id:
+        return {}
+    return {
+        "inference_resource_context": resource_context,
+        "inference_reservation_id": reservation_id,
+        "inference_assigned_gpus": resource_context.get("assigned_gpus"),
+        "inference_runtime_node_id": resource_context.get("runtime_node_id"),
+    }
+
+def _workflow_context_inference_resource_context(context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    resource_context = context.get("inference_resource_context")
+    if isinstance(resource_context, dict):
+        return resource_context
+    return None
+
+
+def _normalize_gpu_id_set(value: Any) -> set[str]:
+    if value in (None, "", [], {}):
+        return set()
+    if isinstance(value, str):
+        parts = re.split(r"[,;\s]+", value.strip())
+    elif isinstance(value, (list, tuple, set)):
+        parts = list(value)
+    else:
+        parts = [value]
+    return {str(part).strip() for part in parts if str(part).strip()}
+
+
+def _workflow_expected_inference_gpus(resource_context: Optional[Dict[str, Any]]) -> set[str]:
+    if not isinstance(resource_context, dict):
+        return set()
+    for key in ("assigned_gpus", "gpu_ids", "gpus", "CUDA_VISIBLE_DEVICES", "cuda_visible_devices"):
+        values = _normalize_gpu_id_set(resource_context.get(key))
+        if values:
+            return values
+    nodes = resource_context.get("nodes")
+    if isinstance(nodes, list):
+        values: set[str] = set()
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            for key in ("assigned_gpus", "gpu_ids", "gpus", "CUDA_VISIBLE_DEVICES", "cuda_visible_devices"):
+                values.update(_normalize_gpu_id_set(node.get(key)))
+        if values:
+            return values
+    return set()
+
+
+def _workflow_payload_active_service_items(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    seen: set[int] = set()
+
+    def collect(source: Any) -> None:
+        if not isinstance(source, dict):
+            return
+        source_id = id(source)
+        if source_id in seen:
+            return
+        seen.add(source_id)
+        service_instances = source.get("service_instances")
+        if isinstance(service_instances, dict):
+            raw_items = service_instances.get("items")
+            if isinstance(raw_items, list):
+                for item in raw_items:
+                    if isinstance(item, dict):
+                        status = str(item.get("status") or "").strip().lower()
+                        if status in {"running", "degraded"}:
+                            items.append(item)
+        nodes = source.get("nodes")
+        if isinstance(nodes, dict):
+            for node_payload in nodes.values():
+                collect(node_payload)
+
+    protocol = payload.get("protocol") if isinstance(payload.get("protocol"), dict) else {}
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    for source in (protocol, data, payload):
+        collect(source)
+    return items
+
+
+def _workflow_payload_item_gpu_ids(item: Dict[str, Any]) -> set[str]:
+    values: set[str] = set()
+    nested_sources = [item]
+    for key in ("resource", "resource_context", "runtime", "config", "config_draft"):
+        nested = item.get(key)
+        if isinstance(nested, dict):
+            nested_sources.append(nested)
+            nested_values = nested.get("values")
+            if isinstance(nested_values, dict):
+                nested_sources.append(nested_values)
+    for source in nested_sources:
+        for key in (
+            "assigned_gpus",
+            "assignedGpus",
+            "gpu_ids",
+            "gpuIds",
+            "gpus",
+            "CUDA_VISIBLE_DEVICES",
+            "cuda_visible_devices",
+        ):
+            values.update(_normalize_gpu_id_set(source.get(key)))
+    return values
+
+
+def _workflow_payload_item_resource_scope(item: Dict[str, Any]) -> tuple[str, str]:
+    sources = [item]
+    for key in ("resource", "resource_context"):
+        nested = item.get(key)
+        if isinstance(nested, dict):
+            sources.append(nested)
+
+    resource_group_id = ""
+    training_pool_id = ""
+    for source in sources:
+        if not resource_group_id:
+            resource_group_id = str(
+                source.get("resource_group_id") or source.get("resourceGroupId") or ""
+            ).strip()
+        if not training_pool_id:
+            training_pool_id = str(
+                source.get("training_pool_id") or source.get("trainingPoolId") or ""
+            ).strip()
+    return resource_group_id, training_pool_id
+
+
+def _workflow_inference_service_matches_resource(
+    status_result: Dict[str, Any],
+    resource_context: Optional[Dict[str, Any]],
+    *,
+    resource_group_id: str = "",
+    training_pool_id: str = "",
+) -> bool:
+    if not status_result.get("all_running"):
+        return False
+    expected_resource_group_id = str(resource_group_id or "").strip()
+    expected_training_pool_id = str(training_pool_id or "").strip()
+    expected_reservation_id = ""
+    if isinstance(resource_context, dict):
+        expected_reservation_id = str(
+            resource_context.get("reservation_id") or resource_context.get("reservationId") or ""
+        ).strip()
+    expected_gpus = _workflow_expected_inference_gpus(resource_context)
+    resource_scoped = bool(
+        expected_resource_group_id
+        or expected_training_pool_id
+        or expected_reservation_id
+        or expected_gpus
+    )
+    if not resource_scoped:
+        return True
+    for item in _workflow_payload_active_service_items(status_result):
+        if expected_reservation_id and _reservation_id_from_payload_item(item) == expected_reservation_id:
+            return True
+        if expected_gpus:
+            item_gpus = _workflow_payload_item_gpu_ids(item)
+            if item_gpus and item_gpus == expected_gpus:
+                return True
+        if not expected_reservation_id and not expected_gpus and (expected_resource_group_id or expected_training_pool_id):
+            item_group_id, item_pool_id = _workflow_payload_item_resource_scope(item)
+            if expected_resource_group_id and item_group_id != expected_resource_group_id:
+                continue
+            if expected_training_pool_id and item_pool_id != expected_training_pool_id:
+                continue
+            if item_group_id or item_pool_id:
+                return True
+    return False
+
+def _workflow_ensure_benchmark_inference_ready(workflow: Dict[str, Any]) -> Dict[str, Any]:
+    context = workflow.get("context") or {}
+    container = _workflow_evaluation_container(workflow)
+    resource_group_id = str(context.get("resource_group_id") or "").strip()
+    training_pool_id = str(context.get("training_pool_id") or "").strip()
+    owner_kwargs = _workflow_inference_owner_kwargs(context)
+    resource_context = _workflow_context_inference_resource_context(context)
+
+    status_result = _workflow_inference_command(
+        "查看推理服务状态",
+        container,
+        resource_group_id=resource_group_id,
+        training_pool_id=training_pool_id,
+        **owner_kwargs,
+    )
+    if _workflow_inference_service_matches_resource(
+        status_result,
+        resource_context,
+        resource_group_id=resource_group_id,
+        training_pool_id=training_pool_id,
+    ):
+        return status_result
+
+    if not resource_context:
+        try:
+            resource_context = _inference_request_resource_context(
+                "重启推理服务",
+                resource_group_id=resource_group_id,
+                training_pool_id=training_pool_id,
+            )
+        except Exception as e:
+            raise RuntimeError(f"申请推理服务 GPU 资源失败: {e}")
+
+    start_result = _workflow_inference_command(
+        "重启推理服务",
+        container,
+        resource_context=resource_context,
+        **owner_kwargs,
+    )
+    if not start_result.get("success"):
+        error_msg = start_result.get("error") or start_result.get("result") or "推理服务重启命令失败"
+        raise RuntimeError(error_msg)
+    if isinstance(resource_context, dict):
+        context["inference_resource_context"] = resource_context
+
+    for _ in range(12):
+        time.sleep(5)
+        check = _workflow_inference_command(
+            "查看推理服务状态",
+            container,
+            resource_group_id=resource_group_id,
+            training_pool_id=training_pool_id,
+            **owner_kwargs,
+        )
+        if _workflow_inference_service_matches_resource(
+            check,
+            resource_context,
+            resource_group_id=resource_group_id,
+            training_pool_id=training_pool_id,
+        ):
+            return check
+    raise RuntimeError("推理服务启动超时，请检查容器日志和资源配置")
+
+
+def _workflow_start_benchmark(workflow: Dict[str, Any]) -> Dict[str, Any]:
+    context = workflow.get("context") or {}
+    container = _workflow_evaluation_container(workflow)
+    resource_group_id = str(context.get("resource_group_id") or "").strip()
+    training_pool_id = str(context.get("training_pool_id") or "").strip()
+    owner_kwargs = _workflow_inference_owner_kwargs(context)
+    _workflow_ensure_benchmark_inference_ready(workflow)
+
+    result = _workflow_inference_command(
+        _benchmark_start_command(workflow),
+        container,
+        resource_group_id=resource_group_id,
+        training_pool_id=training_pool_id,
+        **owner_kwargs,
+    )
+
+    if not result.get("success"):
+        raise RuntimeError(result.get("error") or result.get("result") or f"{_benchmark_name(workflow)}基准评测启动失败")
+    return result
+
+
+def _workflow_inference_service_stop_command() -> str:
+    return "停止推理服务 确认停止"
 
 def _workflow_stop_inference_service(workflow: Dict[str, Any]) -> Dict[str, Any]:
-    result = _workflow_inference_command("停止推理服务", _workflow_evaluation_container(workflow))
-    result["stop_command"] = "停止推理服务"
+    context = workflow.get("context") or {}
+    stop_command = _workflow_inference_service_stop_command()
+    result = _workflow_inference_command(
+        stop_command,
+        _workflow_evaluation_container(workflow),
+        resource_group_id=str(context.get("resource_group_id") or "").strip(),
+        training_pool_id=str(context.get("training_pool_id") or "").strip(),
+            **_workflow_inference_owner_kwargs(context),
+    )
+    result["stop_command"] = stop_command
     result["service_log_command"] = "查看推理服务日志"
     log_fields = _append_workflow_stage_log(
         workflow,
         "stop_service",
-        "停止推理服务",
+        stop_command,
         result,
     )
     result.update(log_fields)
@@ -2005,10 +2778,14 @@ def _workflow_benchmark_stop_command(workflow: Dict[str, Any]) -> str:
     result = stage.get("result") if isinstance(stage.get("result"), dict) else {}
     stop_command = str(result.get("stop_command") or "").strip()
     if stop_command:
-        return stop_command
+        #deepseek
+        #return stop_command
+        return f"{stop_command} 确认停止"
     job_id = str(result.get("benchmark_job_id") or "").strip()
     if job_id:
-        return f'benchmark_stop("{job_id}")'
+        #deepseek
+        #return f'benchmark_stop("{job_id}")'
+        return f'benchmark_stop("{job_id}") 确认停止'
     benchmark = _benchmark_name(workflow)
     benchmark_command = "2024.json" if benchmark in {"2024", "2024.json"} else benchmark
     return f"停止推理基准测试{benchmark_command}"
@@ -2039,6 +2816,18 @@ def _workflow_service_statuses_from_services(services: Any) -> List[str]:
         if isinstance(item, dict) and str(item.get("status") or "").strip()
     ]
 
+def _workflow_service_statuses_from_service_instances(service_instances: Any) -> List[str]:
+    if not isinstance(service_instances, dict):
+        return []
+    items = service_instances.get("items")
+    if not isinstance(items, list):
+        return []
+    return [
+        str(item.get("status") or "").strip().lower()
+        for item in items
+        if isinstance(item, dict) and str(item.get("status") or "").strip()
+    ]
+
 
 def _workflow_service_statuses_from_nodes(nodes: Any) -> List[str]:
     if not isinstance(nodes, dict):
@@ -2049,6 +2838,59 @@ def _workflow_service_statuses_from_nodes(nodes: Any) -> List[str]:
             continue
         statuses.extend(_workflow_service_statuses_from_services(node_payload.get("services")))
     return statuses
+#deepseek
+CORE_INFERENCE_PORTS = {"vllm", "inference", "ui", "case2chat"}
+#deepseek
+def _workflow_are_degraded_ports_healthy(payload: Dict[str, Any]) -> bool:
+    """检测所有 degraded 实例的四个核心端口是否都 running。"""
+    protocol = payload.get("protocol") if isinstance(payload.get("protocol"), dict) else {}
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+
+    def _collect_degraded_items(source: Dict[str, Any]) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        si = source.get("service_instances")
+        if isinstance(si, dict):
+            si_items = si.get("items")
+            if isinstance(si_items, list):
+                for item in si_items:
+                    if isinstance(item, dict) and str(item.get("status") or "").lower() == "degraded":
+                        items.append(item)
+        nodes = source.get("nodes")
+        if isinstance(nodes, dict):
+            for node_payload in nodes.values():
+                if not isinstance(node_payload, dict):
+                    continue
+                si = node_payload.get("service_instances")
+                if isinstance(si, dict):
+                    si_items = si.get("items")
+                    if isinstance(si_items, list):
+                        for item in si_items:
+                            if isinstance(item, dict) and str(item.get("status") or "").lower() == "degraded":
+                                items.append(item)
+        return items
+
+    all_degraded: List[Dict[str, Any]] = []
+    for source in (protocol, data, payload):
+        all_degraded.extend(_collect_degraded_items(source))
+
+    if not all_degraded:
+        return True
+
+    for item in all_degraded:
+        port_statuses = item.get("port_statuses")
+        if not isinstance(port_statuses, list):
+            return False
+        running_core = set()
+        for ps in port_statuses:
+            if not isinstance(ps, dict):
+                continue
+            name = str(ps.get("name") or "").lower()
+            status = str(ps.get("status") or "").lower()
+            if name in CORE_INFERENCE_PORTS and status == "running":
+                running_core.add(name)
+        if not CORE_INFERENCE_PORTS.issubset(running_core):
+            return False
+    return True
 
 
 def _workflow_all_running_from_payload(payload: Dict[str, Any], result: str = "") -> Optional[bool]:
@@ -2079,12 +2921,33 @@ def _workflow_all_running_from_payload(payload: Dict[str, Any], result: str = ""
     statuses.extend(_workflow_service_statuses_from_services(protocol.get("services")))
     statuses.extend(_workflow_service_statuses_from_services(data.get("services")))
     statuses.extend(_workflow_service_statuses_from_services(payload.get("services")))
+    statuses.extend(_workflow_service_statuses_from_service_instances(protocol.get("service_instances")))
+    statuses.extend(_workflow_service_statuses_from_service_instances(data.get("service_instances")))
+    statuses.extend(_workflow_service_statuses_from_service_instances(payload.get("service_instances")))
+    for nodes in (protocol.get("nodes"), data.get("nodes"), payload.get("nodes")):
+        if not isinstance(nodes, dict):
+            continue
+        for node_payload in nodes.values():
+            if isinstance(node_payload, dict):
+                statuses.extend(_workflow_service_statuses_from_service_instances(node_payload.get("service_instances")))
+
+    
     if statuses:
-        return all(status == "running" for status in statuses)
+        #deepseek
+        active_statuses = [s for s in statuses if s in {"running", "degraded", "starting"}]
+        if not active_statuses:
+            return False
+        if all(s == "running" for s in active_statuses):
+            return True
+        if all(s in {"running", "degraded"} for s in active_statuses):
+            if _workflow_are_degraded_ports_healthy(payload):
+                 return True
+        return False
 
     text_statuses = _workflow_service_statuses_from_text(result)
+    #deepseek
     if text_statuses:
-        return all(status == "running" for status in text_statuses)
+        return all(status in {"running", "degraded"} for status in text_statuses)
 
     lowered = str(result or "").lower()
     if any(keyword in lowered for keyword in ["运行中", "正在运行", "运行状态", "正常运行", "running"]):
@@ -2092,21 +2955,263 @@ def _workflow_all_running_from_payload(payload: Dict[str, Any], result: str = ""
     return None
 
 
-def _workflow_inference_command(command: str, container: Optional[str] = None) -> Dict[str, Any]:
-    response = requests.post(
-        config.agents.inference.inference_agent_url,
-        json={
-            "command": command,
-            "user_id": "workflow-manager",
-            "container": container or _current_evaluation_container(),
-        },
-        timeout=360,
+def _reservation_id_from_payload_item(item: Any) -> str:
+    if not isinstance(item, dict):
+        return ""
+    resource = item.get("resource") if isinstance(item.get("resource"), dict) else {}
+    resource_context = item.get("resource_context") if isinstance(item.get("resource_context"), dict) else {}
+    return str(
+        item.get("reservation_id")
+        or item.get("reservationId")
+        or resource.get("reservation_id")
+        or resource.get("reservationId")
+        or resource_context.get("reservation_id")
+        or resource_context.get("reservationId")
+        or ""
+    ).strip()
+
+
+def _service_start_matches_reservation(service_start: Any, reservation_id: str) -> bool:
+    if not reservation_id or not isinstance(service_start, dict):
+        return False
+    if service_start.get("submitted") is not True:
+        return False
+    return _reservation_id_from_payload_item(service_start) == reservation_id
+
+
+def _service_instances_hold_reservation(service_instances: Any, reservation_id: str) -> bool:
+    if not reservation_id or not isinstance(service_instances, dict):
+        return False
+    items = service_instances.get("items")
+    if not isinstance(items, list):
+        return False
+    active_statuses = {"starting", "running", "degraded"}
+    return any(
+        isinstance(item, dict)
+        and str(item.get("status") or "").strip().lower() in active_statuses
+        and _reservation_id_from_payload_item(item) == reservation_id
+        for item in items
     )
-    response.raise_for_status()
-    payload = response.json()
+
+
+def _payload_holds_matching_service_start(payload: Dict[str, Any], reservation_id: str) -> bool:
+    protocol = payload.get("protocol") if isinstance(payload.get("protocol"), dict) else {}
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    #deepseek
+    result = str(payload.get("result") or "")
+    for source in (protocol, data, payload):
+        if _service_start_matches_reservation(source.get("service_start"), reservation_id):
+            return True
+    for nodes in (protocol.get("nodes"), data.get("nodes"), payload.get("nodes")):
+        if not isinstance(nodes, dict):
+            continue
+        for node_payload in nodes.values():
+            if isinstance(node_payload, dict) and _service_start_matches_reservation(node_payload.get("service_start"), reservation_id):
+                return True
+    #deepseek
+    if not reservation_id:
+        return False
+    protocol_type = str(protocol.get("type") or "").lower()
+    action = str(protocol.get("action") or "").lower()
+    if protocol_type == "job_started" and action in {"service_start", "service_restart"}:
+        return True
+    if reservation_id in result:
+        return True
+    return False
+
+
+def _payload_holds_matching_service_instance(payload: Dict[str, Any], reservation_id: str) -> bool:
+    protocol = payload.get("protocol") if isinstance(payload.get("protocol"), dict) else {}
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    for source in (protocol, data, payload):
+        if _service_instances_hold_reservation(source.get("service_instances"), reservation_id):
+            return True
+    for nodes in (protocol.get("nodes"), data.get("nodes"), payload.get("nodes")):
+        if not isinstance(nodes, dict):
+            continue
+        for node_payload in nodes.values():
+            if isinstance(node_payload, dict) and _service_instances_hold_reservation(node_payload.get("service_instances"), reservation_id):
+                return True
+    return False
+
+
+def _inference_response_holds_resource_reservation(
+    command: str,
+    payload: Dict[str, Any],
+    result: str = "",
+    resource_context: Optional[Dict[str, Any]] = None,
+) -> bool:
+    if not _inference_command_needs_resource_context(command) or not isinstance(payload, dict):
+        return False
+    reservation_id = str((resource_context or {}).get("reservation_id") or "").strip()
+    if not reservation_id:
+        return False
+    protocol = payload.get("protocol") if isinstance(payload.get("protocol"), dict) else {}
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    status_value = str(payload.get("status") or "").lower()
+    if status_value in {"error", "failed", "timeout"}:
+        return False
+    protocol_type = str(protocol.get("type") or "").lower()
+    action = str(protocol.get("action") or data.get("action") or payload.get("action") or "").lower()
+    if protocol_type in {"job_failed", "error", "need_input", "inference_config"}:
+        return False
+    if action in {"config_view", "config_update", "service_status", "service_instances", "instance_list", "instance_status", "service_stop_preview", "benchmark_stop_preview", "test_stop_preview", "logs"}:
+        return False
+    if _payload_holds_matching_service_start(payload, reservation_id):
+        return True
+    return _payload_holds_matching_service_instance(payload, reservation_id)
+
+def _inference_service_start_submitted(response_data: Any) -> bool:
+    if not isinstance(response_data, dict):
+        return False
+    service_start = response_data.get("service_start")
+    if isinstance(service_start, dict) and service_start.get("submitted") is True:
+        return True
+    service_instances = response_data.get("service_instances")
+    if isinstance(service_instances, dict):
+        items = service_instances.get("items")
+        if isinstance(items, list):
+            active_statuses = {"starting", "running", "degraded"}
+            if any(
+                isinstance(item, dict)
+                and str(item.get("status") or "").strip().lower() in active_statuses
+                for item in items
+            ):
+                return True
+    nodes = response_data.get("nodes")
+    if isinstance(nodes, dict):
+        return any(
+            isinstance(node_data, dict)
+            and _inference_service_start_submitted(node_data)
+            for node_data in nodes.values()
+        )
+    return False
+
+
+def _inference_service_start_payload_submitted(response_data: Any) -> bool:
+    if not isinstance(response_data, dict):
+        return False
+    service_start = response_data.get("service_start")
+    if isinstance(service_start, dict) and service_start.get("submitted") is True:
+        return True
+    nodes = response_data.get("nodes")
+    if isinstance(nodes, dict):
+        return any(
+            isinstance(node_data, dict)
+            and _inference_service_start_payload_submitted(node_data)
+            for node_data in nodes.values()
+        )
+    return False
+
+
+def _inference_start_result_needs_input(result: str) -> bool:
+    text = str(result or "")
+    lowered = text.lower()
+    return (
+        "请提供" in text
+        or "请确认" in text
+        or "需要" in text and "参数" in text
+        or "无法识别模型参数规模" in text
+        or "model_param_b" in lowered
+    )
+
+def _workflow_inference_command(
+    command: str,
+    container: Optional[str] = None,
+    *,
+    resource_group_id: str = "",
+    training_pool_id: str = "",
+    user_role: str = "",
+    owner_user_id: str = "",
+    owner_aliases: Any = None,
+    resource_context: Optional[Dict[str, Any]] = None,
+    #deepseek
+    workflow: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    #deepseek
+    if workflow is not None:
+        ctx = workflow.get("context") or {}
+        resource_group_id = str(resource_group_id or ctx.get("resource_group_id") or "").strip()
+        training_pool_id = str(training_pool_id or ctx.get("training_pool_id") or "").strip()
+        if not user_role:
+            user_role = str(ctx.get("user_role") or "").strip()
+        if not owner_user_id:
+            owner_user_id = str(ctx.get("inference_owner_user_id") or "").strip()
+        if not owner_aliases:
+            owner_aliases = _owner_aliases_from_any(ctx.get("inference_owner_aliases"))
+
+    
+    
+    prepare_resource_context = globals().get("_inference_request_resource_context")
+    release_resource_context = globals().get("_release_inference_resource_context", lambda _context: None)
+
+    release_known_reservations = globals().get("_release_known_inference_reservations", lambda: None)
+    command_may_stop_service = globals().get("_inference_command_may_stop_service", lambda _command: False)
+    
+    ##deepseek
+    # 如果未提供 resource_context，则自动申请
+    if resource_context is None:
+        try:
+            if callable(prepare_resource_context):
+                resource_context = prepare_resource_context(
+                    command,
+                    resource_group_id=resource_group_id,
+                    training_pool_id=training_pool_id,
+                )
+        except Exception:
+            release_resource_context(resource_context)
+            raise
+    # 否则直接使用外部传入的，跳过申请
+    else:
+        # 确保 resource_context 是 dict
+        if not isinstance(resource_context, dict):
+            resource_context = {}
+
+    try:
+        current_owner = globals().get("_current_inference_owner_user_id")
+        current_aliases = globals().get("_current_inference_owner_aliases")
+        alias_parser = globals().get("_owner_aliases_from_any", lambda value: list(value or []) if isinstance(value, (list, tuple, set)) else [item.strip() for item in str(value or "").split(",") if item.strip()])
+        resolved_owner_user_id = str(owner_user_id or (current_owner() if callable(current_owner) else "") or "workflow-manager").strip()
+        resolved_owner_aliases = alias_parser(owner_aliases) or (current_aliases() if callable(current_aliases) else [])
+        request_payload: Dict[str, Any] = {
+            "command": command,
+            "user_id": resolved_owner_user_id,
+            "user_aliases": resolved_owner_aliases,
+            "thread_id": "workflow-manager",
+            "container": container or _current_evaluation_container(),
+        }
+        if user_role:
+            request_payload["user_role"] = user_role.strip().lower()
+        if resource_context:
+            request_payload["resource_context"] = resource_context
+        response = requests.post(
+            config.agents.inference.inference_agent_url,
+            json=request_payload,
+            timeout=360,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:
+        release_resource_context(resource_context)
+        raise
+
     if not isinstance(payload, dict):
         payload = {}
+    status_value = str(payload.get("status") or "").lower()
     result = str(payload.get("result") or payload.get("message") or "")
+    if isinstance(resource_context, dict) and resource_context.get("reservation_id"):
+        if _inference_response_holds_resource_reservation(command, payload, result, resource_context):
+            start_resource_heartbeat = globals().get("_start_inference_resource_heartbeat", lambda _context: None)
+            start_resource_heartbeat(resource_context)
+        else:
+            release_resource_context(resource_context)
+    ###deepseek
+    #_inference_payload_is_service_stop = globals().get("_inference_payload_is_service_stop", lambda _payload: False)
+    #if _inference_payload_is_service_stop(payload):
+    #    release_known_reservations()
+    if command_may_stop_service(command) and _inference_stop_response_is_success(command, payload):
+        release_known_reservations()
+
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
     lowered = result.lower()
     all_running = _workflow_all_running_from_payload(payload, result)
@@ -2130,7 +3235,7 @@ def _workflow_inference_command(command: str, container: Optional[str] = None) -
             if any(keyword in result for keyword in keywords):
                 benchmark_status = status_value
                 break
-    failed = _workflow_inference_has_failure_signal(result)
+    failed = status_value in {"error", "failed", "timeout"} or _workflow_inference_has_failure_signal(result)
     model_name = _workflow_inference_model_name(data)
     if model_name is None:
         model_name = _workflow_inference_model_name(payload)
@@ -2144,16 +3249,20 @@ def _workflow_inference_command(command: str, container: Optional[str] = None) -
         "all_running": all_running is True,
         "status": benchmark_status or None,
         "error": result if failed else None,
+        "resource_context": resource_context,
     }
-
 
 def _workflow_stop_task(workflow: Dict[str, Any]) -> Dict[str, Any]:
     stage_name = workflow["current_stage"]
     stage = workflow["stages"][stage_name]
     if stage_name == "benchmark":
+        context = workflow.get("context") or {}
         stop_benchmark_result = _workflow_inference_command(
             _workflow_benchmark_stop_command(workflow),
             _workflow_evaluation_container(workflow),
+            resource_group_id=str(context.get("resource_group_id") or "").strip(),
+            training_pool_id=str(context.get("training_pool_id") or "").strip(),
+            **_workflow_inference_owner_kwargs(context),
         )
         benchmark_log_fields = _append_workflow_stage_log(
             workflow,
@@ -2166,7 +3275,7 @@ def _workflow_stop_task(workflow: Dict[str, Any]) -> Dict[str, Any]:
             **benchmark_log_fields,
             "benchmark_stop_result": stop_benchmark_result,
             "inference_service_stop_result": stop_service_result,
-            "inference_service_stop_command": "停止推理服务",
+            "inference_service_stop_command": _workflow_inference_service_stop_command(),
             "inference_service_log_command": "查看推理服务日志",
             "stop_service_log_path": stop_service_result.get("stop_service_log_path"),
             "stop_service_log_tail": stop_service_result.get("stop_service_log_tail"),
@@ -2176,7 +3285,7 @@ def _workflow_stop_task(workflow: Dict[str, Any]) -> Dict[str, Any]:
         stop_service_result = _workflow_stop_inference_service(workflow)
         return {
             "inference_service_stop_result": stop_service_result,
-            "inference_service_stop_command": "停止推理服务",
+            "inference_service_stop_command": _workflow_inference_service_stop_command(),
             "inference_service_log_command": "查看推理服务日志",
             "stop_service_log_path": stop_service_result.get("stop_service_log_path"),
             "stop_service_log_tail": stop_service_result.get("stop_service_log_tail"),
@@ -2297,6 +3406,7 @@ def get_workflow_manager() -> WorkflowManager:
                     stop_inference_service=_workflow_stop_inference_service,
                     check_existing_stage_output=_workflow_check_existing_stage_output,
                     monitor_deploy=_workflow_monitor_deploy,
+                    start_benchmark=_workflow_start_benchmark,
                     monitor_benchmark=_workflow_monitor_benchmark,
                     benchmark_result=_workflow_benchmark_result,
                 ),
@@ -3360,6 +4470,10 @@ class OrchestratorSystem:
 
     def _normalize_inference_status(self, status_text: str) -> str:
         text = (status_text or "").strip().lower()
+        if any(keyword in text for keyword in ["启动中", "starting"]):
+            return "starting"
+        if any(keyword in text for keyword in ["降级", "degraded"]):
+            return "degraded"
         if any(keyword in text for keyword in ["运行", "running", "started", "已启动"]):
             return "running"
         if any(keyword in text for keyword in ["停止", "stopped", "未运行", "not running"]):
@@ -3394,6 +4508,8 @@ class OrchestratorSystem:
             "可见GPU设备": "CUDA_VISIBLE_DEVICES",
             "可见GPU": "CUDA_VISIBLE_DEVICES",
             "模型名称": "MODEL_NAME",
+            "模型参数量": "MODEL_PARAM_B",
+            "主端口": "MASTER_PORT",
             "模型路径": "MODEL_PATH",
             "启动脚本": "START_SCRIPT",
             "启动脚本路径": "START_SCRIPT",
@@ -3411,6 +4527,8 @@ class OrchestratorSystem:
             "代码评估进程数限制": "HUMANEVAL_PIDS_LIMIT",
             "张量并行规模": "TENSOR_PARALLEL_SIZE",
             "GPU内存利用率": "GPU_MEMORY_UTILIZATION",
+            "GPU显存利用率": "GPU_MEMORY_UTILIZATION",
+            "GPU利用率阈值": "GPU_UTILIZATION_THRESHOLD",
             "最大上下文长度": "MAX_TOKENS",
         }
         if re.fullmatch(r"[A-Za-z0-9_]+", normalized):
@@ -3445,7 +4563,7 @@ class OrchestratorSystem:
         if "ENV" in upper_context or "环境" in context:
             return "env"
         port_keys = {"VLLM_OPENAI_PORT", "INFERENCE_PORT", "UI_PORT", "DATA_ANNOTATION_PORT"}
-        runtime_keys = {"TENSOR_PARALLEL_SIZE", "GPU_MEMORY_UTILIZATION", "MAX_TOKENS"}
+        runtime_keys = {"TENSOR_PARALLEL_SIZE", "GPU_MEMORY_UTILIZATION", "GPU_UTILIZATION_THRESHOLD", "MAX_TOKENS"}
         keys = {str(key) for key in payload.keys()}
         if keys & port_keys:
             return "ports"
@@ -3506,7 +4624,7 @@ class OrchestratorSystem:
             if not key:
                 continue
             value = self._normalize_inference_config_value(match.group(2).strip())
-            if key in {"TENSOR_PARALLEL_SIZE", "GPU_MEMORY_UTILIZATION", "MAX_TOKENS"}:
+            if key in {"TENSOR_PARALLEL_SIZE", "GPU_MEMORY_UTILIZATION", "GPU_UTILIZATION_THRESHOLD", "MAX_TOKENS"}:
                 config_data["runtime"][key] = value
             elif key in {"VLLM_OPENAI_PORT", "INFERENCE_PORT", "UI_PORT", "DATA_ANNOTATION_PORT"}:
                 config_data["ports"][key] = value
@@ -3540,11 +4658,19 @@ class OrchestratorSystem:
             )
         display_name_map = {
             "VLLM 服务": "VLLM_OPENAI_PORT",
+            "vLLM API": "VLLM_OPENAI_PORT",
+            "vLLM OpenAI API": "VLLM_OPENAI_PORT",
+            "VLLM OpenAI API": "VLLM_OPENAI_PORT",
+            "vLLM OpenAI 兼容 API": "VLLM_OPENAI_PORT",
             "VLLM服务": "VLLM_OPENAI_PORT",
             "vLLM 服务": "VLLM_OPENAI_PORT",
+            "Inference Server": "INFERENCE_PORT",
             "推理服务": "INFERENCE_PORT",
+            "Web UI": "UI_PORT",
             "UI 服务": "UI_PORT",
             "UI服务": "UI_PORT",
+            "Case2Chat": "DATA_ANNOTATION_PORT",
+            "Data Annotation": "DATA_ANNOTATION_PORT",
             "数据标注服务": "DATA_ANNOTATION_PORT",
         }
         display_pattern = re.compile(
@@ -3571,6 +4697,39 @@ class OrchestratorSystem:
                     "rawStatus": raw_status,
                 }
             )
+            seen.add((name, port))
+        table_pattern = re.compile(r"^\s*\|(.+?)\|\s*$", re.MULTILINE)
+        for match in table_pattern.finditer(text or ""):
+            cells = [cell.strip().strip("*` ") for cell in match.group(1).split("|")]
+            if len(cells) < 3:
+                continue
+            if all(re.fullmatch(r":?-{2,}:?", cell.replace(" ", "")) for cell in cells):
+                continue
+            service_label, port_text, raw_status = cells[0], cells[1], cells[2]
+            header_text = "".join(cells).lower()
+            if any(keyword in header_text for keyword in ["服务组件端口状态", "servicecomponentportstatus"]):
+                continue
+            port_match = re.search(r"\d{2,5}", port_text)
+            if not service_label or not port_match:
+                continue
+            port = int(port_match.group(0))
+            normalized_status = self._normalize_inference_status(raw_status)
+            if normalized_status == "unknown":
+                continue
+            label = re.sub(r"\s+", " ", service_label)
+            name = display_name_map.get(label, label)
+            if (name, port) in seen:
+                continue
+            services.append(
+                {
+                    "name": name,
+                    "displayName": label,
+                    "port": port,
+                    "status": normalized_status,
+                    "rawStatus": raw_status,
+                }
+            )
+            seen.add((name, port))
         return services
 
     def _normalize_inference_config_payload(
@@ -3610,6 +4769,79 @@ class OrchestratorSystem:
             services.append(service)
         return services     
 
+    def _normalize_inference_port_statuses_payload(
+        self,
+        payload: Any,
+        *,
+        fallback_ports: Any = None,
+        fallback_status: Any = None,
+    ) -> List[Dict[str, Any]]:
+        source_items = payload if isinstance(payload, list) else []
+        port_statuses: List[Dict[str, Any]] = []
+        for item in source_items:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or item.get("key") or item.get("service") or "").strip()
+            port = item.get("port")
+            if not name or port in (None, ""):
+                continue
+            status = self._normalize_inference_status(item.get("status"))
+            if status == "unknown":
+                status = self._normalize_inference_status(fallback_status)
+            port_statuses.append(
+                {
+                    "key": name,
+                    "name": name,
+                    "displayName": item.get("displayName") or item.get("label") or name,
+                    "port": port,
+                    "status": status,
+                    "rawStatus": item.get("rawStatus") or item.get("status") or status,
+                }
+            )
+        if port_statuses or not isinstance(fallback_ports, dict):
+            return port_statuses
+        fallback = self._normalize_inference_status(fallback_status)
+        for name in ("vllm", "inference", "ui", "case2chat"):
+            port = fallback_ports.get(name)
+            if port in (None, ""):
+                continue
+            port_statuses.append(
+                {
+                    "key": name,
+                    "name": name,
+                    "displayName": name,
+                    "port": port,
+                    "status": fallback if fallback != "unknown" else "stopped",
+                    "rawStatus": fallback if fallback != "unknown" else "stopped",
+                }
+            )
+        return port_statuses
+
+    def _normalize_inference_service_instances_payload(
+        self, payload: Any
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return None
+        normalized = dict(payload)
+        items = payload.get("items")
+        if not isinstance(items, list):
+            return normalized
+        normalized_items: List[Dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            normalized_item = dict(item)
+            port_statuses = self._normalize_inference_port_statuses_payload(
+                normalized_item.get("port_statuses") or normalized_item.get("portStatuses"),
+                fallback_ports=normalized_item.get("ports"),
+                fallback_status=normalized_item.get("status"),
+            )
+            if port_statuses:
+                normalized_item["port_statuses"] = port_statuses
+            normalized_items.append(normalized_item)
+        normalized["items"] = normalized_items
+        return normalized
+
     def _inference_nodes_from_response_data(
         self, response_data: Optional[Dict[str, Any]]
     ) -> Dict[str, Dict[str, Any]]:
@@ -3626,9 +4858,12 @@ class OrchestratorSystem:
             node_name = str(node_key)
             node_info: Dict[str, Any] = {}
 
-            config_data = self._normalize_inference_config_payload(
-                node_payload.get("config")
-            )
+            config_payload = node_payload.get("config")
+            if not isinstance(config_payload, dict):
+                config_draft = node_payload.get("config_draft")
+                if isinstance(config_draft, dict):
+                    config_payload = config_draft.get("values")
+            config_data = self._normalize_inference_config_payload(config_payload)
             if config_data:
                 node_info["config"] = config_data
 
@@ -3644,6 +4879,33 @@ class OrchestratorSystem:
                 node_info["allRunning"] = all(
                     service.get("status") == "running" for service in services
                 )
+
+            service_instances = node_payload.get("service_instances")
+            if isinstance(service_instances, dict):
+                node_info["service_instances"] = self._normalize_inference_service_instances_payload(service_instances) or service_instances
+
+            service_instance = node_payload.get("service_instance")
+            if isinstance(service_instance, dict):
+                node_info["service_instance"] = service_instance
+
+            for structured_key in ("test_runs", "test_run_stop", "admin_cleanup", "benchmark_stop"):
+                structured_value = node_payload.get(structured_key)
+                if isinstance(structured_value, dict):
+                    node_info[structured_key] = structured_value
+
+            benchmark_jobs = node_payload.get("benchmark_jobs")
+            if isinstance(benchmark_jobs, dict):
+                node_info["benchmark_jobs"] = benchmark_jobs
+
+            benchmark_reports = node_payload.get("benchmark_reports")
+            if isinstance(benchmark_reports, list):
+                node_info["benchmark_reports"] = [
+                    report for report in benchmark_reports if isinstance(report, dict)
+                ]
+
+            service_start = node_payload.get("service_start")
+            if isinstance(service_start, dict):
+                node_info["service_start"] = service_start
 
             if node_info:
                 nodes[node_name] = node_info
@@ -3670,6 +4932,51 @@ class OrchestratorSystem:
                 )
         return services
        
+    def _first_inference_service_instances_from_nodes(
+        self, nodes: Dict[str, Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        for node_data in nodes.values():
+            service_instances = node_data.get("service_instances")
+            if isinstance(service_instances, dict):
+                return service_instances
+        return None
+
+    def _first_inference_service_instance_from_nodes(
+        self, nodes: Dict[str, Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        for node_data in nodes.values():
+            service_instance = node_data.get("service_instance")
+            if isinstance(service_instance, dict):
+                return service_instance
+        return None
+
+    def _inference_benchmark_reports_from_nodes(
+        self, nodes: Dict[str, Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        reports: List[Dict[str, Any]] = []
+        for node_data in nodes.values():
+            node_reports = node_data.get("benchmark_reports")
+            if isinstance(node_reports, list):
+                reports.extend(report for report in node_reports if isinstance(report, dict))
+        return reports
+
+    def _first_inference_benchmark_jobs_from_nodes(
+        self, nodes: Dict[str, Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        for node_data in nodes.values():
+            benchmark_jobs = node_data.get("benchmark_jobs")
+            if isinstance(benchmark_jobs, dict):
+                return benchmark_jobs
+        return None
+
+    def _first_inference_structured_from_nodes(
+        self, nodes: Dict[str, Dict[str, Any]], key: str
+    ) -> Optional[Dict[str, Any]]:
+        for node_data in nodes.values():
+            value = node_data.get(key)
+            if isinstance(value, dict):
+                return value
+        return None
 
 
     def _extract_inline_commands(self, text: str) -> List[str]:
@@ -3697,9 +5004,73 @@ class OrchestratorSystem:
         result: str,
         config_data: Optional[Dict[str, Dict[str, Any]]] = None,
         services: Optional[List[Dict[str, Any]]] = None,
+        service_instances: Optional[Dict[str, Any]] = None,
+        service_instance: Optional[Dict[str, Any]] = None,
+        service_stop: Optional[Dict[str, Any]] = None,
+        benchmark_reports: Optional[List[Dict[str, Any]]] = None,
+        benchmark_jobs: Optional[Dict[str, Any]] = None,
+        benchmark_stop: Optional[Dict[str, Any]] = None,
+        test_runs: Optional[Dict[str, Any]] = None,
+        test_run_stop: Optional[Dict[str, Any]] = None,
+        admin_cleanup: Optional[Dict[str, Any]] = None,
+        service_start: Optional[Dict[str, Any]] = None,
     ) -> str:
         task = (task_description or "").lower()
         combined = f"{task_description}\n{result}".lower()
+        if isinstance(service_instance, dict):
+            return "instance_status"
+        if isinstance(service_stop, dict):
+            operation = str(service_stop.get("operation") or "").strip().lower()
+            if operation == "preview":
+                return "service_stop_preview"
+        if isinstance(service_start, dict) and service_start.get("submitted") is True:
+            return "service_start"
+        if any(
+            keyword in combined
+            for keyword in ["当前请求不是管理员角色", "已拒绝调用管理员维护工具", "not admin", "admin role"]
+        ):
+            return "message"
+        if isinstance(admin_cleanup, dict):
+            operation = str(admin_cleanup.get("operation") or "").strip().lower()
+            return "admin_cleanup_apply" if operation == "apply" else "admin_cleanup_preview"
+        if isinstance(test_run_stop, dict):
+            operation = str(test_run_stop.get("operation") or "").strip().lower()
+            return "test_stop" if operation == "apply" else "test_stop_preview"
+        if isinstance(test_runs, dict):
+            operation = str(test_runs.get("operation") or "").strip().lower()
+            return "test_running_list" if operation == "list_running" else "test_list"
+        if isinstance(benchmark_stop, dict):
+            operation = str(benchmark_stop.get("operation") or "").strip().lower()
+            return "benchmark_stop_preview" if operation == "preview" else "benchmark_stop"
+        if isinstance(benchmark_jobs, dict):
+            operation = str(benchmark_jobs.get("operation") or "").strip().lower()
+            if operation == "list":
+                return "benchmark_list"
+        if benchmark_reports:
+            if any(
+                keyword in task
+                for keyword in ["列表", "所有", "全部", "有哪些", "可用", "list", "available"]
+            ):
+                return "benchmark_list"
+            if any(keyword in task for keyword in ["结果", "result", "报告", "report"]):
+                return "benchmark_result"
+            if any(keyword in task for keyword in ["进度", "progress"]):
+                return "benchmark_progress"
+            if len(benchmark_reports) > 1:
+                return "benchmark_list"
+            return "benchmark_status"
+        if isinstance(service_instances, dict):
+            operation = str(service_instances.get("operation") or "").strip().lower()
+            if operation == "list":
+                return "instance_list"
+            if operation == "status":
+                return "service_status"
+            if service_instances.get("items") is not None:
+                if any(keyword in task for keyword in ["列表", "有哪些", "list", "instances"]):
+                    return "instance_list"
+                return "service_status"
+        if any(keyword in task for keyword in ["清理", "残留", "cleanup", "维护", "管理员", "admin"]):
+            return "message"
         if config_data and self._has_inference_config_data(config_data):
             if any(keyword in task for keyword in ["修改", "更新", "设置", "change", "update", "set"]):
                 return "config_update"
@@ -3731,6 +5102,8 @@ class OrchestratorSystem:
             if any(keyword in task for keyword in ["状态", "status"]):
                 return "benchmark_status"
             if any(keyword in task for keyword in ["停止", "关闭", "stop"]):
+                if any(keyword in task for keyword in ["预览", "preview", "dry-run", "dry run"]):
+                    return "benchmark_stop_preview"
                 return "benchmark_stop"
             if any(keyword in task for keyword in ["运行", "启动", "执行", "run", "start"]):
                 return "benchmark_start"
@@ -3762,10 +5135,115 @@ class OrchestratorSystem:
         response_data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:    
         nodes = self._inference_nodes_from_response_data(response_data)
-        config_data = self._first_inference_config_from_nodes(nodes)
+        top_level_config: Dict[str, Dict[str, Any]] = {}
+        if isinstance(response_data, dict):
+            config_draft = response_data.get("config_draft")
+            if isinstance(config_draft, dict):
+                top_level_config = self._normalize_inference_config_payload(config_draft.get("values"))
+            if not top_level_config:
+                top_level_config = self._normalize_inference_config_payload(response_data.get("config"))
+        config_data = top_level_config or self._first_inference_config_from_nodes(nodes)
         services = self._inference_services_from_nodes(nodes)
-        action = self._infer_inference_action(task_description, result, config_data=config_data, services=services)
+        if not services:
+            services = self._extract_inference_services(result)
+        service_instances = response_data.get("service_instances") if isinstance(response_data, dict) else None
+        service_instance = response_data.get("service_instance") if isinstance(response_data, dict) else None
+        benchmark_reports = response_data.get("benchmark_reports") if isinstance(response_data, dict) else None
+        benchmark_jobs = response_data.get("benchmark_jobs") if isinstance(response_data, dict) else None
+        service_stop = response_data.get("service_stop") if isinstance(response_data, dict) else None
+        service_start = response_data.get("service_start") if isinstance(response_data, dict) else None
+        benchmark_stop = response_data.get("benchmark_stop") if isinstance(response_data, dict) else None
+        test_runs = response_data.get("test_runs") if isinstance(response_data, dict) else None
+        test_run_stop = response_data.get("test_run_stop") if isinstance(response_data, dict) else None
+        admin_cleanup = response_data.get("admin_cleanup") if isinstance(response_data, dict) else None
+        if not isinstance(service_instances, dict):
+            service_instances = self._first_inference_service_instances_from_nodes(nodes)
+        if isinstance(service_instances, dict):
+            service_instances = self._normalize_inference_service_instances_payload(service_instances) or service_instances
+        if not isinstance(service_instance, dict):
+            service_instance = self._first_inference_service_instance_from_nodes(nodes)
+        if not isinstance(benchmark_reports, list):
+            benchmark_reports = self._inference_benchmark_reports_from_nodes(nodes)
+        if not isinstance(service_stop, dict):
+            service_stop = self._first_inference_structured_from_nodes(nodes, "service_stop")
+        if not isinstance(service_start, dict):
+            service_start = self._first_inference_structured_from_nodes(nodes, "service_start")
+        if not isinstance(benchmark_jobs, dict):
+            benchmark_jobs = self._first_inference_benchmark_jobs_from_nodes(nodes)
+        if not isinstance(benchmark_stop, dict):
+            benchmark_stop = self._first_inference_structured_from_nodes(nodes, "benchmark_stop")
+        if not isinstance(test_runs, dict):
+            test_runs = self._first_inference_structured_from_nodes(nodes, "test_runs")
+        if not isinstance(test_run_stop, dict):
+            test_run_stop = self._first_inference_structured_from_nodes(nodes, "test_run_stop")
+        if not isinstance(admin_cleanup, dict):
+            admin_cleanup = self._first_inference_structured_from_nodes(nodes, "admin_cleanup")
+        action = self._infer_inference_action(
+            task_description,
+            result,
+            config_data=config_data,
+            services=services,
+            service_instances=service_instances if isinstance(service_instances, dict) else None,
+            service_instance=service_instance if isinstance(service_instance, dict) else None,
+            service_stop=service_stop if isinstance(service_stop, dict) else None,
+            service_start=service_start if isinstance(service_start, dict) else None,
+            benchmark_reports=benchmark_reports if isinstance(benchmark_reports, list) else None,
+            benchmark_jobs=benchmark_jobs if isinstance(benchmark_jobs, dict) else None,
+            benchmark_stop=benchmark_stop if isinstance(benchmark_stop, dict) else None,
+            test_runs=test_runs if isinstance(test_runs, dict) else None,
+            test_run_stop=test_run_stop if isinstance(test_run_stop, dict) else None,
+            admin_cleanup=admin_cleanup if isinstance(admin_cleanup, dict) else None,
+        )
+        if _inference_service_start_payload_submitted(response_data):
+            action = "service_start"
         fields: Dict[str, Any] = {"action": action}
+        if isinstance(service_instances, dict):
+            fields["service_instances"] = service_instances
+        if isinstance(service_instance, dict):
+            fields["service_instance"] = service_instance
+        if isinstance(service_stop, dict):
+            fields["service_stop"] = service_stop
+        if isinstance(benchmark_jobs, dict):
+            fields["benchmark_jobs"] = benchmark_jobs
+        if isinstance(benchmark_stop, dict):
+            benchmark_stop = dict(benchmark_stop)
+            benchmark_stop_operation = str(benchmark_stop.get("operation") or "").strip().lower()
+            if benchmark_stop_operation == "apply" and benchmark_stop.get("stopped") is not False:
+                benchmark_stop.setdefault("stopped", True)
+                benchmark_stop.setdefault("status", "stopped")
+            fields["benchmark_stop"] = benchmark_stop
+            if benchmark_stop.get("stopped") is True:
+                fields.setdefault("status", "stopped")
+                benchmark_stop_job_id = benchmark_stop.get("job_id") or benchmark_stop.get("jobId")
+                if benchmark_stop_job_id is not None:
+                    fields.setdefault("jobId", benchmark_stop_job_id)
+                    fields.setdefault("job_id", benchmark_stop_job_id)
+        if isinstance(test_runs, dict):
+            fields["test_runs"] = test_runs
+        if isinstance(test_run_stop, dict):
+            fields["test_run_stop"] = test_run_stop
+        if isinstance(admin_cleanup, dict):
+            fields["admin_cleanup"] = admin_cleanup
+        if isinstance(benchmark_reports, list) and benchmark_reports:
+            fields["benchmark_reports"] = benchmark_reports
+            first_report = next((item for item in benchmark_reports if isinstance(item, dict)), {})
+            if isinstance(first_report, dict):
+                for source_key, protocol_key in (
+                    ("job_id", "jobId"),
+                    ("benchmark_job_id", "benchmark_job_id"),
+                    ("status", "status"),
+                    ("model", "model"),
+                    ("dataset", "dataset"),
+                    ("result_path", "resultPath"),
+                ):
+                    if first_report.get(source_key) is not None:
+                        fields.setdefault(protocol_key, first_report.get(source_key))
+        if isinstance(service_start, dict):
+            fields["service_start"] = service_start
+        if services:
+            fields["services"] = services
+        if config_data and self._has_inference_config_data(config_data):
+            fields["config"] = config_data
         if nodes:
             fields["nodes"] = nodes
         commands = self._extract_inline_commands(result)
@@ -3773,12 +5251,14 @@ class OrchestratorSystem:
             fields["commands"] = commands
 
         if action == "config_view":
-            
-            return self._with_protocol("inference_config", "inference", result, **fields)
+            return self._with_protocol("inference_config", "inference", result, jobType="inference_config", **fields)
         if action == "config_update":
-            
-            return self._with_protocol("inference_config_updated", "inference", result, **fields)
-        if action == "service_status":
+            return self._with_protocol("inference_config_updated", "inference", result, jobType="inference_config", **fields)
+        if action == "instance_list":
+            return self._with_protocol("inference_instance_list", "inference", result, jobType="inference_instance", **fields)
+        if action == "instance_status":
+            return self._with_protocol("inference_instance_status", "inference", result, jobType="inference_instance", **fields)
+        if action in {"service_status", "service_instances"}:
             return self._with_protocol("inference_status", "inference", result, jobType="inference_service", **fields)
         if action in {"service_start", "service_restart"}:
             if _workflow_inference_structured_failure(response_data):
@@ -3790,15 +5270,59 @@ class OrchestratorSystem:
                     status="failed",
                     **fields,
                 )
-            return self._with_protocol("job_started", "inference", result, jobType="inference_service", **fields)
+            if _inference_service_start_submitted(response_data):
+                return self._with_protocol(
+                    "job_started",
+                    "inference", 
+                    result,
+                    jobType="inference_service", 
+                    **fields)
+            if _inference_start_result_needs_input(result):
+                return self._with_protocol(
+                    "need_input",
+                    "inference",
+                    result,
+                    kind="inference_model_param_b",
+                    title="补充模型参数规模",
+                    requiredParams=["model_param_b"],
+                    jobType="inference_service",
+                    status="blocked",
+                    **fields,
+                )
+            #deepseek
+            if action == "service_restart":
+                import re
+
+                # 匹配“启动”或“重启” + 任意内容 + “提交”，且包含“成功”或“完成”
+                pattern = r"(启动|重启).*(?:成功.*提交|已提交|正在.*启动)|提交.*(?:成功|已提交)"
+                if re.search(pattern, result):
+                    return self._with_protocol(
+                        "job_started", 
+                        "inference", 
+                        result, 
+                        jobType="inference_service", 
+                        **fields)
+            return self._with_protocol(
+                "job_failed",
+                "inference",
+                result,
+                jobType="inference_service",
+                status="failed",
+                **fields,
+            )
+        if action == "service_stop_preview":
+            return self._with_protocol("inference_service_stop_preview", "inference", result, jobType="inference_service", **fields)
         if action == "service_stop":
             return self._with_protocol("job_stopped", "inference", result, jobType="inference_service", **fields)
         if action == "logs":
             return self._with_protocol("inference_logs", "inference", result, jobType="inference_service", **fields)
         if action == "benchmark_start":
             return self._with_protocol("job_started", "inference", result, jobType="inference_benchmark", **fields)
+        if action == "benchmark_stop_preview":
+            return self._with_protocol("inference_benchmark_stop_preview", "inference", result, jobType="inference_benchmark", **fields)
         if action == "benchmark_stop":
-            return self._with_protocol("job_stopped", "inference", result, jobType="inference_benchmark", **fields)
+            protocol_type = "job_stopped" if isinstance(benchmark_stop, dict) and benchmark_stop.get("stopped") is True else "inference_benchmark_stop_result"
+            return self._with_protocol(protocol_type, "inference", result, jobType="inference_benchmark", **fields)
         if action == "benchmark_status":
             return self._with_protocol("inference_benchmark_status", "inference", result, jobType="inference_benchmark", **fields)
         if action == "benchmark_result":
@@ -3809,8 +5333,19 @@ class OrchestratorSystem:
             return self._with_protocol("inference_benchmark_list", "inference", result, jobType="inference_benchmark", **fields)
         if action == "test_run":
             return self._with_protocol("inference_test_result", "inference", result, jobType="inference_test", **fields)
+        if action == "test_stop_preview":
+            return self._with_protocol("inference_test_stop_preview", "inference", result, jobType="inference_test", **fields)
+        if action == "test_stop":
+            protocol_type = "job_stopped" if isinstance(test_run_stop, dict) and test_run_stop.get("stopped") is True else "inference_test_stop_result"
+            return self._with_protocol(protocol_type, "inference", result, jobType="inference_test", **fields)
+        if action == "test_running_list":
+            return self._with_protocol("inference_test_running_list", "inference", result, jobType="inference_test", **fields)
         if action == "test_list":
             return self._with_protocol("inference_test_list", "inference", result, jobType="inference_test", **fields)
+        if action == "admin_cleanup_preview":
+            return self._with_protocol("inference_admin_cleanup_preview", "inference", result, jobType="inference_admin_cleanup", **fields)
+        if action == "admin_cleanup_apply":
+            return self._with_protocol("inference_admin_cleanup_result", "inference", result, jobType="inference_admin_cleanup", **fields)
         return self._message_protocol("inference", result)
 
     def _agent_key_from_print_name(self, name: str) -> str:
@@ -5338,11 +6873,26 @@ class OrchestratorSystem:
 
     def _extract_dataset_reference(self, text: str) -> Optional[str]:
         text = text or ""
-        ref_match = re.search(r"(?<![A-Za-z0-9_.-])(20\d{6}(?:_[A-Za-z0-9][A-Za-z0-9_.-]*)?)(?![A-Za-z0-9_.-])", text)
+        normalized = text.replace("：", ":")
+        dataset_patterns = [
+            r"(?:data_identifier|dataset_id|dataset_date|data_date|数据标识|数据日期|训练日期)\s*(?:是|为|=|:)?\s*(20\d{6}(?:_[A-Za-z0-9][A-Za-z0-9_.-]*)?)",
+            r"(?:dataset_dir|data_dir|数据集路径|数据路径|数据集目录|数据目录|数据集位置|数据位置)\s*(?:是|为|=|:)?\s*/[^\s,，;；]*(?:dataset_batch_train|dataset_daily_train)/([A-Za-z0-9_.-]+)",
+            r"/[^\s,，;；]*(?:dataset_batch_train|dataset_daily_train)/(20\d{6}(?:_[A-Za-z0-9][A-Za-z0-9_.-]*)?)",
+            r"(?:用|使用|拿)\s*(20\d{6}(?:_[A-Za-z0-9][A-Za-z0-9_.-]*)?)\s*(?:这个|这份)?(?:数据|数据集)",
+            r"(20\d{6}(?:_[A-Za-z0-9][A-Za-z0-9_.-]*)?)\s*(?:这个|这份)?(?:数据|数据集)",
+        ]
+        for pattern in dataset_patterns:
+            match = re.search(pattern, normalized, re.IGNORECASE)
+            if match:
+                return match.group(1).strip().rstrip("/")
+
+        scrubbed = re.sub(r"/[^\s,，;；]*(?:models|medical_models)/[^\s,，;；]*", " ", normalized)
+        scrubbed = re.sub(r"\bmodel_medical_(?:lora|full)_20\d{6}(?:_[A-Za-z0-9][A-Za-z0-9_.-]*)?\b", " ", scrubbed)
+        ref_match = re.search(r"(?<![A-Za-z0-9_.-])(20\d{6}(?:_[A-Za-z0-9][A-Za-z0-9_.-]*)?)(?![A-Za-z0-9_.-])", scrubbed)
         if ref_match:
             return ref_match.group(1)
 
-        dataset_date = self._extract_dataset_date(text)
+        dataset_date = self._extract_dataset_date(scrubbed)
         if dataset_date:
             return dataset_date
 
@@ -5354,7 +6904,6 @@ class OrchestratorSystem:
             if dataset_name in lowered:
                 return dataset_name
         return None
-
     def _extract_workflow_benchmark_name(self, text: str) -> str:
         normalized = (text or "").replace("：", ":").strip()
         patterns = [
@@ -5602,34 +7151,87 @@ class OrchestratorSystem:
         if raw_exists is True:
             return (
                 f"[系统路由提示] 检测到数据 {dataset_ref} 仍在 /home/workspace/dataset 原始数据目录。"
-                "训练前不能直接开始训练，也不要直接把请求丢给 dataprocessor 让它报 data_type/strategy。"
-                "应先用面向新手的话说明需要做数据预处理，并请用户选择 sft/dpo 与 inspection/diagnosis/prescription。"
+                "训练前不能直接开始训练，必须先调用 dataprocessor 的 data_preprocessing 工具。"
+                "调用时带上该数据目录作为 input_folder，让工具先检测格式；"
+                "通用格式由工具只追问 data_type，医疗 raw 才追问 data_type 和 strategy。"
             )
 
         return "[系统路由提示] 未检测到该数据对应的可训练数据目录；先询问用户确认数据位置。"
 
     def _build_preprocess_guidance(self, dataset_ref: str, raw_path: str) -> str:
-        return (
-            f"检测到 `{dataset_ref}` 目前还在原始数据目录 `{raw_path}`，还不能直接开始训练。\n\n"
-            "先做一步数据预处理就行。我需要你补充两个信息：\n"
-            "1. 预处理后的训练类型：`sft` 或 `dpo`\n"
-            "2. 你希望模型学习的任务方向：`inspection`、`diagnosis` 或 `prescription`\n\n"
-            "可以这样理解：\n"
-            "- `sft`：常规监督微调，适合先做 LoRA / 全参训练\n"
-            "- `dpo`：偏好优化数据，适合后续增强训练\n"
-            "- `inspection`：生成检查相关内容\n"
-            "- `diagnosis`：生成诊断相关内容\n"
-            "- `prescription`：生成处方相关内容\n\n"
-            "你直接回复一句就可以，例如：\n"
-            "- `把 medical-example 处理成 sft，方向选 diagnosis`\n"
-            "- `先做 dpo 预处理，用 prescription 方向`\n"
+        return f"""检测到 `{dataset_ref}` 目前还在原始数据目录 `{raw_path}`，还不能直接开始训练。
+
+先做一步数据预处理就行。我会先调用预处理工具检测数据格式；如果是 OpenAI、ShareGPT、SFT、DPO 或 text 等通用格式，只需要你补充 `data_type=sft` 或 `data_type=dpo`；如果检测为医疗 raw 原始格式，再补充 `strategy=inspection/diagnosis/prescription`。
+
+可以这样理解：
+- `sft`：常规监督微调，适合先做 LoRA / 全参训练
+- `dpo`：偏好优化数据，适合后续增强训练
+- `strategy`：只用于医疗 raw 原始格式，表示检查、诊断或处方方向
+"""
+
+    def _is_inference_preview_stop_command(self, message: str) -> bool:
+        text = (message or "").lower()
+        compact = re.sub(r"\s+", "", text)
+        return any(
+            marker in compact
+            for marker in (
+                "预览停止",
+                "停止预览",
+                "previewstop",
+                "stoppreview",
+                "dry-runstop",
+                "dryrunstop",
+                "stopdry-run",
+                "stopdryrun",
+            )
         )
+
+    def _is_inference_command(self, message: str) -> bool:
+        text = (message or "").lower()
+        compact = re.sub(r"\s+", "", text)
+        inference_keywords = [
+            "推理服务",
+            "推理配置",
+            "推理基准",
+            "推理基准测试",
+            "基准测试",
+            "功能测试",
+            "service_test",
+            "benchmark",
+            "medbench",
+            "inference",
+            "step1",
+            "step2",
+            "step3",
+            "2021.json",
+            "2024.json",
+        ]
+        if any(keyword in text for keyword in inference_keywords):
+            return True
+        if "job_id=" in compact or "jobid=" in compact:
+            non_inference_targets = (
+                "训练",
+                "trainer",
+                "train",
+                "评估",
+                "评测",
+                "evaluator",
+                "evaluate",
+                "evaluation",
+                "数据处理",
+                "预处理",
+                "dataprocessor",
+            )
+            return not any(target in compact for target in non_inference_targets)
+        return False
 
     def _resolve_explicit_agent_route(self, message: str) -> Optional[str]:
         text = (message or "").lower()
         if not text:
             return None
         if self._extract_stop_target_params(message).get("has_stop_intent"):
+            if self._is_inference_command(message):
+                return "inference"
             return None
 
         # Evaluation requests must be able to replace a stale training parameter
@@ -5949,7 +7551,9 @@ class OrchestratorSystem:
             if "高级筛选" in content or "score_based_filtering" in lower:
                 return ["input_folder"]
             if "数据预处理" in content or "data_preprocessing" in lower:
-                return ["data_type", "strategy"]
+                # Data preprocessing required params depend on the detected input format.
+                # Let the tool inspect input_folder or the latest default dataset first.
+                return []
         return []
 
     def _extract_pending_param_names(self, task_info: Dict[str, Any]) -> List[str]:
@@ -6025,7 +7629,7 @@ class OrchestratorSystem:
 
         patterns = {
             "model_path": [
-                r"(?:model_path|模型路径|模型位置)\s*(?:是|为|=|:)?\s*(/[^\s,，;；]+)",
+                r"(?:model_path|模型路径|模型位置|基础模型路径|模型在)\s*(?:是|为|=|:)?\s*(/[^\s,，;；]+)",
             ],
             "train_files": [
                 r"(?:train_files|data\.train_files|训练数据|训练集|训练文件|训练数据文件)\s*(?:是|为|=|:)?\s*(/[^\s,，;；]+)",
@@ -6369,7 +7973,8 @@ class OrchestratorSystem:
                 f"执行{mode_text}。用户指定数据标识为{dataset_ref}，"
                 f"对应SFT数据目录为{batch_path}。不要询问训练类型，立即执行{mode_text}。"
                 "调用 run_script_by_name_train 时 additional_args 只能使用 "
-                f"data_identifier={dataset_ref} 和 data_dir={batch_path}，禁止使用 data_id。"
+                f"data_identifier={dataset_ref}、data_dir={batch_path}"
+                f"{'、model_path=' + named_values['model_path'] if named_values.get('model_path') else ''}，禁止使用 data_id。"
             )
             if is_multinode:
                 multinode_args = self._extract_multinode_cli_args(task_description)
@@ -6651,14 +8256,24 @@ class OrchestratorSystem:
 
     def _request_inference_agent(self, command: str) -> Dict[str, Any]:
         command = str(command or self.current_user_message or "").strip()
+        resource_context: Optional[Dict[str, Any]] = None
         try:
+
+            resource_context = _inference_request_resource_context(command)
+            owner_user_id, owner_aliases = _inference_owner_payload(self.user_id)
+            request_payload: Dict[str, Any] = {
+                "command": command,
+                "user_id": owner_user_id,
+                "user_aliases": owner_aliases,
+                "user_role": _current_user_role(),
+                "thread_id": f"user:{self.user_id}:inference",
+                "container": self.evaluation_container,
+            }
+            if resource_context:
+                request_payload["resource_context"] = resource_context
             response = requests.post(
                 config.agents.inference.inference_agent_url,
-                json={
-                    "command": command,
-                    "user_id": self.user_id,
-                    "container": self.evaluation_container,
-                },
+                json=request_payload,
                 timeout=360,
             )
             response.raise_for_status()
@@ -6669,9 +8284,27 @@ class OrchestratorSystem:
             if not result:
                 raise ValueError("推理服务未返回 result")
             data = response_data.get("data") or {}
+            status_value = str(response_data.get("status") or "").lower()
+            stop_response_success = _inference_stop_response_is_success(command, response_data)
             protocol = self._inference_protocol_for_result(command, result, data)
-            success = True
+            logger.info(
+                "[inference-protocol] command=%s data_keys=%s protocol=%s",
+                command,
+                sorted(data.keys()) if isinstance(data, dict) else [],
+                json.dumps(protocol, ensure_ascii=False),
+            )
+            resource_payload = dict(response_data)
+            resource_payload["protocol"] = protocol
+            if isinstance(resource_context, dict) and resource_context.get("reservation_id"):
+                if _inference_response_holds_resource_reservation(command, resource_payload, result, resource_context):
+                    _start_inference_resource_heartbeat(resource_context)
+                else:
+                    _release_inference_resource_context(resource_context)
+            if _inference_protocol_is_service_stop(protocol):
+                _release_known_inference_reservations()
+            success = stop_response_success or status_value not in {"error", "failed", "timeout"}
         except Exception as exc:
+            _release_inference_resource_context(resource_context)
             logger.exception("Inference agent command failed: %s", command)
             result = f"推理服务调用失败：{exc}"
             data = {}
@@ -6683,6 +8316,7 @@ class OrchestratorSystem:
             "result": result,
             "data": data,
             "protocol": protocol,
+            "resource_context": resource_context,
         }
     def _run_inference_agent_command(self, command: str) -> ToolResponse:
         """调用推理服务。inference agent 必须通过此工具执行推理相关查询/操作。"""
@@ -6755,6 +8389,7 @@ class OrchestratorSystem:
             metadata={
                 "success": success,
                 "protocol": protocol,
+                "inference_payload": payload,
                 "response_msg": self._agent_msg(
                     self.agents["inference"].name if "inference" in self.agents else "inference",
                     result,
@@ -8574,10 +10209,12 @@ exit 0
             "deployment_step", "old_model_name", "service_log_command",
         }
         result_keys = {
-            "status", "benchmark_status", "progress", "progress_percent",
+            "status", "benchmark_status", "processed", "total", "progress", "progress_percent",
+            "correct", "accuracy", "invalid", "invalid_rate", "avg_f1",
+            "record_only", "executed", "passed", "failed", "timeout", "executor_error", "pass@1",
             "result_entry", "resultEntry", "benchmark_job_id",
             "status_command", "stop_command", "log_command", "message", "error",
-            "folder_path", "log_dir", "result_path", "inference_service_stopped",
+            "folder_path", "log_dir", "log_file", "result_path", "inference_service_stopped",
             "inference_service_stop_command", "inference_service_log_command",
             "inference_service_stop_error", "log_path", "log_tail", "log_updated_at",
             "stop_service_log_path", "stop_service_log_tail",
@@ -9256,12 +10893,67 @@ exit 0
                     "failed": "失败",
                     "stopped": "已停止",
                 }.get(benchmark_status, benchmark_status))
-                add("进度", result.get("progress") or result.get("progress_percent"))
+                processed = result.get("processed")
+                total = result.get("total")
+                progress_percent = result.get("progress_percent")
+                if processed is not None and total is not None:
+                    progress_value = f"{processed}/{total}"
+                    if progress_percent is not None and str(progress_percent).strip() != "":
+                        progress_value += f" ({progress_percent}%)"
+                else:
+                    progress_value = result.get("progress") or progress_percent
+                add("进度", progress_value)
+                def percent_text(value):
+                    try:
+                        if value is None or str(value).strip() == "":
+                            return None
+                        percent = float(str(value).strip().rstrip("%"))
+                        if "%" not in str(value) and 0 <= percent <= 1:
+                            percent *= 100
+                        return f"{percent:.1f}%"
+                    except (TypeError, ValueError):
+                        return str(value)
+
+                correct = result.get("correct")
+                accuracy = result.get("accuracy")
+                invalid = result.get("invalid")
+                invalid_rate = result.get("invalid_rate")
+                avg_f1 = result.get("avg_f1")
+                if correct is not None:
+                    correct_value = str(correct)
+                    if processed is not None:
+                        correct_value += f"/{processed}"
+                    add("正确数", correct_value)
+                add("准确率", percent_text(accuracy))
+                if invalid is not None:
+                    invalid_value = str(invalid)
+                    invalid_rate_text = percent_text(invalid_rate)
+                    if invalid_rate_text:
+                        invalid_value += f" ({invalid_rate_text})"
+                    add("无效数", invalid_value)
+                add("平均F1", avg_f1)
+                executed = result.get("executed")
+                passed = result.get("passed")
+                failed = result.get("failed")
+                timeout_count = result.get("timeout")
+                executor_error = result.get("executor_error")
+                pass_at_1 = result.get("pass@1")
+                add("执行数", executed)
+                if passed is not None:
+                    passed_value = str(passed)
+                    if executed is not None:
+                        passed_value += f"/{executed}"
+                    add("通过数", passed_value)
+                add("失败数", failed)
+                add("超时数", timeout_count)
+                add("执行器错误", executor_error)
+                add("pass@1", percent_text(pass_at_1))
                 add("任务ID", result.get("benchmark_job_id"))
                 add("查询命令", result.get("status_command"))
                 add("停止命令", result.get("stop_command"))
                 add("日志命令", result.get("log_command"))
                 add("日志目录", result.get("log_dir") or result.get("folder_path"))
+                add("运行日志", result.get("log_file"))
                 add("结果文件", result.get("result_path"))
                 add("结果入口", result.get("result_entry") or result.get("resultEntry"))
                 if result.get("inference_service_stopped") is not None:
@@ -9448,6 +11140,7 @@ exit 0
             "LR": r"\bLR\s*=\s*([0-9.eE+-]+)",
             "TEM": r"\bTEM\s*=\s*([A-Za-z0-9_.-]+)",
             "RESUME": r"\bRESUME\s*=\s*([^\s,;]+)",
+            "model_path": r"\b(?:MODEL_PATH|model_path|base_model_path)\s*=\s*(/[^\s,，;；]+)",
             "container": r"\b(?:container|docker_container)\s*=\s*([A-Za-z0-9_.-]+)",
         }
         for key, pattern in explicit_patterns.items():
@@ -9473,6 +11166,7 @@ exit 0
             "ACC": r"(?:梯度累积|累积步数|acc)\s*(?:是|为|=|:)?\s*([0-9]+)",
             "LR": r"(?:学习率|学习速率|lr)\s*(?:是|为|=|:)?\s*([0-9.eE+-]+)",
             "TEM": r"(?:模型模板|模型类别|tem)\s*(?:是|为|=|:)?\s*([A-Za-z0-9_.-]+)",
+            "model_path": r"(?:模型路径|模型位置|基础模型路径|模型在)\s*(?:是|为|=|:)?\s*(/[^\s,，;；]+)",
             "container": r"(?:容器|docker)\s*(?:是|为|=|:)?\s*([A-Za-z0-9_.-]+)",
         }
         for key, pattern in chinese_patterns.items():
@@ -9522,9 +11216,47 @@ exit 0
         workflow: Optional[Dict[str, Any]] = None,
         stage_name: Optional[str] = None,
     ) -> Dict[str, Any]:
-        response = await self._call_inference(command, command=command)
+        context = workflow.get("context") if isinstance(workflow, dict) else {}
+        context = context if isinstance(context, dict) else {}
+        owner_kwargs = _workflow_inference_owner_kwargs(context) if workflow else {}
+        role_value = str(context.get("user_role") or _current_user_role()).strip().lower()
+        resource_group_token = training_pool_token = user_role_token = None
+        owner_user_id_token = owner_aliases_token = None
+        try:
+            if workflow:
+                resource_group_token = REQUEST_RESOURCE_GROUP_ID.set(
+                    str(context.get("resource_group_id") or "").strip()
+                )
+                training_pool_token = REQUEST_TRAINING_POOL_ID.set(
+                    str(context.get("training_pool_id") or "").strip()
+                )
+                user_role_token = REQUEST_USER_ROLE.set(role_value)
+                owner_user_id_token = REQUEST_INFERENCE_OWNER_USER_ID.set(
+                    str(owner_kwargs.get("owner_user_id") or "").strip()
+                )
+                owner_aliases_token = REQUEST_INFERENCE_OWNER_ALIASES.set(
+                    tuple(_owner_aliases_from_any(owner_kwargs.get("owner_aliases")))
+                )
+            response = await self._call_inference(command, command=command)
+        finally:
+            if owner_aliases_token is not None:
+                REQUEST_INFERENCE_OWNER_ALIASES.reset(owner_aliases_token)
+            if owner_user_id_token is not None:
+                REQUEST_INFERENCE_OWNER_USER_ID.reset(owner_user_id_token)
+            if user_role_token is not None:
+                REQUEST_USER_ROLE.reset(user_role_token)
+            if training_pool_token is not None:
+                REQUEST_TRAINING_POOL_ID.reset(training_pool_token)
+            if resource_group_token is not None:
+                REQUEST_RESOURCE_GROUP_ID.reset(resource_group_token)
         metadata = response.metadata or {}
         protocol = metadata.get("protocol") if isinstance(metadata.get("protocol"), dict) else {}
+        inference_payload = metadata.get("inference_payload") if isinstance(metadata.get("inference_payload"), dict) else {}
+        resource_context = (
+            inference_payload.get("resource_context")
+            if isinstance(inference_payload.get("resource_context"), dict)
+            else None
+        )
         text = self._response_to_text(response) or ""
         protocol_type = str(protocol.get("type") or "")
         protocol_status = str(protocol.get("status") or "").lower()
@@ -9547,6 +11279,8 @@ exit 0
             "model_name": _workflow_inference_model_name(protocol),
             "all_running": _workflow_all_running_from_payload({"protocol": protocol}, text) is True,
         }
+        if resource_context:
+            result["resource_context"] = resource_context
         if workflow and stage_name:
             result.update(
                 _append_workflow_stage_log(
@@ -9557,6 +11291,44 @@ exit 0
                 )
             )
         return result
+
+    async def _workflow_ensure_benchmark_inference_ready_event(
+        self,
+        workflow: Dict[str, Any],
+        stage_name: str = "benchmark",
+    ) -> Dict[str, Any]:
+        context = workflow.get("context") if isinstance(workflow.get("context"), dict) else {}
+        resource_group_id = str(context.get("resource_group_id") or "").strip()
+        training_pool_id = str(context.get("training_pool_id") or "").strip()
+        resource_context = _workflow_context_inference_resource_context(context)
+
+        status_result = await self._workflow_inference_event("查看推理服务状态", workflow, stage_name)
+        if _workflow_inference_service_matches_resource(
+            status_result,
+            resource_context,
+            resource_group_id=resource_group_id,
+            training_pool_id=training_pool_id,
+        ):
+            return status_result
+
+        restarted = await self._workflow_inference_event("重启推理服务", workflow, stage_name)
+        if not restarted.get("success"):
+            raise RuntimeError(restarted.get("text") or "推理服务重启失败")
+        resource_context = restarted.get("resource_context") if isinstance(restarted.get("resource_context"), dict) else resource_context
+        if isinstance(resource_context, dict):
+            context["inference_resource_context"] = resource_context
+
+        for _ in range(12):
+            await asyncio.sleep(5)
+            check = await self._workflow_inference_event("查看推理服务状态", workflow, stage_name)
+            if _workflow_inference_service_matches_resource(
+                check,
+                resource_context,
+                resource_group_id=resource_group_id,
+                training_pool_id=training_pool_id,
+            ):
+                return check
+        raise RuntimeError("推理服务启动超时，请检查容器日志和资源配置")
 
     async def handle_workflow_event(self, event: Dict[str, Any]) -> None:
         """Execute state-machine events through the existing per-user agents."""
@@ -9738,6 +11510,7 @@ exit 0
                     next_service_check_at=time.time() + config.workflow.poll_interval,
                     service_log_command="查看推理服务日志",
                     message="推理服务重启命令已提交，等待服务全部运行",
+                    **_workflow_inference_resource_result_fields(restarted),
                     **_workflow_stage_log_fields(workflow, "deploy"),
                 )
                 manager.activate_worker_for(workflow["workflow_id"])
@@ -9799,6 +11572,7 @@ exit 0
                     next_service_check_at=time.time() + config.workflow.poll_interval,
                     service_log_command="查看推理服务日志",
                     message="推理服务重启命令已提交，等待服务全部运行",
+                    **_workflow_inference_resource_result_fields(restarted),
                     **_workflow_stage_log_fields(workflow, "deploy"),
                 )
                 manager.activate_worker_for(workflow["workflow_id"])
@@ -9822,6 +11596,8 @@ exit 0
                 workflow.get("workflow_id"),
                 start_command,
             )
+            await self._workflow_ensure_benchmark_inference_ready_event(workflow, "benchmark")
+            require_running()
             result = await self._workflow_inference_event(start_command, workflow, "benchmark")
             logger.debug(
                 "[workflow-debug] start benchmark result workflow_id=%s success=%s status=%s commands=%s text_head=%s",
@@ -10056,6 +11832,9 @@ exit 0
             normalized_action = parse_workflow_control_command(raw_action) or normalized_action
         resumed_in_background = False
         workflow_resource_group_id = _current_resource_group_id().strip()
+        is_admin_group_workflow = bool(
+            _current_user_role() == "admin" and workflow_resource_group_id
+        )
         try:
             if normalized_action in {"resume", "continue", "retry", "继续", "续跑", "恢复"}:
                 if requested_workflow_id:
@@ -10064,6 +11843,7 @@ exit 0
                         self.user_id,
                         workflow_resource_group_id,
                         permission_message="无权继续指定的一键工作流",
+                        include_group_users=is_admin_group_workflow,
                     )
                     if not workflow:
                         raise ValueError(f"一键工作流不存在: {requested_workflow_id}")
@@ -10072,12 +11852,21 @@ exit 0
                             requested_workflow_id,
                             self.user_id,
                             workflow_resource_group_id,
+                            include_group_users=is_admin_group_workflow,
                         )
                     elif workflow.get("status") != "running":
                         raise ValueError("指定的一键工作流不是运行、失败或停止状态，无法继续")
                 else:
-                    active = manager.active_for_user_family(self.user_id, workflow_resource_group_id)
-                    workflow = active if active else manager.resume(self.user_id, workflow_resource_group_id)
+                    active = manager.active_for_user_family(
+                        self.user_id,
+                        workflow_resource_group_id,
+                        include_group_users=is_admin_group_workflow,
+                    )
+                    workflow = active if active else manager.resume(
+                        self.user_id,
+                        workflow_resource_group_id,
+                        include_group_users=is_admin_group_workflow,
+                    )
                 manager.activate_worker_for(workflow["workflow_id"])
                 train_stage = (workflow.get("stages") or {}).get("train", {})
                 if (
@@ -10096,9 +11885,14 @@ exit 0
                         requested_workflow_id,
                         self.user_id,
                         workflow_resource_group_id,
+                        include_group_users=is_admin_group_workflow,
                     )
                     if requested_workflow_id
-                    else manager.begin_stop(self.user_id, workflow_resource_group_id)
+                    else manager.begin_stop(
+                        self.user_id,
+                        workflow_resource_group_id,
+                        include_group_users=is_admin_group_workflow,
+                    )
                 )
                 try:
                     stop_result = await self._stop_workflow_runtime(workflow)
@@ -10126,7 +11920,7 @@ exit 0
                                 "stop_service_log_path": service_log_fields.get("log_path"),
                                 "stop_service_log_tail": service_log_fields.get("log_tail"),
                                 "stop_service_log_updated_at": service_log_fields.get("log_updated_at"),
-                                "inference_service_stop_command": "停止推理服务",
+                                "inference_service_stop_command": _workflow_inference_service_stop_command(),
                                 "inference_service_log_command": "查看推理服务日志",
                             }
                         )
@@ -10143,7 +11937,7 @@ exit 0
                                 "stop_service_log_path": service_log_fields.get("log_path"),
                                 "stop_service_log_tail": service_log_fields.get("log_tail"),
                                 "stop_service_log_updated_at": service_log_fields.get("log_updated_at"),
-                                "inference_service_stop_command": "停止推理服务",
+                                "inference_service_stop_command": _workflow_inference_service_stop_command(),
                                 "inference_service_log_command": "查看推理服务日志",
                             }
                         )
@@ -10162,6 +11956,7 @@ exit 0
                         requested_workflow_id,
                         self.user_id,
                         workflow_resource_group_id,
+                        include_group_users=is_admin_group_workflow,
                     )
                     if workflow:
                         workflow = manager.get_status_snapshot(workflow["workflow_id"])
@@ -10169,6 +11964,7 @@ exit 0
                     workflow = manager.latest_for_user_family(
                         self.user_id,
                         workflow_resource_group_id,
+                        include_group_users=is_admin_group_workflow,
                     )
                 if not workflow:
                     raise ValueError(
@@ -10217,14 +12013,16 @@ exit 0
         container = str(stage.get("container") or "").strip() or None
         if stage_name == "benchmark":
             command = _workflow_benchmark_stop_command(workflow)
-            benchmark_response = await self._call_inference(command)
-            service_response = await self._call_inference("停止推理服务")
-            benchmark_text = self._response_to_text(benchmark_response) if benchmark_response else f"已发送{command}指令"
-            service_text = self._response_to_text(service_response) if service_response else "已发送停止推理服务指令"
+            benchmark_result = await self._workflow_inference_event(command, workflow)
+            service_command = _workflow_inference_service_stop_command()
+            service_result = await self._workflow_inference_event(service_command, workflow)
+            benchmark_text = benchmark_result.get("text") or f"已发送{command}指令"
+            service_text = service_result.get("text") or f"已发送{service_command}指令"
             return f"{benchmark_text}\n\n{service_text}"
         if stage_name == "deploy":
-            response = await self._call_inference("停止推理服务")
-            return self._response_to_text(response) if response else "已发送停止推理服务指令"
+            command = _workflow_inference_service_stop_command()
+            result = await self._workflow_inference_event(command, workflow)
+            return result.get("text") or f"已发送{command}指令"
         if stage_name == "evaluate":
             model_path = str((workflow.get("context") or {}).get("trained_model_path") or "").strip()
             stop_message_parts = ["停止当前单模型评估 single_model_evaluation_vpn"]
@@ -10318,6 +12116,11 @@ exit 0
                 if not dataset_ref:
                     raise ValueError("请在一键工作流口令中提供数据标识，例如 20260417")
                 workflow_context = self._workflow_training_context(message, dataset_ref)
+                owner_user_id, owner_aliases = _inference_owner_payload(self.user_id)
+                workflow_context["inference_owner_user_id"] = owner_user_id
+                workflow_context["inference_owner_aliases"] = owner_aliases
+                #deepseek
+                workflow_context["user_role"] = _current_user_role()
                 workflow = manager.create(
                     self.user_id,
                     dataset_ref,
@@ -10514,6 +12317,10 @@ exit 0
 
             stop_target = self._extract_stop_target_params(message)
             stop_task_type = self._normalize_stop_task_type(stop_target.get("task_type"))
+            if self._is_inference_command(message):
+                logger.info("[Orchestrator] 检测到推理请求，原样直通 inference agent")
+                response = await self._call_inference(message, command=message)
+                return self._tool_response_to_client_text(response)
             if stop_target.get("has_stop_intent") and stop_task_type in {"train", "assessment", "data"}:
                 logger.info("[Orchestrator] 检测到明确的终止意图，直接执行停止任务")
                 response = await self._stop_task(
@@ -10909,6 +12716,9 @@ async def process_user_message_structured(
     grpo_container: str = "",
     resource_group_id: str = "",
     training_pool_id: str = "",
+    user_role: str = "",
+    owner_user_id: str = "",
+    owner_aliases: Any = None,
 ) -> Dict[str, Any]:
     """处理用户消息，并返回前端可直接消费的轻量协议结果。"""
     logger.info(f"用户{user_id}; 输入{message}")
@@ -10920,14 +12730,18 @@ async def process_user_message_structured(
     resolved_grpo_container = grpo_container.strip() or resolved_training_container
     resolved_resource_group_id = resource_group_id.strip()
     resolved_training_pool_id = training_pool_id.strip()
+    resolved_user_role = user_role.strip().lower()
+    resolved_owner_user_id = str(owner_user_id or "").strip()
+    resolved_owner_aliases = _owner_aliases_from_any(owner_aliases)
     logger.info(
-        "用户%s; resolved containers training=%s evaluation=%s grpo=%s resource_group=%s training_pool=%s",
+        "用户%s; resolved containers training=%s evaluation=%s grpo=%s resource_group=%s training_pool=%s user_role=%s",
         user_id,
         resolved_training_container,
         resolved_evaluation_container,
         resolved_grpo_container,
         resolved_resource_group_id,
         resolved_training_pool_id,
+        resolved_user_role,
     )
     memory_manager = await get_memory_manager()
     if session.system is None:
@@ -10950,12 +12764,18 @@ async def process_user_message_structured(
     grpo_token = REQUEST_GRPO_CONTAINER.set(resolved_grpo_container)
     resource_group_token = REQUEST_RESOURCE_GROUP_ID.set(resolved_resource_group_id)
     training_pool_token = REQUEST_TRAINING_POOL_ID.set(resolved_training_pool_id)
+    user_role_token = REQUEST_USER_ROLE.set(resolved_user_role)
+    owner_user_id_token = REQUEST_INFERENCE_OWNER_USER_ID.set(resolved_owner_user_id)
+    owner_aliases_token = REQUEST_INFERENCE_OWNER_ALIASES.set(tuple(resolved_owner_aliases))
     session.system.training_container = resolved_training_container
     session.system.evaluation_container = resolved_evaluation_container
     session.system.grpo_container = resolved_grpo_container
     try:
         response = await session.system.process_message(message, raw_content=raw_content)
     finally:
+        REQUEST_INFERENCE_OWNER_ALIASES.reset(owner_aliases_token)
+        REQUEST_INFERENCE_OWNER_USER_ID.reset(owner_user_id_token)
+        REQUEST_USER_ROLE.reset(user_role_token)
         REQUEST_TRAINING_CONTAINER.reset(training_token)
         REQUEST_EVALUATION_CONTAINER.reset(evaluation_token)
         REQUEST_GRPO_CONTAINER.reset(grpo_token)
@@ -11160,21 +12980,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 

@@ -1127,12 +1127,13 @@ def validate_required_param_values(script_info: Dict[str, Any], values: Dict[str
 def validate_cli_param_paths_in_container(
     script_info: Dict[str, Any],
     cli_args: Dict[str, str],
+    container: Optional[str] = None,
 ) -> List[str]:
     missing = []
     if not script_info.get("requires_docker", False):
         return missing
 
-    container = script_info.get("docker_container")
+    container = container or script_info.get("docker_container")
     if not container:
         return missing
 
@@ -1394,10 +1395,10 @@ def run_script_by_name_evaluate(
     # 更新命令行参数
     for cli_param, value in cli_params_to_update.items():
         cli_args[cli_param] = value
-    template_container = str((env_vars or {}).get("container") or script_info.get("docker_container") or DEFAULT_DOCKER_CONTAINER)
+    selected_container = str(params_to_update.get("container") or (env_vars or {}).get("container") or script_info.get("docker_container") or DEFAULT_DOCKER_CONTAINER)
     template_issue = _evaluate_template_policy_issue(
         script_name,
-        template_container,
+        selected_container,
         params_to_update,
         cli_args,
         explicit_template=explicit_template_provided,
@@ -1476,7 +1477,7 @@ def run_script_by_name_evaluate(
                 invalidParams=invalid_params,
             )
 
-        missing_paths = validate_cli_param_paths_in_container(script_info, cli_args)
+        missing_paths = validate_cli_param_paths_in_container(script_info, cli_args, selected_container)
         if missing_paths:
             response_text = (
                 "错误！评估参数指向的路径在容器内不存在，已阻止启动：\n"

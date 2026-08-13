@@ -14,6 +14,8 @@ import subprocess
 import tarfile
 import tempfile
 import threading
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from time import monotonic, sleep
 from pathlib import Path
@@ -113,6 +115,11 @@ _EVALUATE_PID_REGISTRIES = _unique_registry_paths(
     _AGENT_RUNTIME_DIR / "evaluate_pid_registry.jsonl",
     _OUTER_RUNTIME_DIR / "evaluate_pid_registry.jsonl",
 )
+_INFERENCE_PID_REGISTRIES = _unique_registry_paths(
+    Path(os.getenv("MEDFLOW_INFERENCE_PID_REGISTRY", str(_RUNTIME_DIR / "inference_pid_registry.jsonl"))),
+    _AGENT_RUNTIME_DIR / "inference_pid_registry.jsonl",
+    _OUTER_RUNTIME_DIR / "inference_pid_registry.jsonl",
+)
 _BACKGROUND_TASK_REGISTRIES = _unique_registry_paths(
     Path(os.getenv("MEDFLOW_BACKGROUND_TASK_REGISTRY", str(_RUNTIME_DIR / "background_task_registry.jsonl"))),
     _AGENT_RUNTIME_DIR / "background_task_registry.jsonl",
@@ -197,6 +204,12 @@ class TrainingAllocationWriteRequest(BaseModel):
 
 class TrainingReservationStopProcessRequest(BaseModel):
     reservationId: str
+
+
+class InferenceReservationStopServiceRequest(BaseModel):
+    reservationId: str
+    container: str | None = None
+    resourceContext: dict[str, Any] | None = None
 
 
 class EvaluationResultRequest(ContainerRequest):
@@ -324,6 +337,7 @@ def _query_structured_benchmark_status(
     script = r"""
 import json
 import os
+import re
 import sys
 
 root, job_id, benchmark, expected_model, aliases_json = sys.argv[1:6]
@@ -356,10 +370,95 @@ def normalize_status(meta, result):
         return "finished"
     return "running"
 
+def int_or_none(value):
+    try:
+        if value is None or value == "":
+            return None
+        return int(float(str(value).strip().rstrip("%")))
+    except (TypeError, ValueError):
+        return None
+
+def percent_or_none(value):
+    try:
+        if value is None or value == "":
+            return None
+        text = str(value).strip()
+        percent = float(text.rstrip("%"))
+        if "%" not in text and 0 <= percent <= 1:
+            percent *= 100
+        return round(percent, 1)
+    except (TypeError, ValueError):
+        return None
+
+def progress_text(processed, total, percent):
+    if processed is None or total is None:
+        return None
+    if percent is None and total:
+        percent = round(processed * 100 / total, 1)
+    if percent is None:
+        return f"{processed}/{total}"
+    return f"{processed}/{total} ({percent:.1f}%)"
+
+def progress_from_summary(result):
+    summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+    if not summary:
+        return {}
+    processed = int_or_none(summary.get("processed") or summary.get("done"))
+    total = int_or_none(summary.get("total"))
+    percent = percent_or_none(summary.get("progress") or summary.get("progress_percent"))
+    text = progress_text(processed, total, percent)
+    payload = {}
+    if processed is not None:
+        payload["processed"] = processed
+    if total is not None:
+        payload["total"] = total
+    if percent is not None:
+        payload["progress_percent"] = percent
+    if text:
+        payload["progress"] = text
+    elif summary.get("progress") is not None:
+        payload["progress"] = str(summary.get("progress"))
+    for key in ("correct", "accuracy", "avg_f1", "invalid", "invalid_rate"):
+        if key in summary:
+            payload[key] = summary[key]
+    metrics = summary.get("metrics")
+    if isinstance(metrics, dict):
+        for key in ("record_only", "executed", "passed", "failed", "timeout", "executor_error", "pass@1"):
+            if key in metrics:
+                payload[key] = metrics[key]
+    return payload
+
+def read_tail(path, max_bytes=65536):
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - max_bytes), os.SEEK_SET)
+            return handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+def progress_from_run_log(folder):
+    text = read_tail(os.path.join(folder, "run.log"))
+    matches = re.findall(r"\[(\d+)\s*/\s*(\d+)\]\s*done", text)
+    if not matches:
+        return {}
+    processed = int(matches[-1][0])
+    total = int(matches[-1][1])
+    percent = round(processed * 100 / total, 1) if total else None
+    return {
+        "processed": processed,
+        "total": total,
+        "progress_percent": percent,
+        "progress": progress_text(processed, total, percent),
+    }
+
 def payload_for(folder):
     meta = load(os.path.join(folder, "meta.json"))
     result = load(os.path.join(folder, "result.json"))
     status = normalize_status(meta, result)
+    result_path = os.path.join(folder, "result.json")
+    log_file = os.path.join(folder, "run.log")
     payload = {
         "status": status,
         "benchmark_status": status,
@@ -370,13 +469,20 @@ def payload_for(folder):
         "end_time": meta.get("end_time"),
         "folder_path": folder,
         "log_dir": folder,
-        "result_path": os.path.join(folder, "result.json"),
+        "log_file": log_file,
+        "result_path": result_path,
         "data": {"meta": meta},
     }
     if result:
         payload["data"]["result"] = result
+    summary_progress = progress_from_summary(result)
+    has_structured_progress = (
+        summary_progress.get("processed") is not None
+        and summary_progress.get("total") is not None
+    )
+    log_progress = {} if has_structured_progress else progress_from_run_log(folder)
+    payload.update({**log_progress, **summary_progress})
     return payload
-
 folders = []
 skipped = []
 if os.path.isdir(root):
@@ -1506,6 +1612,7 @@ def _runtime_registry_specs() -> list[tuple[str, Path]]:
     for label, paths in (
         ("train_pid", _TRAIN_PID_REGISTRIES),
         ("evaluate_pid", _EVALUATE_PID_REGISTRIES),
+        ("inference_pid", _INFERENCE_PID_REGISTRIES),
         ("background_task", _BACKGROUND_TASK_REGISTRIES),
     ):
         specs.extend((label, path) for path in paths)
@@ -1741,6 +1848,114 @@ def stop_training_reservation_process(request: TrainingReservationStopProcessReq
         }
     )
 
+
+
+def _inference_agent_url() -> str:
+    return os.getenv("INFERENCE_AGENT_URL", "http://127.0.0.1:8899/inference_agent").strip()
+
+
+def _inference_stop_payload(data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        return {}
+    response_data = data.get("data") if isinstance(data.get("data"), dict) else {}
+    service_stop = response_data.get("service_stop")
+    if isinstance(service_stop, dict):
+        return service_stop
+    inference_stop = response_data.get("inference_service_stop")
+    if isinstance(inference_stop, dict):
+        nested_stop = inference_stop.get("service_stop")
+        if isinstance(nested_stop, dict):
+            return nested_stop
+    return {}
+
+
+def _inference_stop_response_is_success(data: Any) -> bool:
+    if not isinstance(data, dict):
+        return False
+    stop_payload = _inference_stop_payload(data)
+    if stop_payload:
+        return stop_payload.get("stopped") is True and stop_payload.get("release_ready") is not False
+    text = str(data.get("result") or data.get("message") or "")
+    status = str(data.get("status") or "").lower()
+    if status not in {"error", "failed", "timeout"}:
+        return True
+    return any(
+        keyword in text
+        for keyword in (
+            "已处于非活动状态",
+            "无需重复停止",
+            "已停止",
+            "无需重复操作",
+            "未检测到存活进程",
+            "not active",
+            "already stopped",
+            "already inactive",
+            "no running process",
+        )
+    )
+
+def _stop_inference_service(request: InferenceReservationStopServiceRequest) -> dict[str, Any]:
+    url = _inference_agent_url()
+    if not url:
+        raise HTTPException(400, "INFERENCE_AGENT_URL is not configured")
+    payload = {
+        "command": "停止推理服务",
+        "user_id": "resource-reservation-admin",
+        "user_role": "admin",
+        "thread_id": f"reservation:{request.reservationId}:inference-stop",
+    }
+    if isinstance(request.resourceContext, dict) and request.resourceContext:
+        payload["resource_context"] = request.resourceContext
+    container = (request.container or "").strip()
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    http_request = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(http_request, timeout=360) as response:
+            response_body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise HTTPException(exc.code, f"Inference service stop failed: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise HTTPException(502, f"Inference service stop failed: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise HTTPException(504, "Inference service stop timed out") from exc
+    try:
+        data = json.loads(response_body or "{}")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(502, "Inference service stop returned invalid JSON") from exc
+    if not _inference_stop_response_is_success(data):
+        message = str(data.get("result") or data.get("message") or "Inference service stop failed")
+        raise HTTPException(502, message)
+    stop_payload = _inference_stop_payload(data)
+    payload_reservation_id = str(
+        stop_payload.get("reservation_id") or stop_payload.get("reservationId") or ""
+    ).strip()
+    if payload_reservation_id and payload_reservation_id != request.reservationId:
+        raise HTTPException(409, "Inference stop response reservation_id does not match request")
+    stopped = bool(stop_payload.get("stopped", True)) if stop_payload else True
+    release_ready = bool(stop_payload.get("release_ready", stopped)) if stop_payload else True
+    return {
+        "reservationId": request.reservationId,
+        "container": container or None,
+        "stopped": stopped,
+        "releaseReady": release_ready,
+        "serviceStop": stop_payload or None,
+        "message": str(data.get("result") or data.get("message") or "推理服务已停止"),
+        "inferenceResponse": data,
+    }
+
+
+@router.post("/inference-reservations/stop-service", dependencies=[Depends(_authorize)])
+def stop_inference_reservation_service(request: InferenceReservationStopServiceRequest):
+    reservation_id = request.reservationId.strip()
+    if not reservation_id:
+        raise HTTPException(400, "reservationId is required")
+    return _response(_stop_inference_service(request))
 
 @router.post("/gpu-reservations/release", dependencies=[Depends(_authorize)])
 def release_gpu_reservation(request: GpuReservationRequest):

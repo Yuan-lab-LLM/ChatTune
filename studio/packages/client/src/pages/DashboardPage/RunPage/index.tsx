@@ -198,6 +198,15 @@ interface AssessmentTaskSummary {
   evalTypeText?: string;
 }
 
+interface InferenceInstanceSummary {
+  instanceId?: string;
+  runtimeNodeId?: string;
+  gpus?: string;
+  reservationId?: string;
+  owner?: string;
+  status?: string;
+}
+
 interface InferenceTaskSummary {
   sourceKey?: string;
   modelName?: string;
@@ -206,8 +215,11 @@ interface InferenceTaskSummary {
   vllmPort?: string;
   hasConfig?: boolean;
   hasStatus?: boolean;
+  preferredView?: InferencePanelView;
+  shouldOpenPanel?: boolean;
   stoppedServices?: number;
   runningServices?: number;
+  instances?: InferenceInstanceSummary[];
 }
 
 interface BenchmarkTaskSummary {
@@ -674,6 +686,43 @@ interface InferenceProtocolConfig {
   };
 }
 
+interface InferenceServiceInstanceItem {
+  instance_id?: string;
+  instanceId?: string;
+  runtime_node_id?: string;
+  runtimeNodeId?: string;
+  reservation_id?: string;
+  reservationId?: string;
+  owner?: string;
+  status?: string;
+  gpus?: Array<string | number> | string;
+  assigned_gpus?: Array<string | number> | string;
+  assignedGpus?: Array<string | number> | string;
+  node?: string;
+  resource?: {
+    runtime_node_id?: string;
+    runtimeNodeId?: string;
+    reservation_id?: string;
+    reservationId?: string;
+    assigned_gpus?: Array<string | number> | string;
+    assignedGpus?: Array<string | number> | string;
+  };
+}
+
+interface InferenceServiceInstancesPayload {
+  operation?: string;
+  items?: InferenceServiceInstanceItem[];
+  summary?: Record<string, number | string | undefined>;
+}
+
+interface BenchmarkStopPayload {
+  operation?: string;
+  stopped?: boolean;
+  status?: string;
+  job_id?: string;
+  jobId?: string;
+}
+
 interface TrainingJobProtocol {
   type?: string;
   jobType?: string;
@@ -682,7 +731,12 @@ interface TrainingJobProtocol {
   errorReason?: string;
   errorRecoverable?: boolean;
   action?: string;
+  benchmark_stop?: BenchmarkStopPayload;
   config?: InferenceProtocolConfig;
+  service_instances?: InferenceServiceInstancesPayload;
+  serviceInstances?: InferenceServiceInstancesPayload;
+  service_instance?: Record<string, unknown>;
+  serviceInstance?: Record<string, unknown>;
   nodes?: Record<
     string,
     {
@@ -694,6 +748,10 @@ interface TrainingJobProtocol {
         rawStatus?: string;
         node?: string;
       }>;
+      service_instances?: InferenceServiceInstancesPayload;
+      serviceInstances?: InferenceServiceInstancesPayload;
+      service_instance?: Record<string, unknown>;
+      serviceInstance?: Record<string, unknown>;
       allStopped?: boolean;
       allRunning?: boolean;
     }
@@ -1278,6 +1336,13 @@ const benchmarkSummaryFromText = (
     return null;
   }
 
+  if (
+    /(?:最终结果|结果文件路径|完整结果|以上为最终结果|任务已运行完毕|任务已结束)/i.test(text) &&
+    /(?:结果|result)/i.test(text)
+  ) {
+    return null;
+  }
+
   if (!/推理基准测试|基准测试|inference_benchmark|benchmark/i.test(text)) {
     return null;
   }
@@ -1333,8 +1398,7 @@ const benchmarkSummaryFromProtocol = (
   if (
     protocol.type !== "job_started" &&
     protocol.type !== "inference_benchmark_progress" &&
-    protocol.type !== "inference_benchmark_status" &&
-    protocol.type !== "inference_benchmark_result"
+    protocol.type !== "inference_benchmark_status"
   ) {
     return null;
   }
@@ -1359,19 +1423,26 @@ const benchmarkSummaryFromProtocol = (
   };
 };
 
-const isBenchmarkTaskStopped = (text: string): boolean => {
-  const protocol = extractProtocolFromText(text);
-  if (
-    protocol?.type === "job_stopped" &&
-    protocol.jobType === "inference_benchmark"
-  ) {
+const isBenchmarkStopProtocol = (
+  protocol: TrainingJobProtocol | null,
+): boolean => {
+  if (!protocol || protocol.jobType !== "inference_benchmark") {
+    return false;
+  }
+
+  if (protocol.type === "job_stopped") {
     return true;
   }
 
-  return /推理基准测试任务已.*停止|推理基准测试.*(?:成功停止|已停止|已结束)/.test(
-    text,
+  return Boolean(
+    protocol.type === "inference_benchmark_stop_result" &&
+      protocol.action === "benchmark_stop" &&
+      protocol.benchmark_stop?.stopped === true,
   );
 };
+
+const isBenchmarkTaskStopped = (text: string): boolean =>
+  isBenchmarkStopProtocol(extractProtocolFromText(text));
 
 const extractTextFromContent = (content: ContentType): string => {
   if (typeof content === "string") {
@@ -1671,14 +1742,125 @@ const parseInferenceTaskSummaryFromText = (
   };
 };
 
+const inferenceServiceInstanceItems = (
+  payload?: InferenceServiceInstancesPayload,
+): InferenceServiceInstanceItem[] =>
+  Array.isArray(payload?.items) ? payload.items : [];
+
+const isInferenceServiceInstancesStatusPayload = (
+  payload?: InferenceServiceInstancesPayload,
+): boolean => {
+  if (!payload) {
+    return false;
+  }
+  const operation = String(payload.operation || "").trim().toLowerCase();
+  return !operation || operation === "status";
+};
+
+const protocolHasInferenceServiceStatusPayload = (
+  protocol: TrainingJobProtocol | null,
+): boolean => {
+  if (!protocol) {
+    return false;
+  }
+  if (
+    isInferenceServiceInstancesStatusPayload(
+      protocol.service_instances || protocol.serviceInstances,
+    ) ||
+    Boolean(protocol.services?.length) ||
+    Boolean(protocol.message?.trim())
+  ) {
+    return true;
+  }
+  return Object.values(protocol.nodes || {}).some((node) =>
+    isInferenceServiceInstancesStatusPayload(
+      node?.service_instances || node?.serviceInstances,
+    ) || Boolean(node?.services?.length),
+  );
+};
+
+const inferenceGpuText = (
+  value: InferenceServiceInstanceItem["gpus"],
+): string | undefined => {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item)).filter(Boolean).join(",");
+  }
+  const text = String(value || "").trim();
+  return text || undefined;
+};
+
+const inferenceInstanceSummariesFromProtocol = (
+  protocol: TrainingJobProtocol,
+): InferenceInstanceSummary[] => {
+  const items: InferenceServiceInstanceItem[] = [
+    ...inferenceServiceInstanceItems(
+      protocol.service_instances || protocol.serviceInstances,
+    ),
+  ];
+  Object.entries(protocol.nodes || {}).forEach(([nodeKey, node]) => {
+    inferenceServiceInstanceItems(
+      node?.service_instances || node?.serviceInstances,
+    ).forEach((item) => items.push({ node: nodeKey, ...item }));
+  });
+  return items
+    .map((item) => {
+      const resource = item.resource || {};
+      return {
+        instanceId: String(item.instance_id || item.instanceId || "").trim(),
+        runtimeNodeId: String(
+          item.runtime_node_id ||
+            item.runtimeNodeId ||
+            resource.runtime_node_id ||
+            resource.runtimeNodeId ||
+            item.node ||
+            "",
+        ).trim(),
+        gpus:
+          inferenceGpuText(item.gpus) ||
+          inferenceGpuText(item.assigned_gpus) ||
+          inferenceGpuText(item.assignedGpus) ||
+          inferenceGpuText(resource.assigned_gpus) ||
+          inferenceGpuText(resource.assignedGpus),
+        reservationId: String(
+          item.reservation_id ||
+            item.reservationId ||
+            resource.reservation_id ||
+            resource.reservationId ||
+            "",
+        ).trim(),
+        owner: String(item.owner || "").trim(),
+        status: String(item.status || "").trim(),
+      };
+    })
+    .filter(
+      (item) =>
+        item.instanceId || item.runtimeNodeId || item.gpus || item.reservationId,
+    )
+    .slice(0, 3);
+};
 const inferenceSummaryFromProtocol = (
   protocol: TrainingJobProtocol | null,
 ): InferenceTaskSummary | null => {
+  const hasServiceInstances = Boolean(
+    protocol?.service_instances ||
+      protocol?.serviceInstances ||
+      Object.values(protocol?.nodes || {}).some(
+        (node) => node?.service_instances || node?.serviceInstances,
+      ),
+  );
+  const isLegacyInferenceServiceInstances =
+    protocol?.type === "inference_config" &&
+    protocol.action === "config_view" &&
+    hasServiceInstances &&
+    !protocol.config;
   const isInferenceConfigView =
-    protocol?.type === "inference_config" && protocol.action === "config_view";
+    protocol?.type === "inference_config" &&
+    protocol.action === "config_view" &&
+    !isLegacyInferenceServiceInstances;
   const isInferenceStatusView =
     protocol?.type === "inference_status" &&
-    protocol.action === "service_status";
+    protocol.action === "service_status" &&
+    protocolHasInferenceServiceStatusPayload(protocol);
   const isInferenceServiceJob =
     ["job_started", "job_stopped"].includes(protocol?.type || "") &&
     protocol?.jobType === "inference_service";
@@ -1721,6 +1903,8 @@ const inferenceSummaryFromProtocol = (
           ? messageSummary?.vllmPort
           : String(ports.VLLM_OPENAI_PORT),
       hasConfig: true,
+      preferredView: `config`,
+      shouldOpenPanel: true,
     };
   }
 
@@ -1729,25 +1913,52 @@ const inferenceSummaryFromProtocol = (
       (node) => node?.services || [],
     );
     const services = protocol.services || nodeServices;
-    const runningServices = services.filter(
-      (service) => service.status === "running",
-    ).length;
-    const stoppedServices = services.filter(
-      (service) => service.status !== "running",
-    ).length;
+    const instances = inferenceInstanceSummariesFromProtocol(protocol);
+    const runningServices = services.length
+      ? services.filter((service) => service.status === "running").length
+      : instances.filter((instance) => instance.status === "running").length;
+    const stoppedServices = services.length
+      ? services.filter((service) => service.status !== "running").length
+      : instances.filter((instance) => instance.status !== "running").length;
     return {
       hasStatus: true,
+      preferredView: `status`,
+      shouldOpenPanel: true,
       runningServices,
       stoppedServices,
+      instances,
     };
   }
-
   if (isInferenceServiceJob) {
+    const messageSummary = protocol.message
+      ? parseInferenceTaskSummaryFromText(protocol.message)
+      : null;
+    const nodeConfigs = Object.values(protocol.nodes || {})
+      .map((node) => node?.config)
+      .filter(Boolean);
+    const config = (protocol.config ||
+      protocol.nodes?.main?.config ||
+      nodeConfigs[0]) as InferenceProtocolConfig | undefined;
+    const ports = config?.ports;
+    const env = config?.env;
+
     return {
-      hasStatus: true,
+      modelName: env?.MODEL_NAME || messageSummary?.modelName,
+      hostIp: env?.HOST_IP || messageSummary?.hostIp,
+      inferencePort:
+        ports?.INFERENCE_PORT === undefined
+          ? messageSummary?.inferencePort
+          : String(ports.INFERENCE_PORT),
+      vllmPort:
+        ports?.VLLM_OPENAI_PORT === undefined
+          ? messageSummary?.vllmPort
+          : String(ports.VLLM_OPENAI_PORT),
+      hasConfig: protocol.type === "job_stopped" && Boolean(config || messageSummary?.hasConfig),
+      hasStatus: protocol.type === "job_stopped",
+      preferredView: `status`,
+      instances: inferenceInstanceSummariesFromProtocol(protocol),
     };
   }
-
   return null;
 };
 
@@ -1762,8 +1973,11 @@ const mergeInferenceTaskSummary = (
   vllmPort: current?.vllmPort || next.vllmPort,
   hasConfig: Boolean(current?.hasConfig || next.hasConfig),
   hasStatus: Boolean(current?.hasStatus || next.hasStatus),
+  preferredView: current?.preferredView || next.preferredView,
+  shouldOpenPanel: Boolean(current?.shouldOpenPanel || next.shouldOpenPanel),
   stoppedServices: current?.stoppedServices ?? next.stoppedServices,
   runningServices: current?.runningServices ?? next.runningServices,
+  instances: current?.instances?.length ? current.instances : next.instances,
 });
 
 const mergeDataFilterTaskSummary = (
@@ -2081,6 +2295,24 @@ const buildDatasetTrainingCommand = (dataset: DatasetInfo): string => {
   const datasetDir = resolveTrainableDatasetDir(dataset, config);
   return `${baseCommand}，训练类型=${config.trainType}，数据类型=${config.label}，dataset_dir=${datasetDir}`;
 };
+
+const resolveRawDatasetPath = (dataset: DatasetInfo): string => {
+  const rawPath = dataset.path?.trim().replace(/\\+/g, "/").replace(/\/+$/, "");
+
+  if (!rawPath) {
+    return dataset.name;
+  }
+  if (rawPath === "/home/workspace/dataset/openai") {
+    return rawPath;
+  }
+  if (rawPath.endsWith(`/${dataset.name}`)) {
+    return rawPath;
+  }
+  return `${rawPath}/${dataset.name}`;
+};
+
+const buildDatasetPreprocessCommand = (dataset: DatasetInfo): string =>
+  `执行数据预处理，${resolveRawDatasetPath(dataset)}`;
 
 interface RunContentPageProps {
   isMetricsSheetOpen: boolean;
@@ -4856,6 +5088,25 @@ const RunContentPage = ({
   useEffect(() => {
     onSilentMonitorCacheKeyChange?.(metricsCacheKey);
   }, [metricsCacheKey, onSilentMonitorCacheKeyChange]);
+  const metricsMonitorTarget = useMemo(() => {
+    if (!metricsTrainingTask || !metricsCacheKey) {
+      return null;
+    }
+
+    return {
+      key: metricsCacheKey,
+      workflowId: metricsTrainingTask.workflowId,
+      container: metricsTrainingTask.container,
+      pid: metricsTrainingTask.pid,
+      trainType: metricsTrainingTask.trainType,
+    };
+  }, [
+    metricsCacheKey,
+    metricsTrainingTask?.workflowId,
+    metricsTrainingTask?.container,
+    metricsTrainingTask?.pid,
+    metricsTrainingTask?.trainType,
+  ]);
 
   const latestAssessmentTask = useMemo(() => {
     for (
@@ -4933,10 +5184,7 @@ const RunContentPage = ({
         if (isWorkflowProtocol(metadataProtocol)) {
           return null;
         }
-        if (
-          metadataProtocol?.type === "job_stopped" &&
-          metadataProtocol.jobType === "inference_benchmark"
-        ) {
+        if (isBenchmarkStopProtocol(metadataProtocol)) {
           return null;
         }
 
@@ -4990,10 +5238,7 @@ const RunContentPage = ({
         const metadataProtocol = extractProtocolFromMetadata(
           messageItem.metadata,
         );
-        if (
-          metadataProtocol?.type === "job_stopped" &&
-          metadataProtocol.jobType === "inference_benchmark"
-        ) {
+        if (isBenchmarkStopProtocol(metadataProtocol)) {
           return `${reply.replyId}:${messageItem.id}:metadata`;
         }
 
@@ -5359,16 +5604,17 @@ const RunContentPage = ({
   ]);
 
   useEffect(() => {
-    if (!isMetricsSheetOpen || !metricsTrainingTask) {
+    if (!isMetricsSheetOpen || !metricsMonitorTarget) {
       onSilentMonitorStatusChange?.({
         isQuerying: false,
         hasMetrics: false,
         hasNewData: false,
-        message: metricsTrainingTask ? undefined : "暂无训练任务",
+        message: metricsMonitorTarget ? undefined : "暂无训练任务",
       });
       return;
     }
 
+    const monitorTarget = metricsMonitorTarget;
     const silentMonitorIntervalMs = 30_000;
     let disposed = false;
     let inFlight = false;
@@ -5389,11 +5635,11 @@ const RunContentPage = ({
       try {
         const requestPayload = {
           runId,
-          workflowId: metricsTrainingTask.workflowId,
+          workflowId: monitorTarget.workflowId,
           nodeId: conversationResourceNodeId,
-          container: metricsTrainingTask.container,
-          pid: metricsTrainingTask.pid,
-          trainType: metricsTrainingTask.trainType,
+          container: monitorTarget.container,
+          pid: monitorTarget.pid,
+          trainType: monitorTarget.trainType,
           historyLimit: 1000,
           timeWindowMinutes: 1440,
         };
@@ -5406,9 +5652,9 @@ const RunContentPage = ({
 
         if (!result.success || !result.data) {
           console.warn("Silent monitor query failed", {
-            container: metricsTrainingTask.container,
-            pid: metricsTrainingTask.pid,
-            trainType: metricsTrainingTask.trainType,
+            container: monitorTarget.container,
+            pid: monitorTarget.pid,
+            trainType: monitorTarget.trainType,
             message: result.message,
           });
           onSilentMonitorStatusChange?.({
@@ -5519,7 +5765,7 @@ const RunContentPage = ({
     };
   }, [
     isMetricsSheetOpen,
-    metricsTrainingTask,
+    metricsMonitorTarget,
     runId,
     conversationResourceNodeId,
     onSilentMonitorReplyChange,
@@ -7520,6 +7766,7 @@ interface RunPageWithMetricsProps {
   onDownload: (dataset: DatasetInfo) => void;
   onDeleteDataset: (dataset: DatasetInfo) => Promise<void>;
   onUseDatasetForTraining: (dataset: DatasetInfo) => void;
+  onUseDatasetForPreprocess: (dataset: DatasetInfo) => void;
   onUseEvaluationForBenchmark: (testName: string) => void;
   onLoadDatasetPreviews: (dataset: DatasetInfo) => Promise<void>;
   isUploading: boolean;
@@ -7643,6 +7890,7 @@ const RunPageWithMetrics = ({
   onDownload,
   onDeleteDataset,
   onUseDatasetForTraining,
+  onUseDatasetForPreprocess,
   onUseEvaluationForBenchmark,
   onLoadDatasetPreviews,
   isUploading,
@@ -7957,6 +8205,121 @@ const RunPageWithMetrics = ({
     ],
   );
 
+  const guardedUseDatasetForPreprocess = useCallback(
+    (dataset: DatasetInfo) => {
+      const datasetNodeId = dataset.nodeId?.trim();
+      const runNodeId = runData?.nodeId?.trim();
+      const fallbackNodeId =
+        user?.assignedNodeId?.trim() ||
+        (selectedResourceNodeId !== "all" ? selectedResourceNodeId.trim() : "");
+      const currentNodeId =
+        runNodeId && runNodeId !== "unknown" ? runNodeId : fallbackNodeId;
+      const datasetContainerName = dataset.containerName?.trim();
+      const currentContainerName = (currentTrainingContainerName || "").trim();
+
+      if (!datasetNodeId) {
+        message.warning(
+          t("dataset.train.missingNode") ||
+            "数据集缺少节点信息，请刷新数据集列表后重试",
+        );
+        return;
+      }
+
+      if (!currentNodeId || currentNodeId === "unknown") {
+        message.warning(
+          t("dataset.train.missingRunNode") ||
+            "当前运行实例缺少节点信息，不能直接启动训练",
+        );
+        return;
+      }
+
+      if (datasetNodeId !== currentNodeId) {
+        const targetRun = runs.find(
+          (run) =>
+            run.nodeId === datasetNodeId &&
+            (run.status === Status.RUNNING || run.status === Status.PENDING),
+        );
+        const datasetNodeLabel =
+          dataset.nodeName || datasetNodeId || t("resourceNode.unknown");
+        const currentNodeLabel = currentNodeId || t("resourceNode.unknown");
+
+        Modal.confirm({
+          title: t("dataset.train.crossNodeTitle") || "数据集不在当前运行节点",
+          content: (
+            <div className="space-y-2 text-sm">
+              <p>
+                {t("dataset.train.crossNodeDesc", {
+                  dataset: dataset.name,
+                  datasetNode: datasetNodeLabel,
+                  runNode: currentNodeLabel,
+                }) ||
+                  `数据集 ${dataset.name} 位于 ${datasetNodeLabel}，当前运行实例位于 ${currentNodeLabel}。训练请求会由当前运行节点执行，因此不能直接使用跨节点数据集。`}
+              </p>
+              <p>
+                {targetRun
+                  ? t("dataset.train.crossNodeSwitchHint") ||
+                    "可以切换到该节点当前可运行的 Run 后再启动训练。"
+                  : t("dataset.train.crossNodeNoRunHint") ||
+                    "该节点当前没有可运行的 Run，请先启动对应 Runtime/run。"}
+              </p>
+            </div>
+          ),
+          okText: targetRun
+            ? t("dataset.train.switchRun") || "切换到该节点 Run"
+            : t("dataset.train.viewRuns") || "查看运行列表",
+          cancelText: t("common.cancel") || "取消",
+          onOk: () => {
+            if (targetRun) {
+              navigate(`/projects/${projectName}/runs/${targetRun.id}`, {
+                replace: true,
+              });
+              setRunPagePanelOpen(false);
+              return;
+            }
+            onTabChange("runs");
+            setRunPagePanelOpen(true);
+          },
+        });
+        return;
+      }
+
+      if (
+        datasetContainerName &&
+        currentContainerName &&
+        datasetContainerName !== currentContainerName
+      ) {
+        Modal.warning({
+          title:
+            t("dataset.train.crossContainerTitle") || "数据集不在当前训练容器",
+          content:
+            t("dataset.train.crossContainerDesc", {
+              dataset: dataset.name,
+              datasetContainer: datasetContainerName,
+              runContainer: currentContainerName,
+            }) ||
+            `数据集 ${dataset.name} 来自容器 ${datasetContainerName}，当前运行实例使用训练容器 ${currentContainerName}。请先将数据集同步到当前训练容器后再启动训练。`,
+          okText: t("common.ok") || "知道了",
+        });
+        return;
+      }
+
+      onUseDatasetForPreprocess(dataset);
+    },
+    [
+      currentTrainingContainerName,
+      navigate,
+      onTabChange,
+      onUseDatasetForPreprocess,
+      projectName,
+      runData?.nodeId,
+      selectedResourceNodeId,
+      runs,
+      setRunPagePanelOpen,
+      t,
+      user?.assignedNodeId,
+    ],
+  );
+
   // 从 content 中提取文本（处理 string 或 ContentBlocks）
   const extractTextFromContent = (content: ContentType): string => {
     if (typeof content === "string") {
@@ -8131,6 +8494,7 @@ const RunPageWithMetrics = ({
             return Promise.resolve(onDownload(dataset));
           }}
           onUseDatasetForTraining={guardedUseDatasetForTraining}
+          onUseDatasetForPreprocess={guardedUseDatasetForPreprocess}
           onUseEvaluationForBenchmark={onUseEvaluationForBenchmark}
           onDownloadTest={(name, test) => {
             onDownloadTest(name, test);
@@ -8215,6 +8579,7 @@ const RunPageWithMetrics = ({
               onDownload={onDownload}
               onDeleteDataset={onDeleteDataset}
               onUseDatasetForTraining={guardedUseDatasetForTraining}
+              onUseDatasetForPreprocess={guardedUseDatasetForPreprocess}
               onUseEvaluationForBenchmark={onUseEvaluationForBenchmark}
               onLoadDatasetPreviews={onLoadDatasetPreviews}
               isInputDisabled={isCommandFillDisabled}
@@ -8426,6 +8791,26 @@ const RunPage = () => {
           command,
           t("dataset.train.inputHint") ||
             "训练命令已填入，点击右下角发送即可开始",
+        );
+        setRunPagePanelOpen(false);
+        message.success(t("wizard.resume.commandFilledToast"));
+        return;
+      }
+
+      message.warning(t("wizard.resume.inputUnavailable"));
+    },
+    [setRunPagePanelOpen, t],
+  );
+
+  const handleUseDatasetForPreprocess = useCallback(
+    (dataset: DatasetInfo) => {
+      const command = buildDatasetPreprocessCommand(dataset);
+
+      if (setInputTextRef.current) {
+        setInputTextRef.current(
+          command,
+          t("dataset.preprocess.inputHint") ||
+            "预处理命令已填入，点击右下角发送即可开始",
         );
         setRunPagePanelOpen(false);
         message.success(t("wizard.resume.commandFilledToast"));
@@ -10271,6 +10656,7 @@ const RunPage = () => {
       onDownload={handleDownload}
       onDeleteDataset={handleDeleteDataset}
       onUseDatasetForTraining={handleUseDatasetForTraining}
+      onUseDatasetForPreprocess={handleUseDatasetForPreprocess}
       onLoadDatasetPreviews={handleLoadDatasetPreviews}
       isUploading={isUploading}
       downloadingId={downloadingId}
@@ -10430,6 +10816,7 @@ const RunPage = () => {
                 onDownload={handleDownload}
                 onDeleteDataset={handleDeleteDataset}
                 onUseDatasetForTraining={handleUseDatasetForTraining}
+                onUseDatasetForPreprocess={handleUseDatasetForPreprocess}
                 onLoadDatasetPreviews={handleLoadDatasetPreviews}
                 isUploading={isUploading}
                 downloadingId={downloadingId}

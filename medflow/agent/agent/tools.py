@@ -1,17 +1,24 @@
 import ast
 import copy
+import fcntl
+import hashlib
 import json
 import os
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
+import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Dict, Optional
 
 import psutil
@@ -21,34 +28,23 @@ from langchain.tools import tool
 CONFIG_FILE = "../config/service.yaml"
 DEFAULT_CONFIG_FILE = "../config/service.default.yaml"
 NODES_CONFIG_FILE = "../config/nodes.yaml"
+AGENT_CONFIG_FILE = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "../config/agent.yaml")
+)
 WHITELIST = {
     "PORTS.VLLM_OPENAI_PORT",
     "PORTS.INFERENCE_PORT",
     "PORTS.UI_PORT",
     "PORTS.DATA_ANNOTATION_PORT",
-    "ENV.HOST_IP",
     "ENV.CUDA_VISIBLE_DEVICES",
     "ENV.MASTER_PORT",
     "ENV.MODEL_NAME",
+    "ENV.MODEL_PARAM_B",
     "RUNTIME.TENSOR_PARALLEL_SIZE",
     "RUNTIME.MAX_TOKENS",
     "RUNTIME.GPU_MEMORY_UTILIZATION",
+    "RUNTIME.GPU_UTILIZATION_THRESHOLD",
 }
-# "ENV.BENCHMARK_DIR",
-# "ENV.GENERAL_BENCHMARK_DIR",
-# "ENV.HUMANEVAL_EXECUTOR",
-# "ENV.HUMANEVAL_DOCKER_IMAGE",
-# "ENV.HUMANEVAL_TIMEOUT",
-# "ENV.HUMANEVAL_MEMORY",
-# "ENV.HUMANEVAL_CPUS",
-# "ENV.HUMANEVAL_PIDS_LIMIT",
-# "ENV.LCB_EXECUTOR",
-# "ENV.LCB_DOCKER_IMAGE",
-# "ENV.LCB_TIMEOUT",
-# "ENV.LCB_NUM_PROCESS",
-# "ENV.LCB_MEMORY",
-# "ENV.LCB_CPUS",
-# "ENV.LCB_PIDS_LIMIT",
 LOG_FILES = {
     "start": "start-service.log",
     "vllm": "vllm.log",
@@ -57,27 +53,448 @@ LOG_FILES = {
     "web": "web.log",
     "case2chat": "case2chat.log",
 }
-MAX_OUTPUT_CHARS = 6000
+MAX_OUTPUT_CHARS = 3000
+MAX_LOG_LINES = 80
+MAX_LOG_CONTEXT_WINDOW = 40
+DEFAULT_LIST_LIMIT = 20
+MAX_LIST_LIMIT = 100
 PROGRESS_UPDATE_INTERVAL = 5
-NODE_AGENT_TIMEOUT = 120
+NODE_AGENT_TIMEOUT = int(os.getenv("NODE_AGENT_TIMEOUT", "300"))
+BENCHMARK_SUBMIT_LOCK_TTL = int(os.getenv("BENCHMARK_SUBMIT_LOCK_TTL", "600"))
+# Request-scoped identity for service instance ownership checks.
+CURRENT_REQUEST_USER_ID: ContextVar[str] = ContextVar(
+    "CURRENT_REQUEST_USER_ID", default=""
+)
+CURRENT_REQUEST_USER_ROLE: ContextVar[str] = ContextVar(
+    "CURRENT_REQUEST_USER_ROLE", default=""
+)
+CURRENT_REQUEST_USER_ALIASES: ContextVar[tuple[str, ...]] = ContextVar(
+    "CURRENT_REQUEST_USER_ALIASES", default=()
+)
+CURRENT_REQUEST_THREAD_ID: ContextVar[str] = ContextVar(
+    "CURRENT_REQUEST_THREAD_ID", default=""
+)
+CURRENT_REQUEST_RESOURCE_CONTEXT: ContextVar[Optional[dict]] = ContextVar(
+    "CURRENT_REQUEST_RESOURCE_CONTEXT", default=None
+)
+PORT_ALLOCATION_LOCK = threading.Lock()
+PENDING_INSTANCE_PORTS: set[int] = set()
+PENDING_PORT_LEASE_TTL = 900
+PORT_LISTENER_CACHE_LOCK = threading.Lock()
+PORT_LISTENER_CACHE = {"time": 0.0, "listeners": {}, "scan_failed": False}
+PORT_LISTENER_CACHE_TTL = 0.5
 
 
-def safe_output(text):
-    if len(text) > MAX_OUTPUT_CHARS:
-        return text[:MAX_OUTPUT_CHARS] + "\n... truncated ..."
+def safe_output(text, limit: int = MAX_OUTPUT_CHARS):
+    text = str(text)
+    if len(text) > limit:
+        return (
+            text[:limit]
+            + "\n... truncated ...\n"
+            "输出已截断，请缩小 service、keyword、lines 或 window 后继续查看。"
+        )
     return text
 
 
-def get_service_log_root() -> str:
-    CONFIG = show_config()
-    log_dir = CONFIG["ENV"]["LOG_DIR"]
+def clamp_int(value, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def parse_time_sort_value(value: object) -> float:
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    for fmt, length in (("%Y-%m-%d %H:%M:%S", 19), ("%Y%m%d_%H%M%S", 15)):
+        try:
+            return time.mktime(time.strptime(text[:length], fmt))
+        except Exception:
+            continue
+    try:
+        return float(text.split("_", 1)[0])
+    except Exception:
+        return 0.0
+
+
+def status_sort_rank(status: object) -> int:
+    value = str(status or "").strip().lower()
+    order = {
+        "submitting": 0,
+        "running": 0,
+        "starting": 1,
+        "degraded": 2,
+        "pending": 2,
+        "failed": 3,
+        "unknown_finished": 4,
+        "stopped": 5,
+        "finished": 6,
+    }
+    return order.get(value, 9)
+
+
+def set_current_request_user_id(user_id: str):
+    return CURRENT_REQUEST_USER_ID.set(str(user_id or "").strip())
+
+
+def reset_current_request_user_id(token) -> None:
+    CURRENT_REQUEST_USER_ID.reset(token)
+
+
+def current_request_user_id() -> str:
+    return CURRENT_REQUEST_USER_ID.get().strip()
+
+
+def _owner_aliases_from_any(value) -> tuple[str, ...]:
+    if isinstance(value, (list, tuple, set)):
+        values = value
+    else:
+        values = str(value or "").split(",")
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        text = str(item or "").strip()
+        if text and text not in seen:
+            result.append(text)
+            seen.add(text)
+    return tuple(result)
+
+
+def set_current_request_user_aliases(user_aliases):
+    return CURRENT_REQUEST_USER_ALIASES.set(_owner_aliases_from_any(user_aliases))
+
+
+def reset_current_request_user_aliases(token) -> None:
+    CURRENT_REQUEST_USER_ALIASES.reset(token)
+
+
+def current_request_user_aliases() -> list[str]:
+    return list(CURRENT_REQUEST_USER_ALIASES.get() or ())
+
+
+def current_request_owner_ids() -> set[str]:
+    ids = set(current_request_user_aliases())
+    current = current_request_user_id()
+    if current:
+        ids.add(current)
+    for owner in list(ids):
+        if owner.startswith("auth:"):
+            stripped = owner.split(":", 1)[1].strip()
+            if stripped:
+                ids.add(stripped)
+    return {item for item in ids if item}
+
+
+def legacy_owner_base(owner) -> str:
+    text = str(owner or "").strip().strip("[]")
+    if not text:
+        return ""
+    if text.startswith("auth:"):
+        return text.split(":", 1)[1].strip()
+    if "#" in text:
+        return text.split("#", 1)[0].strip()
+    match = re.match(r"^user:([^:]+):", text)
+    if match:
+        return match.group(1).strip()
+    return text
+
+
+def owner_matches_current(owner) -> bool:
+    owner_text = str(owner or "").strip()
+    if not owner_text:
+        return False
+    candidates = current_request_owner_ids()
+    if owner_text in candidates:
+        return True
+    owner_base = legacy_owner_base(owner_text)
+    if owner_base and owner_base in candidates:
+        return True
+    return any(owner_text.startswith(f"{candidate}#") for candidate in candidates)
+
+
+def service_instance_owned_by_current(meta: dict) -> bool:
+    meta = meta if isinstance(meta, dict) else {}
+    if owner_matches_current(meta.get("owner_user_id")):
+        return True
+    return any(owner_matches_current(alias) for alias in _owner_aliases_from_any(meta.get("owner_aliases")))
+
+
+def task_owned_by_current(meta: dict) -> bool:
+    meta = meta if isinstance(meta, dict) else {}
+    if owner_matches_current(task_owner_user_id(meta)):
+        return True
+    return any(owner_matches_current(alias) for alias in _owner_aliases_from_any(meta.get("owner_aliases")))
+
+def set_current_request_user_role(user_role: str):
+    return CURRENT_REQUEST_USER_ROLE.set(str(user_role or "").strip().lower())
+
+
+def reset_current_request_user_role(token) -> None:
+    CURRENT_REQUEST_USER_ROLE.reset(token)
+
+
+def current_request_user_role() -> str:
+    return CURRENT_REQUEST_USER_ROLE.get().strip().lower()
+
+
+def current_request_is_admin() -> bool:
+    return current_request_user_role() == "admin"
+
+
+ADMIN_TOOL_FORBIDDEN_MESSAGE = "当前请求不是管理员角色，已拒绝调用管理员维护工具。"
+
+
+def scope_all_forbidden_message(scope: str) -> str:
+    scope = str(scope or "mine").strip().lower()
+    if scope == "all" and not current_request_is_admin():
+        return ADMIN_TOOL_FORBIDDEN_MESSAGE
+    return ""
+
+
+def set_current_request_thread_id(thread_id: str):
+    return CURRENT_REQUEST_THREAD_ID.set(str(thread_id or "").strip())
+
+
+def reset_current_request_thread_id(token) -> None:
+    CURRENT_REQUEST_THREAD_ID.reset(token)
+
+
+def current_request_thread_id() -> str:
+    return CURRENT_REQUEST_THREAD_ID.get().strip()
+
+
+def set_current_request_resource_context(resource_context: Optional[dict]):
+    value = dict(resource_context) if isinstance(resource_context, dict) else None
+    return CURRENT_REQUEST_RESOURCE_CONTEXT.set(value)
+
+
+def reset_current_request_resource_context(token) -> None:
+    CURRENT_REQUEST_RESOURCE_CONTEXT.reset(token)
+
+
+def current_request_resource_context() -> dict:
+    value = CURRENT_REQUEST_RESOURCE_CONTEXT.get()
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def parse_resource_pool_enabled(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off", ""}:
+        return False
+    raise ValueError("RESOURCE_POOL.ENABLED must be true or false")
+
+
+def load_resource_pool_enabled() -> bool:
+    configured = False
+    if os.path.exists(AGENT_CONFIG_FILE):
+        with open(AGENT_CONFIG_FILE) as f:
+            agent_config = yaml.safe_load(f) or {}
+        resource_config = agent_config.get("RESOURCE_POOL", {})
+        if isinstance(resource_config, dict):
+            configured = parse_resource_pool_enabled(
+                resource_config.get("ENABLED", False)
+            )
+    environment_value = os.getenv("MEDFLOW_RESOURCE_POOL_ENABLED")
+    if environment_value is not None:
+        return parse_resource_pool_enabled(environment_value)
+    return configured
+
+
+RESOURCE_POOL_ENABLED = load_resource_pool_enabled()
+
+
+def resource_pool_managed() -> bool:
+    return RESOURCE_POOL_ENABLED
+
+
+def _resource_gpu_ids(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        items = [str(item).strip() for item in value]
+    else:
+        items = [item.strip() for item in str(value or "").split(",")]
+    return list(dict.fromkeys(item for item in items if item))
+
+
+def resource_context_nodes(resource_context: Optional[dict] = None) -> list[dict]:
+    """Return normalized node allocations, including the legacy single-node form."""
+    context = resource_context or current_request_resource_context()
+    raw_nodes = context.get("nodes")
+    if isinstance(raw_nodes, list):
+        nodes = []
+        for item in raw_nodes:
+            if not isinstance(item, dict):
+                continue
+            node_id = str(item.get("runtime_node_id") or "").strip()
+            if not node_id:
+                continue
+            node = dict(item)
+            node["runtime_node_id"] = node_id
+            node["assigned_gpus"] = _resource_gpu_ids(
+                item.get("assigned_gpus", item.get("cuda_visible_devices"))
+            )
+            nodes.append(node)
+        if nodes:
+            return nodes
+
+    node_id = str(context.get("runtime_node_id") or "").strip()
+    if not node_id:
+        return []
+    return [
+        {
+            "runtime_node_id": node_id,
+            "assigned_gpus": _resource_gpu_ids(
+                context.get("assigned_gpus", context.get("cuda_visible_devices"))
+            ),
+            "tensor_parallel_size": context.get("tensor_parallel_size"),
+            "gpus_per_node": context.get("gpus_per_node"),
+            "is_master": True,
+        }
+    ]
+
+
+def resource_context_gpu_ids(resource_context: Optional[dict] = None) -> list[str]:
+    context = resource_context or current_request_resource_context()
+    direct = _resource_gpu_ids(
+        context.get("assigned_gpus", context.get("cuda_visible_devices"))
+    )
+    if direct:
+        return direct
+    nodes = resource_context_nodes(context)
+    return list(nodes[0].get("assigned_gpus") or []) if len(nodes) == 1 else []
+
+
+def managed_resource_error(
+    require_gpus: bool = False, require_reservation: bool = False
+) -> str:
+    if not resource_pool_managed():
+        return ""
+    context = current_request_resource_context()
+    nodes = resource_context_nodes(context)
+    missing = []
+    if not nodes:
+        missing.append("nodes/runtime_node_id")
+    if require_reservation and not str(context.get("reservation_id") or "").strip():
+        missing.append("reservation_id")
+    if require_gpus and (
+        not nodes or any(not node.get("assigned_gpus") for node in nodes)
+    ):
+        missing.append("assigned_gpus")
+    if not missing:
+        return ""
+    return (
+        "资源池托管模式缺少必要的资源上下文，已拒绝执行。\n"
+        f"missing={','.join(missing)}"
+    )
+
+
+def load_template_config() -> dict:
+    with open(CONFIG_FILE) as f:
+        return yaml.safe_load(f) or {}
+
+
+def apply_node_managed_config(cfg: dict) -> dict:
+    """Overlay worker-owned values from this worker's service.yaml."""
+    effective = copy.deepcopy(cfg)
+    template = load_template_config()
+    template_env = template.get("ENV") or {}
+    effective.setdefault("ENV", {})["HOST_IP"] = str(
+        template_env.get("HOST_IP") or ""
+    ).strip()
+    return effective
+
+
+def write_user_draft_config(path: str, cfg: dict) -> None:
+    write_runtime_config(path, apply_node_managed_config(cfg))
+
+
+def sync_worker_service_host_ip() -> dict:
+    """Persist this worker's detected IP in its node-local service.yaml."""
+    cfg = load_template_config()
+    env = cfg.setdefault("ENV", {})
+    configured_ip = str(env.get("HOST_IP") or "").strip()
+    worker_ip = get_local_ip()
+    changed = configured_ip != worker_ip
+    if changed:
+        env["HOST_IP"] = worker_ip
+        write_runtime_config(CONFIG_FILE, cfg)
+    return {
+        "changed": changed,
+        "configured_ip": configured_ip,
+        "worker_ip": worker_ip,
+        "config_file": CONFIG_FILE,
+    }
+
+
+def service_log_root_from_config(cfg: dict) -> str:
+    log_dir = cfg["ENV"]["LOG_DIR"]
     if os.path.isabs(log_dir):
         return os.path.normpath(log_dir)
     return os.path.normpath(f"../{log_dir}")
 
 
+def get_service_log_root() -> str:
+    return service_log_root_from_config(load_template_config())
+
+
 def get_agent_root() -> str:
     return os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+
+def get_project_root() -> str:
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+
+
+def get_inference_pid_registry_path() -> str:
+    return os.getenv(
+        "MEDFLOW_INFERENCE_PID_REGISTRY",
+        os.path.join(get_project_root(), "agent", "runtime", "inference_pid_registry.jsonl"),
+    )
+
+
+def record_inference_pid(instance_meta: dict) -> None:
+    if not isinstance(instance_meta, dict):
+        return
+    resource = instance_meta.get("resource") if isinstance(instance_meta.get("resource"), dict) else {}
+    reservation_id = str(resource.get("reservation_id") or "").strip()
+    script_pid = str(instance_meta.get("script_pid") or "").strip()
+    if not reservation_id or not script_pid:
+        return
+    registry_path = get_inference_pid_registry_path()
+    os.makedirs(os.path.dirname(registry_path), exist_ok=True)
+    record = {
+        "reservationId": reservation_id,
+        "container": os.getenv("AGENT3_DEFAULT_DOCKER_CONTAINER", "agent3"),
+        "pid": script_pid,
+        "started_at": current_time_text(),
+        "agent": "inference",
+        "taskCategory": "inference",
+        "taskType": "inference",
+        "taskTypeText": "推理服务",
+        "instance_id": instance_meta.get("instance_id"),
+        "run_id": instance_meta.get("run_id"),
+        "script_name": "service_start",
+        "script_path": instance_meta.get("runtime_config"),
+        "model": instance_meta.get("model"),
+        "model_path": instance_meta.get("model_path"),
+        "gpus": instance_meta.get("actual_gpus"),
+        "runtime_node_id": resource.get("runtime_node_id"),
+        "resource_group_id": resource.get("resource_group_id"),
+        "training_pool_id": resource.get("training_pool_id"),
+        "log_dir": instance_meta.get("log_dir"),
+        "status_file": instance_meta.get("status_file"),
+        "meta_file": instance_meta.get("meta_file"),
+        "launch_status": instance_meta.get("status") or "starting",
+    }
+    with open(registry_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def load_nodes_config() -> dict:
@@ -106,8 +523,110 @@ def enabled_nodes() -> dict:
     }
 
 
+def node_identity_matches(node_cfg: dict, key: str) -> bool:
+    return (
+        str(node_cfg.get("NAME", "")).strip() == key
+        or str(node_cfg.get("HOST", "")).strip() == key
+        or str(node_cfg.get("RESOURCE_NODE_ID", "")).strip() == key
+    )
+
+
+def managed_resource_env_node_ids() -> set[str]:
+    node_ids = set()
+    for env_name in ("MEDFLOW_RESOURCE_NODE_ID", "MEDFLOW_RUNTIME_NODE_ID", "RESOURCE_NODE_ID"):
+        value = str(os.getenv(env_name) or "").strip()
+        if value:
+            node_ids.add(value)
+    return node_ids
+
+
+def managed_resource_node_ids() -> set[str]:
+    if not resource_pool_managed():
+        return set()
+    context_node_ids = {
+        str(node.get("runtime_node_id") or "").strip()
+        for node in resource_context_nodes()
+        if str(node.get("runtime_node_id") or "").strip()
+    }
+    return context_node_ids or managed_resource_env_node_ids()
+
+def managed_resource_node_id() -> str:
+    return next(iter(managed_resource_node_ids()), "")
+
+
+def node_matches_resource(node_key: str, node_cfg: dict) -> bool:
+    resource_node_ids = managed_resource_node_ids()
+    if not resource_node_ids:
+        return not resource_pool_managed()
+    identities = {
+        str(node_key).strip(),
+        str(node_cfg.get("RESOURCE_NODE_ID") or "").strip(),
+        str(node_cfg.get("NAME") or "").strip(),
+        str(node_cfg.get("HOST") or "").strip(),
+    }
+    return bool(resource_node_ids.intersection(identities))
+
+
+def resource_context_for_node(
+    node_key: str,
+    node_cfg: dict,
+    resource_context: Optional[dict] = None,
+) -> dict:
+    """Narrow a managed multi-node context to one worker allocation."""
+    context = resource_context or current_request_resource_context()
+    if not resource_pool_managed() or not context:
+        return dict(context)
+    identities = {
+        str(node_key).strip(),
+        str(node_cfg.get("RESOURCE_NODE_ID") or "").strip(),
+        str(node_cfg.get("NAME") or "").strip(),
+        str(node_cfg.get("HOST") or "").strip(),
+    }
+    matched = next(
+        (
+            node
+            for node in resource_context_nodes(context)
+            if str(node.get("runtime_node_id") or "").strip() in identities
+        ),
+        None,
+    )
+    if not matched:
+        return {}
+    narrowed = {
+        key: value
+        for key, value in context.items()
+        if key
+        not in {
+            "nodes",
+            "runtime_node_id",
+            "assigned_gpus",
+            "cuda_visible_devices",
+            "tensor_parallel_size",
+            "gpus_per_node",
+        }
+    }
+    narrowed.update(matched)
+    narrowed["assigned_gpus"] = ",".join(matched.get("assigned_gpus") or [])
+    return narrowed
+
+
+def resource_allowed_nodes() -> dict:
+    nodes = enabled_nodes()
+    if not resource_pool_managed():
+        return nodes
+    return {
+        key: value
+        for key, value in nodes.items()
+        if node_matches_resource(key, value)
+    }
+
+
 def resolve_node_config(node: str, require_enabled: bool = True) -> tuple[str, dict]:
     key = str(node or "").strip()
+    if not key and resource_pool_managed():
+        matches = list(resource_allowed_nodes().items())
+        if len(matches) == 1:
+            key = matches[0][0]
     if not key:
         raise ValueError("node is required")
 
@@ -119,13 +638,15 @@ def resolve_node_config(node: str, require_enabled: bool = True) -> tuple[str, d
         matches = [
             (name, item)
             for name, item in nodes.items()
-            if str(item.get("NAME", "")).strip() == key
-            or str(item.get("HOST", "")).strip() == key
+            if node_identity_matches(item, key)
         ]
         if len(matches) != 1:
-            available = ", ".join(enabled_nodes().keys()) or "none"
+            available = []
+            for name, item in enabled_nodes().items():
+                available.append(name)
+            available_text = ", ".join(available) or "none"
             raise ValueError(
-                f"Unknown node: {node}. Available enabled nodes: {available}"
+                f"Unknown node: {node or key}. Available enabled nodes: {available_text}"
             )
         node_key, node_cfg = matches[0]
 
@@ -133,6 +654,12 @@ def resolve_node_config(node: str, require_enabled: bool = True) -> tuple[str, d
         raise ValueError(f"Node disabled: {node_key}")
     if not node_cfg.get("TOOL_URL") and not node_cfg.get("URL"):
         raise ValueError(f"Node URL missing: {node_key}")
+    if resource_pool_managed() and not node_matches_resource(node_key, node_cfg):
+        runtime_node_ids = ",".join(sorted(managed_resource_node_ids())) or "missing"
+        raise ValueError(
+            f"Node outside resource boundary: node={node_key}, "
+            f"runtime_node_ids={runtime_node_ids}"
+        )
     return node_key, node_cfg
 
 
@@ -148,6 +675,8 @@ def save_nodes_config(nodes: dict) -> None:
 
 
 def set_node_enabled(node: str, enabled: bool) -> str:
+    if resource_pool_managed():
+        return "资源池托管模式下禁止通过 Agent 修改全局节点启停状态。"
     nodes = load_nodes_config()
     if not nodes:
         return f"暂无节点配置: {NODES_CONFIG_FILE}"
@@ -185,6 +714,26 @@ def call_node_tool(
         "tool": tool_name,
         "args": args or {},
     }
+    user_id = current_request_user_id()
+    if user_id:
+        payload["user_id"] = user_id
+    thread_id = current_request_thread_id()
+    if thread_id:
+        payload["thread_id"] = thread_id
+    user_role = current_request_user_role()
+    if user_role:
+        payload["user_role"] = user_role
+    resource_context = current_request_resource_context()
+    if resource_context:
+        if resource_pool_managed():
+            resource_context = resource_context_for_node(
+                node_key, node_cfg, resource_context
+            )
+            if not resource_context:
+                raise RuntimeError(
+                    f"Node outside resource boundary: node={node_key}"
+                )
+        payload["resource_context"] = resource_context
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
         tool_url,
@@ -242,16 +791,28 @@ def build_node_tool_response(node: str, response: dict) -> dict:
 
     node_key = response.get("_node_key", node) if isinstance(response, dict) else node
     node_data = {}
-    if payload.get("config") is not None:
-        node_data["config"] = payload["config"]
+    if payload.get("config_draft") is not None:
+        node_data["config_draft"] = payload["config_draft"]
     if payload.get("services") is not None:
         node_data["services"] = payload["services"]
-    if payload.get("benchmark") is not None:
-        node_data["benchmark"] = payload["benchmark"]
+    if payload.get("service_instances") is not None:
+        node_data["service_instances"] = payload["service_instances"]
+    if payload.get("service_instance") is not None:
+        node_data["service_instance"] = payload["service_instance"]
+    if payload.get("service_start") is not None:
+        node_data["service_start"] = payload["service_start"]
+    if payload.get("test_runs") is not None:
+        node_data["test_runs"] = payload["test_runs"]
+    if payload.get("test_run_stop") is not None:
+        node_data["test_run_stop"] = payload["test_run_stop"]
+    if payload.get("admin_cleanup") is not None:
+        node_data["admin_cleanup"] = payload["admin_cleanup"]
+    if payload.get("benchmark_stop") is not None:
+        node_data["benchmark_stop"] = payload["benchmark_stop"]
+    if payload.get("benchmark_jobs") is not None:
+        node_data["benchmark_jobs"] = payload["benchmark_jobs"]
     if payload.get("benchmark_reports"):
         node_data["benchmark_reports"] = payload["benchmark_reports"]
-    elif payload.get("benchmark") is not None:
-        node_data["benchmark_reports"] = [payload["benchmark"]]
 
     response_data = {"nodes": {}}
     if node_data:
@@ -261,6 +822,14 @@ def build_node_tool_response(node: str, response: dict) -> dict:
         "_tool_text": format_node_tool_response(node, response),
         "_response_data": response_data,
     }
+
+
+def node_tool_text(node: str, tool_name: str, args: Optional[dict] = None) -> str:
+    return format_node_tool_response(node, call_node_tool(node, tool_name, args))
+
+
+def node_tool_structured(node: str, tool_name: str, args: Optional[dict] = None) -> dict:
+    return build_node_tool_response(node, call_node_tool(node, tool_name, args))
 
 
 def append_start_target_hint(text: str, node: str) -> str:
@@ -280,15 +849,6 @@ def append_start_target_hint(text: str, node: str) -> str:
     return str(text) + hint
 
 
-def parse_json_args(args_json: str) -> dict:
-    if not str(args_json or "").strip():
-        return {}
-    data = json.loads(args_json)
-    if not isinstance(data, dict):
-        raise ValueError("args_json must be a JSON object")
-    return data
-
-
 def node_is_worker(node_cfg: dict) -> bool:
     role = str(node_cfg.get("ROLE", "worker")).strip().lower()
     return "worker" in role or role in {"", "both"}
@@ -299,10 +859,6 @@ def response_result_text(response: dict) -> str:
     if isinstance(result, dict):
         return str(result.get("analysis", result))
     return str(result)
-
-
-def service_status_has_running(status_text: str) -> bool:
-    return "RUNNING" in str(status_text)
 
 
 def parse_recommend_result(response: dict) -> dict:
@@ -341,8 +897,94 @@ def format_agent_relative_path(path: str, base_dir: Optional[str] = None) -> str
     return rel_path
 
 
+def load_json_file(path: str, default=None):
+    if default is None:
+        default = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return default
+    return data if data is not None else default
+
+
+@contextmanager
+def json_file_lock(path: str):
+    """Serialize read-modify-write operations for one JSON state file."""
+    lock_path = path + ".lock"
+    os.makedirs(os.path.dirname(os.path.abspath(lock_path)), exist_ok=True)
+    with open(lock_path, "a", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def iter_json_records(root: str, filename: str):
+    if not os.path.isdir(root):
+        return
+    for record_id in os.listdir(root):
+        path = os.path.join(root, record_id, filename)
+        if not os.path.isfile(path):
+            continue
+        data = load_json_file(path)
+        if isinstance(data, dict):
+            yield record_id, path, data
+
+
 def get_service_run_log_root() -> str:
     return os.path.join(get_service_log_root(), "services")
+
+
+def get_service_instance_root() -> str:
+    return os.path.join(get_service_run_log_root(), "runs")
+
+
+def get_legacy_service_instance_root() -> str:
+    return os.path.join(get_service_run_log_root(), "instances")
+
+
+def get_service_instance_dir(instance_id: str) -> str:
+    if "/" in str(instance_id) or ".." in str(instance_id):
+        raise ValueError("Invalid instance_id")
+    return os.path.join(get_service_instance_root(), str(instance_id))
+
+
+def get_service_instance_meta_path(instance_id: str) -> str:
+    return os.path.join(get_service_instance_dir(instance_id), "meta.json")
+
+
+def list_service_instance_ids() -> list[str]:
+    root = get_service_instance_root()
+    if not os.path.isdir(root):
+        return []
+    return sorted(
+        [
+            name
+            for name in os.listdir(root)
+            if os.path.isdir(os.path.join(root, name))
+            and os.path.exists(os.path.join(root, name, "meta.json"))
+        ],
+        key=lambda name: os.path.getmtime(os.path.join(root, name, "meta.json")),
+        reverse=True,
+    )
+
+
+def load_service_instance(instance_id: str) -> dict:
+    path = get_service_instance_meta_path(instance_id)
+    if not os.path.exists(path):
+        return {}
+    data = load_json_file(path, {})
+    return data if isinstance(data, dict) else {}
+
+
+def save_service_instance(meta: dict) -> None:
+    instance_id = str(meta.get("instance_id") or "")
+    if not instance_id:
+        raise ValueError("instance_id is required")
+    os.makedirs(get_service_instance_dir(instance_id), exist_ok=True)
+    atomic_write_json(get_service_instance_meta_path(instance_id), meta)
 
 
 def get_service_log_dir(run_id: str = "latest") -> str:
@@ -350,6 +992,13 @@ def get_service_log_dir(run_id: str = "latest") -> str:
     if run_id == "all":
         run_id = "latest"
     if not run_id or run_id == "latest":
+        current_latest = resolve_service_instance_id(
+            "latest", scope="mine", require_running=False
+        )
+        if current_latest:
+            instance_dir = get_service_instance_dir(current_latest)
+            if os.path.exists(instance_dir):
+                return instance_dir
         latest_dir = os.path.join(log_root, "latest")
         if os.path.exists(latest_dir):
             return latest_dir
@@ -363,6 +1012,9 @@ def get_service_log_dir(run_id: str = "latest") -> str:
     run_dir = os.path.join(log_root, "runs", run_id)
     if os.path.exists(run_dir):
         return run_dir
+    legacy_instance_dir = os.path.join(get_legacy_service_instance_root(), run_id)
+    if os.path.exists(legacy_instance_dir):
+        return legacy_instance_dir
     legacy_run_dir = os.path.join(get_service_log_root(), "runs", run_id)
     if os.path.exists(legacy_run_dir):
         return legacy_run_dir
@@ -381,11 +1033,13 @@ def get_log_paths(service: str, run_id: str = "latest"):
     return [os.path.join(log_dir, LOG_FILES[service])]
 
 
-def get_log_path(service: str, run_id: str = "latest"):
-    return " ".join(shlex.quote(path) for path in get_log_paths(service, run_id))
-
-
 def get_latest_service_log_run() -> str:
+    current_latest = resolve_service_instance_id(
+        "latest", scope="mine", require_running=False
+    )
+    if current_latest:
+        return current_latest
+
     log_root = get_service_run_log_root()
     latest_path = os.path.join(log_root, "latest")
     if not os.path.exists(latest_path):
@@ -398,40 +1052,125 @@ def get_latest_service_log_run() -> str:
     return ""
 
 
-def list_service_log_runs_text(limit: int = 10) -> str:
+def refresh_service_latest_pointer() -> str:
+    """Point service latest files to the newest remaining instance."""
+    log_root = get_service_run_log_root()
+    latest_link = os.path.join(log_root, "latest")
+    latest_json = get_service_start_latest_path()
+    instance_ids = list_service_instance_ids()
+
+    if not instance_ids:
+        for path in (latest_link, latest_json):
+            try:
+                if os.path.lexists(path):
+                    if os.path.isdir(path) and not os.path.islink(path):
+                        shutil.rmtree(path)
+                    else:
+                        os.unlink(path)
+            except OSError:
+                pass
+        return ""
+
+    instance_id = instance_ids[0]
+    instance_dir = get_service_instance_dir(instance_id)
+    meta = load_service_instance(instance_id)
+    status_file = str(meta.get("status_file") or os.path.join(instance_dir, "status.json"))
+
+    try:
+        if os.path.lexists(latest_link):
+            os.unlink(latest_link)
+        os.symlink(instance_dir, latest_link)
+    except OSError:
+        pass
+
+    atomic_write_json(
+        latest_json,
+        {
+            "run_id": str(meta.get("run_id") or instance_id),
+            "instance_id": instance_id,
+            "status_file": status_file,
+        },
+    )
+    return instance_id
+
+
+def list_service_log_runs_text(limit: int = 10, instance_id: str = "") -> str:
+    limit = clamp_int(limit, 10, 1, MAX_LIST_LIMIT)
     log_root = get_service_run_log_root()
     runs_dir = os.path.join(log_root, "runs")
+    instances_dir = get_service_instance_root()
+    legacy_instances_dir = get_legacy_service_instance_root()
     if not os.path.isdir(runs_dir):
         legacy_runs_dir = os.path.join(get_service_log_root(), "runs")
         if os.path.isdir(legacy_runs_dir):
             runs_dir = legacy_runs_dir
     latest_run = get_latest_service_log_run()
 
-    if not os.path.isdir(runs_dir):
-        return f"服务日志目录不存在或暂无启动记录: {runs_dir}"
+    entries = []
+    resolved_instance_id = ""
+    if instance_id:
+        access_error = service_instance_access_error(instance_id, "查看日志")
+        if access_error:
+            return access_error
+        resolved_instance_id = resolve_service_instance_id(
+            instance_id, scope="mine", require_running=False
+        )
+        if not resolved_instance_id:
+            return f"未找到推理服务实例: {instance_id}"
 
-    run_ids = [
-        name
-        for name in os.listdir(runs_dir)
-        if os.path.isdir(os.path.join(runs_dir, name))
-    ]
-    if not run_ids:
-        return f"暂无服务启动日志: {runs_dir}"
+    if os.path.isdir(instances_dir):
+        for instance_id in os.listdir(instances_dir):
+            if resolved_instance_id and instance_id != resolved_instance_id:
+                continue
+            instance_dir = os.path.join(instances_dir, instance_id)
+            if not os.path.isdir(instance_dir) or not os.path.exists(
+                os.path.join(instance_dir, "meta.json")
+            ):
+                continue
+            entries.append(("instance", instance_id, instance_dir))
 
-    run_ids.sort(
-        key=lambda name: os.path.getmtime(os.path.join(runs_dir, name)),
-        reverse=True,
-    )
-    limit = max(1, int(limit))
+    if not resolved_instance_id and os.path.isdir(runs_dir):
+        for run_id in os.listdir(runs_dir):
+            run_dir = os.path.join(runs_dir, run_id)
+            if not os.path.isdir(run_dir):
+                continue
+            if os.path.exists(os.path.join(run_dir, "meta.json")):
+                continue
+            entries.append(("run", run_id, run_dir))
+
+    if os.path.isdir(legacy_instances_dir):
+        for legacy_instance_id in os.listdir(legacy_instances_dir):
+            if resolved_instance_id and legacy_instance_id != resolved_instance_id:
+                continue
+            legacy_instance_dir = os.path.join(legacy_instances_dir, legacy_instance_id)
+            if not os.path.isdir(legacy_instance_dir):
+                continue
+            entries.append(("legacy_instance", legacy_instance_id, legacy_instance_dir))
+
+    if not entries:
+        if resolved_instance_id:
+            return f"该实例暂无服务日志记录: instance_id={resolved_instance_id}"
+        return (
+            "暂无服务启动日志。\n"
+            f"runs_dir={format_agent_relative_path(runs_dir)}"
+        )
+
+    entries.sort(key=lambda item: os.path.getmtime(item[2]), reverse=True)
 
     lines = ["服务日志启动记录:"]
+    if resolved_instance_id:
+        lines.append(f"instance_id={resolved_instance_id}")
     if latest_run:
         lines.append(f"latest -> {latest_run}")
     else:
         lines.append("latest -> 未设置")
 
-    for run_id in run_ids[:limit]:
-        run_dir = os.path.join(runs_dir, run_id)
+    visible_entries = entries[:limit]
+    lines.append(f"显示 {len(visible_entries)} / {len(entries)} 条，limit={limit}")
+    if len(entries) > limit:
+        lines.append(f"还有 {len(entries) - limit} 条未显示，可增大 limit 查看。")
+
+    for entry_type, run_id, run_dir in visible_entries:
         mtime = time.strftime(
             "%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(run_dir))
         )
@@ -439,13 +1178,18 @@ def list_service_log_runs_text(limit: int = 10) -> str:
             name for name in os.listdir(run_dir) if name.endswith(".log")
         )
         marker = " *latest*" if run_id == latest_run else ""
+        instance_note = ""
+        if entry_type == "instance":
+            meta = load_service_instance(run_id)
+            instance_note = (
+                f" | status={meta.get('status', '')}"
+                f" | gpus={meta.get('actual_gpus', '')}"
+                f" | owner={service_instance_owner(meta)}"
+            )
         lines.append(
-            f"- {run_id}{marker} | {mtime} | logs: "
+            f"- {run_id}{marker} | type={entry_type}{instance_note} | {mtime} | logs: "
             + (", ".join(log_names) if log_names else "none")
         )
-
-    if len(run_ids) > limit:
-        lines.append(f"... 还有 {len(run_ids) - limit} 条，可增大 limit 查看")
 
     return "\n".join(lines)
 
@@ -461,21 +1205,34 @@ def get_legacy_service_start_latest_path() -> str:
 def service_start_status_text(run_id: str = "latest") -> str:
     log_root = get_service_run_log_root()
     if not run_id or run_id == "latest":
-        latest_path = get_service_start_latest_path()
-        if not os.path.exists(latest_path):
-            legacy_latest_path = get_legacy_service_start_latest_path()
-            if os.path.exists(legacy_latest_path):
-                latest_path = legacy_latest_path
-                log_root = get_service_log_root()
-            else:
-                return f"暂无启动状态记录: {latest_path}"
-        with open(latest_path, "r") as f:
-            latest = json.load(f)
-        run_id = latest.get("run_id", "latest")
-        if run_id and run_id != "latest":
-            status_file = os.path.join(log_root, "runs", run_id, "status.json")
+        current_latest = resolve_service_instance_id(
+            "latest", scope="mine", require_running=False
+        )
+        if current_latest:
+            instance_meta = load_service_instance(current_latest)
+            run_id = str(instance_meta.get("run_id") or current_latest)
+            status_file = str(
+                instance_meta.get("status_file")
+                or os.path.join(get_service_instance_dir(current_latest), "status.json")
+            )
         else:
-            status_file = latest.get("status_file")
+            latest_path = get_service_start_latest_path()
+            if not os.path.exists(latest_path):
+                legacy_latest_path = get_legacy_service_start_latest_path()
+                if os.path.exists(legacy_latest_path):
+                    latest_path = legacy_latest_path
+                    log_root = get_service_log_root()
+                else:
+                    return f"暂无启动状态记录: {latest_path}"
+            with open(latest_path, "r") as f:
+                latest = json.load(f)
+            run_id = latest.get("run_id", "latest")
+            if latest.get("status_file"):
+                status_file = latest.get("status_file")
+            elif run_id and run_id != "latest":
+                status_file = os.path.join(log_root, "runs", run_id, "status.json")
+            else:
+                status_file = latest.get("status_file")
     else:
         if "/" in run_id or ".." in run_id:
             return "Invalid run_id"
@@ -539,11 +1296,149 @@ def service_start_status_text(run_id: str = "latest") -> str:
 
     return "\n".join(lines)
 
+def service_start_status_response_data(text: str, requested_run_id: str = "latest") -> dict:
+    fields = {}
+    ports = {}
+    port_statuses = []
+    in_ports = False
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line == "ports:":
+            in_ports = True
+            continue
+        if in_ports and line.startswith("-"):
+            match = re.match(r"^-\s*([^:]+):\s*(\d+)\s+(\S+)", line)
+            if not match:
+                continue
+            name = match.group(1).strip()
+            port = int(match.group(2))
+            raw_status = match.group(3).strip().upper()
+            status = "running" if raw_status == "RUNNING" else "stopped"
+            ports[name] = port
+            port_statuses.append(
+                {
+                    "name": name,
+                    "port": port,
+                    "status": status,
+                    "rawStatus": raw_status,
+                }
+            )
+            continue
+        if "=" in line:
+            key, value = line.split("=", 1)
+            fields[key.strip()] = value.strip()
+
+    run_id = fields.get("run_id") or str(requested_run_id or "")
+    status = fields.get("status") or "unknown"
+    if not run_id or status == "unknown":
+        return {
+            "service_instances": {
+                "operation": "status",
+                "requested_run_id": str(requested_run_id or "latest"),
+                "returned": 0,
+                "items": [],
+                "summary": {
+                    "total": 0,
+                    "returned": 0,
+                    "status": status,
+                    "error": str(text or ""),
+                },
+            }
+        }
+
+    script_pid_text = fields.get("script_pid") or "0"
+    try:
+        script_pid = int(script_pid_text)
+    except ValueError:
+        script_pid = 0
+    script_running = str(fields.get("script_running") or "").strip().lower() == "true"
+    item = {
+        "instance_id": run_id,
+        "run_id": run_id,
+        "status": status,
+        "stored_status": fields.get("stored_status") or "",
+        "script_pid": script_pid,
+        "script_running": script_running,
+        "started_at": fields.get("started_at") or "",
+        "finished_at": fields.get("finished_at") or "",
+        "status_file": fields.get("status_file") or "",
+        "log_dir": fields.get("log_dir") or "",
+        "ports": ports,
+        "port_statuses": port_statuses,
+    }
+    return {
+        "service_instances": {
+            "operation": "status",
+            "requested_run_id": str(requested_run_id or "latest"),
+            "returned": 1,
+            "items": [item],
+            "summary": {
+                "total": 1,
+                "returned": 1,
+                "status": status,
+            },
+        },
+        "services": port_statuses,
+    }
+
+def user_config_key(user_id: str) -> str:
+    digest = hashlib.sha1(user_id.encode("utf-8")).hexdigest()[:12]
+    return f"user_{digest}"
+
+
+def get_user_config_dir(user_id: str = "") -> str:
+    user_id = user_id or current_request_user_id()
+    return os.path.join(get_service_log_root(), "configs", "users", user_config_key(user_id))
+
+
+def get_user_draft_config_path(user_id: str = "") -> str:
+    user_id = user_id or current_request_user_id()
+    return os.path.join(get_user_config_dir(user_id), "service.draft.yaml")
+
+
+def get_user_config_meta_path(user_id: str = "") -> str:
+    user_id = user_id or current_request_user_id()
+    return os.path.join(get_user_config_dir(user_id), "meta.json")
+
+
+def ensure_user_draft_config() -> str:
+    user_id = current_request_user_id()
+    if not user_id:
+        return CONFIG_FILE
+
+    draft_path = get_user_draft_config_path(user_id)
+    if os.path.exists(draft_path):
+        with open(draft_path, encoding="utf-8") as f:
+            existing = yaml.safe_load(f) or {}
+        synchronized = apply_node_managed_config(existing)
+        if synchronized != existing:
+            write_runtime_config(draft_path, synchronized)
+        return draft_path
+
+    os.makedirs(os.path.dirname(draft_path), exist_ok=True)
+    cfg = load_template_config()
+    write_user_draft_config(draft_path, cfg)
+    atomic_write_json(
+        get_user_config_meta_path(user_id),
+        {
+            "user_id": user_id,
+            "user_key": user_config_key(user_id),
+            "source_config": CONFIG_FILE,
+            "draft_config": draft_path,
+            "created_at": current_time_text(),
+            "updated_at": current_time_text(),
+        },
+    )
+    return draft_path
+
 
 def show_config() -> dict:
-    """Show current service config"""
-    with open(CONFIG_FILE) as f:
-        return yaml.safe_load(f)
+    """Show effective config: user draft plus worker-owned node values."""
+    with open(ensure_user_draft_config()) as f:
+        cfg = yaml.safe_load(f) or {}
+    return apply_node_managed_config(cfg)
 
 
 def show_public_config() -> dict:
@@ -568,40 +1463,477 @@ def run_command(cmd: str) -> str:
         return f"[ERROR]\n{e.output.decode()}"
 
 
-def check_port(port: int) -> bool:
-    """Return True if port is listening."""
-    cmd = f"lsof -i :{port}"
-    code = subprocess.call(
-        cmd,
-        shell=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    return code == 0
+def check_port(port: int, timeout: float = 0.3) -> bool:
+    """Return True when a local TCP service accepts connections on the port."""
+    hosts = []
+    try:
+        hosts.append(get_local_ip())
+    except OSError:
+        pass
+    hosts.append("127.0.0.1")
+
+    for host in dict.fromkeys(hosts):
+        try:
+            with socket.create_connection((host, int(port)), timeout=timeout):
+                return True
+        except (OSError, TypeError, ValueError):
+            continue
+    return False
+
+
+DEFAULT_PORT_POOLS = {
+    "VLLM_OPENAI_PORT": (7111, 7199),
+    "INFERENCE_PORT": (7013, 7099),
+    "UI_PORT": (7860, 7899),
+    "DATA_ANNOTATION_PORT": (7216, 7299),
+    "MASTER_PORT": (50121, 50200),
+}
+
+SERVICE_INSTANCE_PORT_NAMES = (
+    "vllm",
+    "inference",
+    "ui",
+    "case2chat",
+    "master",
+)
+
+
+def process_service_run_id(pid: int) -> str:
+    """Return SERVICE_RUN_ID for a live process, or empty when unavailable."""
+    try:
+        return str(psutil.Process(int(pid)).environ().get("SERVICE_RUN_ID") or "").strip()
+    except (psutil.Error, OSError, TypeError, ValueError):
+        return ""
+
+
+def invalidate_port_listener_cache() -> None:
+    with PORT_LISTENER_CACHE_LOCK:
+        PORT_LISTENER_CACHE["time"] = 0.0
+        PORT_LISTENER_CACHE["listeners"] = {}
+        PORT_LISTENER_CACHE["scan_failed"] = False
+
+
+def cached_tcp_listeners() -> tuple[dict[int, set[int]], bool]:
+    """Return a short-lived snapshot of local TCP listener PIDs."""
+    now = time.monotonic()
+    with PORT_LISTENER_CACHE_LOCK:
+        if now - float(PORT_LISTENER_CACHE["time"]) <= PORT_LISTENER_CACHE_TTL:
+            return (
+                {
+                    port: set(pids)
+                    for port, pids in PORT_LISTENER_CACHE["listeners"].items()
+                },
+                bool(PORT_LISTENER_CACHE["scan_failed"]),
+            )
+
+        listeners = {}
+        scan_failed = False
+        try:
+            connections = psutil.net_connections(kind="tcp")
+        except (psutil.Error, OSError):
+            connections = []
+            scan_failed = True
+        for connection in connections:
+            if connection.status != psutil.CONN_LISTEN or not connection.laddr:
+                continue
+            port = int(connection.laddr.port)
+            listeners.setdefault(port, set())
+            if connection.pid:
+                listeners[port].add(int(connection.pid))
+
+        PORT_LISTENER_CACHE["time"] = now
+        PORT_LISTENER_CACHE["listeners"] = listeners
+        PORT_LISTENER_CACHE["scan_failed"] = scan_failed
+        return (
+            {port: set(pids) for port, pids in listeners.items()},
+            scan_failed,
+        )
+
+
+def listening_port_pids(ports: set[int]) -> tuple[dict[int, set[int]], set[int]]:
+    """Return listener PIDs and ports whose listener ownership is unavailable."""
+    requested = set()
+    for value in ports:
+        try:
+            port = int(value)
+        except (TypeError, ValueError):
+            continue
+        if port > 0:
+            requested.add(port)
+    if not requested:
+        return {}, set()
+    snapshot, scan_failed = cached_tcp_listeners()
+    listeners = {port: set(snapshot.get(port) or set()) for port in requested}
+    unresolved = set()
+    for port in requested:
+        if port in snapshot and not listeners[port]:
+            unresolved.add(port)
+        elif scan_failed and check_port(port):
+            unresolved.add(port)
+        elif not listeners[port] and check_port(port):
+            unresolved.add(port)
+    return listeners, unresolved
+
+
+def service_instance_port_ownership(
+    meta: dict,
+    listener_snapshot: Optional[tuple[dict[int, set[int]], set[int]]] = None,
+) -> dict[str, list[dict]]:
+    """Classify recorded ports as owned, reused, unverified, or closed."""
+    instance_id = str(meta.get("instance_id") or meta.get("run_id") or "").strip()
+    configured_ports = {}
+    for name, value in (meta.get("ports") or {}).items():
+        if name not in SERVICE_INSTANCE_PORT_NAMES:
+            continue
+        try:
+            port = int(value)
+        except (TypeError, ValueError):
+            continue
+        if port > 0:
+            configured_ports[str(name)] = port
+
+    if listener_snapshot is None:
+        listeners, unresolved_ports = listening_port_pids(
+            set(configured_ports.values())
+        )
+    else:
+        listeners, unresolved_ports = listener_snapshot
+    result = {"owned": [], "reused": [], "unverified": [], "closed": []}
+    for name, port in configured_ports.items():
+        pids = sorted(listeners.get(port) or [])
+        entry = {"name": name, "port": port, "pids": pids}
+        if not pids:
+            category = "unverified" if port in unresolved_ports else "closed"
+        else:
+            run_ids = {pid: process_service_run_id(pid) for pid in pids}
+            entry["run_ids"] = run_ids
+            if any(run_id == instance_id for run_id in run_ids.values()):
+                category = "owned"
+            elif any(not run_id for run_id in run_ids.values()):
+                category = "unverified"
+            else:
+                category = "reused"
+        result[category].append(entry)
+    return result
+
+
+def service_instance_process_ownership(
+    meta: dict,
+    port_ownership: Optional[dict[str, list[dict]]] = None,
+    tracked_pids: Optional[list[int]] = None,
+) -> dict[str, list[int]]:
+    """Classify live recorded and port-listener PIDs by SERVICE_RUN_ID."""
+    instance_id = str(meta.get("instance_id") or meta.get("run_id") or "").strip()
+    candidates = set(service_instance_recorded_pids(meta))
+    script_pid = int(meta.get("script_pid") or 0)
+    if script_pid:
+        candidates.add(script_pid)
+    for value in tracked_pids or []:
+        try:
+            pid = int(value)
+        except (TypeError, ValueError):
+            continue
+        if pid > 0:
+            candidates.add(pid)
+
+    port_ownership = port_ownership or service_instance_port_ownership(meta)
+    port_categories = {}
+    for category in ("owned", "reused", "unverified"):
+        for entry in port_ownership[category]:
+            for pid in entry.get("pids") or []:
+                candidates.add(int(pid))
+                port_categories[int(pid)] = category
+
+    result = {"owned": [], "reused": [], "unverified": []}
+    for pid in sorted(candidates):
+        if not pid_is_alive(pid):
+            continue
+        run_id = process_service_run_id(pid)
+        if run_id == instance_id:
+            category = "owned"
+        elif run_id:
+            category = "reused"
+        else:
+            category = port_categories.get(pid, "unverified")
+        result[category].append(pid)
+    return result
+
+
+def terminate_instance_owned_processes(meta: dict, timeout: float = 3.0) -> dict:
+    """Terminate only processes whose SERVICE_RUN_ID matches the instance."""
+    ownership = service_instance_process_ownership(meta)
+    root_processes = []
+    for pid in ownership["owned"]:
+        try:
+            root_processes.append(psutil.Process(pid))
+        except (psutil.Error, OSError):
+            continue
+
+    processes = {}
+    for process in root_processes:
+        try:
+            for child in process.children(recursive=True):
+                processes[child.pid] = child
+        except (psutil.Error, OSError):
+            pass
+        processes[process.pid] = process
+
+    errors = []
+    for process in processes.values():
+        try:
+            process.terminate()
+        except psutil.NoSuchProcess:
+            continue
+        except (psutil.Error, OSError) as exc:
+            errors.append({"pid": process.pid, "error": str(exc)})
+
+    _, alive = psutil.wait_procs(list(processes.values()), timeout=timeout)
+    killed = []
+    for process in alive:
+        try:
+            process.kill()
+            killed.append(process.pid)
+        except psutil.NoSuchProcess:
+            continue
+        except (psutil.Error, OSError) as exc:
+            errors.append({"pid": process.pid, "error": str(exc)})
+    invalidate_port_listener_cache()
+    return {
+        "matched_pids": sorted(processes),
+        "force_killed_pids": sorted(killed),
+        "errors": errors,
+    }
+
+
+def configured_port_pool(cfg: dict, key: str) -> tuple[int, int]:
+    pools = cfg.get("PORT_POOLS") or {}
+    pool = pools.get(key) if isinstance(pools, dict) else None
+    default_start, default_end = DEFAULT_PORT_POOLS[key]
+    if isinstance(pool, dict):
+        start = int(pool.get("START") or pool.get("start") or default_start)
+        end = int(pool.get("END") or pool.get("end") or default_end)
+        return start, end
+    if isinstance(pool, list) and len(pool) >= 2:
+        return int(pool[0]), int(pool[1])
+    configured = None
+    if key == "MASTER_PORT":
+        configured = cfg.get("ENV", {}).get("MASTER_PORT")
+    else:
+        configured = cfg.get("PORTS", {}).get(key)
+    if configured:
+        base = int(configured)
+        return base, max(base, default_end)
+    return default_start, default_end
+
+
+def service_instance_holds_port_lease(
+    meta: dict,
+    listener_snapshot: Optional[tuple[dict[int, set[int]], set[int]]] = None,
+) -> bool:
+    """Return whether an instance must keep its recorded ports reserved."""
+    status = str(meta.get("status") or "").strip().lower()
+    if status in {"allocating", "starting", "running", "degraded"}:
+        return True
+    if status not in {"stopped", "failed"}:
+        return True
+
+    port_ownership = service_instance_port_ownership(meta, listener_snapshot)
+    process_ownership = service_instance_process_ownership(meta, port_ownership)
+    if process_ownership["owned"] or process_ownership["unverified"]:
+        return True
+    return bool(port_ownership["owned"] or port_ownership["unverified"])
+
+
+def used_instance_ports() -> set[int]:
+    ports = set()
+    instances = [
+        load_service_instance(instance_id)
+        for instance_id in list_service_instance_ids()
+    ]
+    configured_ports = set()
+    for meta in instances:
+        for value in (meta.get("ports") or {}).values():
+            try:
+                configured_ports.add(int(value))
+            except (TypeError, ValueError):
+                continue
+    listener_snapshot = listening_port_pids(configured_ports)
+
+    for meta in instances:
+        if not meta or not service_instance_holds_port_lease(
+            meta, listener_snapshot
+        ):
+            continue
+        meta_ports = meta.get("ports") or {}
+        if not isinstance(meta_ports, dict):
+            continue
+        for port in meta_ports.values():
+            try:
+                ports.add(int(port))
+            except (TypeError, ValueError):
+                continue
+    return ports
+
+
+def allocate_free_port(cfg: dict, key: str, reserved: set[int]) -> int:
+    start, end = configured_port_pool(cfg, key)
+    for port in range(start, end + 1):
+        if port in reserved:
+            continue
+        if check_port(port):
+            continue
+        reserved.add(port)
+        return port
+    raise RuntimeError(f"No free port for {key} in range {start}-{end}")
+
+
+def pending_port_lease_dir() -> str:
+    return os.path.join(get_service_log_root(), "port-leases")
+
+
+def pending_port_lease_path(instance_id: str) -> str:
+    return os.path.join(pending_port_lease_dir(), f"{instance_id}.json")
+
+
+def load_pending_instance_ports() -> set[int]:
+    lease_dir = pending_port_lease_dir()
+    if not os.path.isdir(lease_dir):
+        return set()
+    now = time.time()
+    ports = set()
+    for name in os.listdir(lease_dir):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(lease_dir, name)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lease = json.load(f) or {}
+            created_at = float(lease.get("created_at") or 0)
+            instance_id = str(lease.get("instance_id") or "")
+            if instance_id and load_service_instance(instance_id):
+                os.unlink(path)
+                continue
+            if (
+                created_at
+                and now - created_at > PENDING_PORT_LEASE_TTL
+            ):
+                os.unlink(path)
+                continue
+            for value in (lease.get("ports") or {}).values():
+                ports.add(int(value))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return ports
+
+
+def allocate_instance_ports(cfg: dict, instance_id: str) -> dict:
+    instance_id = str(instance_id or "").strip()
+    if not instance_id:
+        raise ValueError("instance_id is required for port allocation")
+    lease_dir = pending_port_lease_dir()
+    os.makedirs(lease_dir, exist_ok=True)
+    lock_path = os.path.join(lease_dir, ".allocation.lock")
+    with PORT_ALLOCATION_LOCK:
+        with open(lock_path, "a", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            reserved = (
+                used_instance_ports()
+                | load_pending_instance_ports()
+                | PENDING_INSTANCE_PORTS
+            )
+            allocated = {
+                "vllm": allocate_free_port(cfg, "VLLM_OPENAI_PORT", reserved),
+                "inference": allocate_free_port(cfg, "INFERENCE_PORT", reserved),
+                "ui": allocate_free_port(cfg, "UI_PORT", reserved),
+                "case2chat": allocate_free_port(
+                    cfg, "DATA_ANNOTATION_PORT", reserved
+                ),
+                "master": allocate_free_port(cfg, "MASTER_PORT", reserved),
+            }
+            atomic_write_json(
+                pending_port_lease_path(instance_id),
+                {
+                    "instance_id": instance_id,
+                    "created_at": time.time(),
+                    "ports": allocated,
+                },
+            )
+            PENDING_INSTANCE_PORTS.update(allocated.values())
+            return allocated
+
+
+def release_pending_instance_ports(instance_id: str, ports: dict) -> None:
+    lease_dir = pending_port_lease_dir()
+    os.makedirs(lease_dir, exist_ok=True)
+    lock_path = os.path.join(lease_dir, ".allocation.lock")
+    with PORT_ALLOCATION_LOCK:
+        with open(lock_path, "a", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                os.unlink(pending_port_lease_path(instance_id))
+            except FileNotFoundError:
+                pass
+            for port in ports.values():
+                try:
+                    PENDING_INSTANCE_PORTS.discard(int(port))
+                except (TypeError, ValueError):
+                    continue
+
+
+SERVICE_TASK_REQUIRED_PORTS = ("vllm", "inference", "case2chat")
+
+
+def service_instance_port_services(meta: dict, include_master: bool = True) -> list[dict]:
+    services = []
+    ports = meta.get("ports") if isinstance(meta.get("ports"), dict) else {}
+    for name in ("vllm", "inference", "ui", "case2chat", "master"):
+        if name == "master" and not include_master:
+            continue
+        port = ports.get(name)
+        try:
+            port_int = int(port)
+        except (TypeError, ValueError):
+            port_int = 0
+        if name == "master":
+            status = "reserved" if port_int else "unknown"
+        elif port_int:
+            status = "running" if check_port(port_int) else "stopped"
+        else:
+            status = "unknown"
+        services.append(
+            {
+                "name": name,
+                "port": port_int or port,
+                "status": status,
+                "rawStatus": status.upper(),
+            }
+        )
+    return services
+
+
+def service_instance_core_ports_ready(meta: dict) -> bool:
+    services = service_instance_port_services(meta, include_master=False)
+    status_by_name = {item["name"]: item["status"] for item in services}
+    return all(status_by_name.get(name) == "running" for name in SERVICE_TASK_REQUIRED_PORTS)
+
+
+def service_instance_task_ready(meta: dict) -> bool:
+    status = str(meta.get("status") or "").strip().lower()
+    if status == "running":
+        return True
+    if status == "degraded":
+        return service_instance_core_ports_ready(meta)
+    return False
 
 
 def service_status_data() -> dict:
-    """Check all service ports."""
-    # lines = ["\n======== 推理服务状态 ========"]
-    # CONFIG = show_config()
-
-    # for name, port in CONFIG["PORTS"].items():
-    #    running = check_port(port)
-    #    mark = "RUNNING" if running else "STOPPED"
-    #    lines.append(f"{name:20s} ({port}) : {mark}")
-
-    # lines.append("============================\n")
-    # return "\n".join(lines)
-
-    lines = ["\n======== 推理服务状态 ========"]
-    CONFIG = show_config()
-    services = []
-
-    for name, port in CONFIG["PORTS"].items():
+    """Summarize current inference service status."""
+    cfg = show_config()
+    template_services = []
+    for name, port in cfg["PORTS"].items():
         running = check_port(port)
         mark = "RUNNING" if running else "STOPPED"
-        lines.append(f"{name:20s} ({port}) : {mark}")
-        services.append(
+        template_services.append(
             {
                 "name": name,
                 "port": int(port),
@@ -610,11 +1942,215 @@ def service_status_data() -> dict:
             }
         )
 
+    current = current_request_user_id()
+    all_instances = []
+    for instance_id in list_service_instance_ids():
+        meta = visible_service_instance_meta(instance_id)
+        if not meta:
+            continue
+        owner_user_id = str(meta.get("owner_user_id") or "")
+        if current and service_instance_owned_by_current(meta):
+            owner = "self"
+        elif owner_user_id:
+            owner = "other"
+        else:
+            owner = "unknown"
+        ports = meta.get("ports") or {}
+        resource_meta = meta.get("resource") if isinstance(meta.get("resource"), dict) else {}
+        all_instances.append(
+            {
+                "instance_id": instance_id,
+                "owner": owner,
+                "status": str(meta.get("status") or ""),
+                "gpus": str(meta.get("actual_gpus") or ""),
+                "model": str(meta.get("model") or ""),
+                "ports": ports,
+                "runtime_node_id": str(resource_meta.get("runtime_node_id") or ""),
+                "reservation_id": str(resource_meta.get("reservation_id") or ""),
+                "resource_group_id": str(resource_meta.get("resource_group_id") or ""),
+                "training_pool_id": str(resource_meta.get("training_pool_id") or ""),
+                "assigned_gpus": resource_meta.get("assigned_gpus") or [],
+                "resource": resource_meta,
+                "started_at": str(meta.get("started_at") or ""),
+                "finished_at": str(meta.get("finished_at") or ""),
+                "log_dir": format_agent_relative_path(meta.get("log_dir", "")),
+                "port_statuses": service_instance_port_services(meta, include_master=False),
+            }
+        )
+    all_instances.sort(
+        key=lambda item: (
+            -parse_time_sort_value(item["started_at"]),
+            status_sort_rank(item["status"]),
+            item["instance_id"],
+        )
+    )
+
+    active_instances = [
+        item
+        for item in all_instances
+        if item["status"] in {"running", "starting", "degraded"}
+    ]
+    self_active = [item for item in active_instances if item["owner"] == "self"]
+    other_active = [item for item in active_instances if item["owner"] != "self"]
+    recent_inactive = [
+        item
+        for item in all_instances
+        if item["status"] not in {"running", "starting", "degraded"}
+    ][:3]
+
+    self_instances = [item for item in all_instances if item["owner"] == "self"]
+    status_counts = {
+        "starting": 0,
+        "running": 0,
+        "degraded": 0,
+        "failed": 0,
+        "stopped": 0,
+    }
+    for item in self_instances:
+        status = item["status"] or "unknown"
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+    always_returned = [
+        copy.deepcopy(item)
+        for item in self_instances
+        if item["status"] in {"starting", "running", "degraded"}
+    ]
+    recent_failed = [
+        copy.deepcopy(item)
+        for item in self_instances
+        if item["status"] == "failed"
+    ][:5]
+    recent_stopped = [
+        copy.deepcopy(item)
+        for item in self_instances
+        if item["status"] == "stopped"
+    ][:5]
+    structured_items = always_returned + recent_failed + recent_stopped
+    structured_items.sort(
+        key=lambda item: (
+            status_sort_rank(item["status"]),
+            -parse_time_sort_value(item["started_at"]),
+            item["instance_id"],
+        )
+    )
+    for item in structured_items:
+        item["gpus"] = [
+            int(gpu) if str(gpu).isdigit() else str(gpu)
+            for gpu in parse_visible_gpus(item.get("gpus", ""))
+        ]
+
+    service_instances = {
+        "operation": "status",
+        "summary": {
+            "total": len(self_instances),
+            **status_counts,
+        },
+        "returned": len(structured_items),
+        "items": structured_items,
+        "limits": {
+            "failed": 5,
+            "stopped": 5,
+        },
+    }
+
+    services = []
+    for item in structured_items:
+        if item["owner"] == "self" and item["status"] in {"starting", "running", "degraded"}:
+            meta = visible_service_instance_meta(item["instance_id"])
+            if meta:
+                services = service_instance_port_services(meta, include_master=False)
+                break
+    if not services:
+        services = template_services
+    service_instances["services"] = services
+    service_instances["template_services"] = template_services
+    if not structured_items and services:
+        service_instances["ports"] = {
+            str(item.get("name") or ""): item.get("port")
+            for item in services
+            if item.get("name")
+        }
+        service_instances["port_statuses"] = services
+
+    lines = [
+        "\n======== 推理服务状态 ========",
+        f"current_time={current_time_text()}",
+        "mode=multi_instance" if all_instances else "mode=template_ports_only",
+    ]
+
+    if all_instances:
+        lines.append("")
+        lines.append(f"当前用户活跃实例: {len(self_active)}")
+        if self_active:
+            for item in self_active:
+                ports = item["ports"]
+                lines.append(
+                    "- "
+                    f"instance_id={item['instance_id']} "
+                    f"status={item['status']} "
+                    f"gpus={item['gpus']} "
+                    f"model={item['model']} "
+                    f"vllm={ports.get('vllm', '')} "
+                    f"inference={ports.get('inference', '')} "
+                    f"ui={ports.get('ui', '')} "
+                    f"started_at={item['started_at']}"
+                )
+        else:
+            lines.append("- none")
+
+        lines.append("")
+        lines.append(f"其他用户活跃实例: {len(other_active)}")
+        if other_active:
+            for item in other_active:
+                ports = item["ports"]
+                lines.append(
+                    "- "
+                    f"instance_id={item['instance_id']} "
+                    f"owner={item['owner']} "
+                    f"status={item['status']} "
+                    f"gpus={item['gpus']} "
+                    f"inference={ports.get('inference', '')} "
+                    f"ui={ports.get('ui', '')} "
+                    f"started_at={item['started_at']}"
+                )
+        else:
+            lines.append("- none")
+
+        if recent_inactive:
+            lines.append("")
+            lines.append(f"最近非活跃实例: {len(recent_inactive)}")
+            for item in recent_inactive:
+                lines.append(
+                    "- "
+                    f"instance_id={item['instance_id']} "
+                    f"owner={item['owner']} "
+                    f"status={item['status']} "
+                    f"gpus={item['gpus']} "
+                    f"started_at={item['started_at']} "
+                    f"finished_at={item['finished_at']}"
+                )
+    else:
+        lines.append("当前没有推理服务实例记录。")
+
+    lines.append("")
+    lines.append("当前用户配置草稿端口状态(service.draft.yaml，仅用于下次启动/兼容旧模式):")
+    for item in template_services:
+        lines.append(
+            f"- {item['name']} ({item['port']}): {item['rawStatus']}"
+        )
+
     lines.append("============================\n")
-    # lines.append(f"Web UI: https://{CONFIG['ENV']['HOST_IP']}:{CONFIG['PORTS']['UI_PORT']}")
-    # return "\n".join(lines)
     return {
+        "service_instances": service_instances,
         "services": services,
+        "template_services": template_services,
+        "instances": {
+            "active": active_instances,
+            "self_active": self_active,
+            "other_active": other_active,
+            "recent_inactive": recent_inactive,
+            "total": len(all_instances),
+        },
         "text": "\n".join(lines),
     }
 
@@ -624,6 +2160,83 @@ def build_local_tool_response(tool_text, response_data: Optional[dict] = None) -
         "_tool_text": str(tool_text),
         "_response_data": response_data or {},
     }
+
+
+def local_tool_text(observation) -> str:
+    if isinstance(observation, dict) and "_tool_text" in observation:
+        return str(observation.get("_tool_text") or "")
+    return str(observation or "")
+
+
+def local_tool_response_data(observation) -> dict:
+    if isinstance(observation, dict) and isinstance(observation.get("_response_data"), dict):
+        return observation["_response_data"]
+    return {}
+
+
+def service_stop_payload(
+    *,
+    stopped: bool,
+    instance_id: str = "",
+    reservation_id: str = "",
+    status: str = "",
+    result: str = "",
+) -> dict:
+    return {
+        "stopped": bool(stopped),
+        "release_ready": bool(stopped),
+        "instance_id": str(instance_id or ""),
+        "reservation_id": str(reservation_id or ""),
+        "status": str(status or ("stopped" if stopped else "error")),
+        "result": str(result or ""),
+    }
+
+
+def build_service_stop_response(tool_text, *, stopped: bool, meta: Optional[dict] = None, reservation_id: str = "") -> dict:
+    meta = meta if isinstance(meta, dict) else {}
+    instance_id = str(meta.get("instance_id") or meta.get("run_id") or "").strip()
+    return build_local_tool_response(
+        tool_text,
+        {
+            "service_stop": service_stop_payload(
+                stopped=stopped,
+                instance_id=instance_id,
+                reservation_id=reservation_id or service_instance_reservation_id(meta),
+                status=str(meta.get("status") or ("stopped" if stopped else "error")),
+                result=tool_text,
+            )
+        },
+    )
+
+
+def build_service_stop_preview_response(
+    tool_text,
+    *,
+    can_apply: bool,
+    meta: Optional[dict] = None,
+    running_tasks: Optional[dict] = None,
+) -> dict:
+    meta = meta if isinstance(meta, dict) else {}
+    instance_id = str(meta.get("instance_id") or meta.get("run_id") or "").strip()
+    return build_local_tool_response(
+        tool_text,
+        {
+            "service_stop": {
+                "operation": "preview",
+                "can_apply": bool(can_apply),
+                "stopped": False,
+                "release_ready": False,
+                "instance_id": instance_id,
+                "reservation_id": service_instance_reservation_id(meta),
+                "status": str(meta.get("status") or ""),
+                "owner_user_id": str(meta.get("owner_user_id") or ""),
+                "gpus": str(meta.get("actual_gpus") or ""),
+                "ports": dict(meta.get("ports") or {}),
+                "running_tasks": running_tasks or {},
+                "result": str(tool_text or ""),
+            }
+        },
+    )
 
 
 def check_port_status(port: int) -> str:
@@ -636,6 +2249,12 @@ def check_gpu_status() -> str:
     """Show GPU usage status (memory, utilization, process)."""
 
     bus_id_to_idx = {}
+    resource_error = managed_resource_error(require_gpus=True)
+    if resource_error:
+        return resource_error
+    allowed_gpus = (
+        set(resource_context_gpu_ids()) if resource_pool_managed() else None
+    )
 
     cmd = (
         "nvidia-smi --query-gpu=index,name,gpu_bus_id,memory.used,memory.total,utilization.gpu "
@@ -657,6 +2276,8 @@ def check_gpu_status() -> str:
             result.append(f"Skip unparsable GPU line: {line}")
             continue
         idx, name, gpu_bus_id, used, total, util = parts
+        if allowed_gpus is not None and idx not in allowed_gpus:
+            continue
 
         bus_id_to_idx[gpu_bus_id] = idx
         result.append(
@@ -688,6 +2309,8 @@ def check_gpu_status() -> str:
             result.append(f"Skip unparsable process line: {line}")
             continue
         gpu_bus_id, pid, name, used = parts
+        if gpu_bus_id not in bus_id_to_idx:
+            continue
         result.append(
             f"GPU: {bus_id_to_idx.get(gpu_bus_id, 'Unknown')} | PID: {pid} {name} | GPU Memory Usage: {used} MiB"
         )
@@ -813,6 +2436,17 @@ def bytes_per_kv_cache(precision: str) -> float:
     return bytes_map.get(dtype, 2)
 
 
+
+def model_config_precision(env: dict, model_cfg: dict, root_model_cfg: dict) -> str:
+    return normalize_precision(
+        env.get("PRECISION")
+        or model_cfg.get("torch_dtype")
+        or model_cfg.get("dtype")
+        or root_model_cfg.get("torch_dtype")
+        or root_model_cfg.get("dtype")
+    )
+
+
 def estimate_params_from_config(model_cfg: dict) -> Optional[float]:
     if not model_cfg:
         return None
@@ -858,6 +2492,40 @@ def estimate_params_from_config(model_cfg: dict) -> Optional[float]:
     if model_cfg.get("tie_word_embeddings") is False:
         total += embedding_params
     return total / 1e9
+
+
+
+def estimate_params_from_safetensors_index(
+    model_dir: str, precision: str
+) -> tuple[Optional[float], str]:
+    index_path = os.path.join(model_dir, "model.safetensors.index.json")
+    if not os.path.exists(index_path):
+        return None, ""
+    try:
+        with open(index_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None, ""
+
+    if not isinstance(data, dict):
+        return None, ""
+    metadata = data.get("metadata")
+    total_size = None
+    if isinstance(metadata, dict):
+        total_size = parse_float(metadata.get("total_size"))
+    if total_size is None:
+        total_size = parse_float(data.get("total_size"))
+    if not total_size:
+        return None, ""
+
+    dtype = normalize_precision(precision)
+    bytes_per_param = bytes_per_param_for_model(dtype)
+    if not bytes_per_param:
+        return None, ""
+    return (
+        total_size / bytes_per_param / 1e9,
+        f"model.safetensors.index.json total_size / {dtype}",
+    )
 
 
 def get_model_max_len(model_cfg: dict, runtime: dict) -> tuple[int, str]:
@@ -935,21 +2603,24 @@ def get_model_memory_profile(cfg: dict) -> dict:
         root_model_cfg, model_cfg
     )
 
+    precision = model_config_precision(env, model_cfg, root_model_cfg)
+    safetensors_param, safetensors_source = estimate_params_from_safetensors_index(
+        model_dir, precision
+    )
     explicit_param = parse_float(env.get("MODEL_PARAM_B"))
     estimated_param = estimate_params_from_config(model_cfg)
     if explicit_param:
         param_billion = explicit_param
         param_source = "service.yaml ENV.MODEL_PARAM_B"
+    elif safetensors_param:
+        param_billion = safetensors_param
+        param_source = safetensors_source
     elif estimated_param:
         param_billion = estimated_param
         param_source = "model config.json estimate"
     else:
-        param_billion = 72.0
-        param_source = "default fallback"
-
-    precision = normalize_precision(
-        env.get("PRECISION") or model_cfg.get("torch_dtype") or model_cfg.get("dtype")
-    )
+        param_billion = None
+        param_source = "unavailable"
     quantization = detect_quantization(model_cfg, env)
     buffer_ratio = parse_float(env.get("GPU_MEMORY_BUFFER_RATIO"), 0.2)
     bytes_per_param = bytes_per_param_for_model(precision, quantization)
@@ -979,6 +2650,19 @@ def get_model_memory_profile(cfg: dict) -> dict:
     profile["kv_cache_mib"] = kv_cache_mib
     profile["kv_cache_note"] = kv_cache_note
     return profile
+
+
+def unknown_model_size_analysis(profile: dict) -> str:
+    return (
+        "无法识别模型参数规模，已停止 GPU 推荐。\n"
+        f"模型路径: {profile.get('model_dir', '')}\n"
+        "未从 model.safetensors.index.json 读取到 total_size，\n"
+        "也未从模型 config.json 中读取到完整的 hidden_size、"
+        "num_hidden_layers 和 intermediate_size 等结构字段。\n"
+        "请先向用户确认模型规模，然后设置 "
+        "ENV.MODEL_PARAM_B（单位为 B，例如 32B 模型填写 32 或 32.76），"
+        "再重新调用 gpu_recommend_allocation。"
+    )
 
 
 def memory_margin_mib(profile: dict) -> int:
@@ -1021,6 +2705,40 @@ def get_gpu_memory_map() -> tuple[Optional[Dict[str, tuple]], Optional[str]]:
     return gpu_memory, None
 
 
+def get_gpu_utilization_map(
+    samples: int = 3, interval_seconds: float = 0.5
+) -> tuple[Optional[Dict[str, float]], Optional[str]]:
+    measurements: Dict[str, list[float]] = {}
+    for sample_index in range(samples):
+        output = run_command(
+            "nvidia-smi --query-gpu=index,utilization.gpu "
+            "--format=csv,noheader,nounits"
+        )
+        if "[ERROR]" in output:
+            return None, "无法获取 GPU 利用率，请确认 nvidia-smi 可用"
+
+        for line in output.strip().splitlines():
+            parts = [item.strip() for item in line.split(",")]
+            if len(parts) != 2:
+                continue
+            gpu_id, utilization = parts
+            try:
+                measurements.setdefault(gpu_id, []).append(float(utilization))
+            except ValueError:
+                continue
+
+        if sample_index < samples - 1:
+            time.sleep(interval_seconds)
+
+    if not measurements:
+        return None, "未获取到有效的 GPU 利用率数据"
+    return {
+        gpu_id: sum(values) / len(values)
+        for gpu_id, values in measurements.items()
+        if values
+    }, None
+
+
 def generate_tp_candidates(max_gpus: int) -> list[int]:
     candidates = []
     for tp in [1, 2, 4, 8]:
@@ -1058,6 +2776,8 @@ def describe_model_profile(profile: dict) -> list[str]:
 
 
 def gpu_eval_status_text(item: dict) -> str:
+    if item.get("busy"):
+        return f"计算繁忙({item.get('utilization', 0):.1f}%)"
     if item.get("recommended_ok"):
         return "满足保守预算"
     if item.get("ok"):
@@ -1065,16 +2785,41 @@ def gpu_eval_status_text(item: dict) -> str:
     return "低于最低需求"
 
 
-def format_gpu_budget_table(gpu_memory: Dict[str, tuple], mem_util: float) -> list[str]:
+def format_gpu_budget_table(
+    gpu_memory: Dict[str, tuple],
+    mem_util: float,
+    gpu_utilization: Optional[Dict[str, float]] = None,
+    utilization_threshold: int = 50,
+) -> list[str]:
     lines = ["GPU预算:"]
+    gpu_utilization = gpu_utilization or {}
     for idx, (used, total) in gpu_memory.items():
         planned_limit = gpu_vllm_planned_limit_mib(total, mem_util)
         budget = gpu_vllm_budget_mib(gpu_memory, idx, mem_util)
+        utilization = gpu_utilization.get(idx, 0.0)
+        status = "busy" if utilization >= utilization_threshold else "available"
         lines.append(
             f"- GPU {idx}: total={total} MiB, used={used} MiB, "
-            f"vllm_limit={planned_limit} MiB, budget={budget} MiB"
+            f"vllm_limit={planned_limit} MiB, budget={budget} MiB, "
+            f"avg_util={utilization:.1f}%, status={status}"
         )
     return lines
+
+
+def reserve_instance_gpu_memory(gpu_memory: Dict[str, tuple]) -> tuple[Dict[str, tuple], list[str]]:
+    adjusted = dict(gpu_memory)
+    reserved = []
+    for instance_id in list_service_instance_ids():
+        meta = visible_service_instance_meta(instance_id)
+        if meta.get("status") not in {"starting", "running"}:
+            continue
+        for gid in parse_visible_gpus(meta.get("actual_gpus", "")):
+            if gid not in adjusted:
+                continue
+            used, total = adjusted[gid]
+            adjusted[gid] = (max(used, total), total)
+            reserved.append(gid)
+    return adjusted, sorted(set(reserved), key=lambda x: int(x) if x.isdigit() else x)
 
 
 def gpu_vllm_budget_mib(
@@ -1095,6 +2840,8 @@ def evaluate_gpu_selection(
     gpu_memory: Dict[str, tuple],
     profile: dict,
     mem_util: float,
+    gpu_utilization: Optional[Dict[str, float]] = None,
+    utilization_threshold: int = 50,
 ) -> dict:
     required_mib, total_mib = estimate_required_memory_mib(profile, tp_size)
     margin_mib = memory_margin_mib(profile)
@@ -1111,12 +2858,18 @@ def evaluate_gpu_selection(
         }
 
     details = []
+    gpu_utilization = gpu_utilization or {}
     ok = True
+    has_busy_gpu = False
     for gid in gpu_ids:
         used, total = gpu_memory[gid]
         planned_limit = gpu_vllm_planned_limit_mib(total, mem_util)
         budget = gpu_vllm_budget_mib(gpu_memory, gid, mem_util)
-        if budget < required_mib:
+        utilization = gpu_utilization.get(gid, 0.0)
+        busy = utilization >= utilization_threshold
+        if busy:
+            has_busy_gpu = True
+        if budget < required_mib or busy:
             ok = False
         details.append(
             {
@@ -1126,14 +2879,16 @@ def evaluate_gpu_selection(
                 "vllm_planned_limit_mib": planned_limit,
                 "vllm_budget_mib": budget,
                 "recommended_mib": required_mib + margin_mib,
-                "ok": budget >= required_mib,
-                "recommended_ok": budget >= required_mib + margin_mib,
+                "utilization": utilization,
+                "busy": busy,
+                "ok": budget >= required_mib and not busy,
+                "recommended_ok": budget >= required_mib + margin_mib and not busy,
             }
         )
 
     return {
         "ok": ok,
-        "reason": "" if ok else "insufficient_memory",
+        "reason": "" if ok else ("gpu_busy" if has_busy_gpu else "insufficient_memory"),
         "required_mib": required_mib,
         "recommended_mib": required_mib + margin_mib,
         "margin_mib": margin_mib,
@@ -1142,7 +2897,18 @@ def evaluate_gpu_selection(
     }
 
 
-def recommend_gpu() -> dict:
+def missing_model_name_analysis() -> str:
+    return (
+        "ENV.MODEL_NAME 为空，无法确定要启动的模型。\n"
+        "请先调用 model_list() 查看可用模型，然后设置 ENV.MODEL_NAME，"
+        "再启动推理服务或重新调用 gpu_recommend_allocation。"
+    )
+
+def recommend_gpu_for_config(
+    cfg: Optional[dict] = None,
+    reserve_instances: bool = True,
+    allowed_gpus: Optional[list[str]] = None,
+) -> dict:
     """
     Intelligently evaluate and recommend GPU resources.
 
@@ -1155,19 +2921,78 @@ def recommend_gpu() -> dict:
         }
     """
 
-    cfg = show_config()
-
+    cfg = cfg or show_config()
+    env = cfg.get("ENV", {})
+    if not str(env.get("MODEL_NAME") or "").strip():
+        return {
+            "ok": False,
+            "current_ok": False,
+            "reason": "model_name_missing",
+            "analysis": missing_model_name_analysis(),
+        }
     mem_util = float(cfg["RUNTIME"].get("GPU_MEMORY_UTILIZATION", 0.9))
+    utilization_threshold = clamp_int(
+        cfg["RUNTIME"].get("GPU_UTILIZATION_THRESHOLD"), 50, 1, 100
+    )
     configured_visible = cfg["ENV"].get("CUDA_VISIBLE_DEVICES", "")
     configured_gpus = parse_visible_gpus(configured_visible)
     configured_tp = int(cfg["RUNTIME"].get("TENSOR_PARALLEL_SIZE", len(configured_gpus) or 1))
     profile = get_model_memory_profile(cfg)
+    if profile.get("param_billion") is None:
+        return {
+            "ok": False,
+            "current_ok": False,
+            "reason": "model_size_unknown",
+            "analysis": unknown_model_size_analysis(profile),
+        }
 
     gpu_memory, error = get_gpu_memory_map()
     if error:
         return {"ok": False, "analysis": error}
+    gpu_utilization, utilization_error = get_gpu_utilization_map()
+    if utilization_error:
+        return {"ok": False, "analysis": utilization_error}
+
+    if allowed_gpus is None and resource_pool_managed():
+        allowed_gpus = resource_context_gpu_ids()
+    if allowed_gpus is not None:
+        allowed = set(str(item) for item in allowed_gpus)
+        gpu_memory = {
+            gpu_id: value for gpu_id, value in gpu_memory.items() if gpu_id in allowed
+        }
+        gpu_utilization = {
+            gpu_id: value
+            for gpu_id, value in gpu_utilization.items()
+            if gpu_id in allowed
+        }
+        if not allowed:
+            return {
+                "ok": False,
+                "current_ok": False,
+                "reason": "resource_context_missing_gpus",
+                "analysis": "资源池未提供可用 GPU 边界，无法进行自动分配。",
+            }
+    if reserve_instances:
+        gpu_memory, reserved_gpus = reserve_instance_gpu_memory(gpu_memory)
+    else:
+        reserved_gpus = []
 
     analysis_lines = describe_model_profile(profile)
+    if allowed_gpus is not None:
+        analysis_lines.append(
+            f"资源池 GPU 边界: assigned_gpus={','.join(allowed_gpus)}"
+        )
+    if reserved_gpus:
+        analysis_lines.append(
+            f"实例预占用: GPU {','.join(reserved_gpus)} 已被 starting/running 实例占用。"
+        )
+    if not gpu_memory:
+        return {
+            "ok": False,
+            "current_ok": False,
+            "analysis": "\n".join(analysis_lines) + "\n没有可用于推荐的 GPU。",
+        }
+
     analysis_lines.append("")
     analysis_lines.append(
         f"当前配置: CUDA_VISIBLE_DEVICES={','.join(configured_gpus) or '(empty)'}, "
@@ -1184,7 +3009,13 @@ def recommend_gpu() -> dict:
         )
     else:
         current_eval = evaluate_gpu_selection(
-            configured_gpus, configured_tp, gpu_memory, profile, mem_util
+            configured_gpus,
+            configured_tp,
+            gpu_memory,
+            profile,
+            mem_util,
+            gpu_utilization,
+            utilization_threshold,
         )
         current_ok = bool(current_eval["ok"])
         analysis_lines.append(
@@ -1200,13 +3031,20 @@ def recommend_gpu() -> dict:
             analysis_lines.append(f"- 当前GPU: {gpu_status}")
 
     analysis_lines.append("")
-    analysis_lines.extend(format_gpu_budget_table(gpu_memory, mem_util))
+    analysis_lines.append(
+        f"GPU繁忙阈值: 连续3次采样平均利用率达到 {utilization_threshold}% 时不参与分配。"
+    )
+    analysis_lines.extend(
+        format_gpu_budget_table(
+            gpu_memory, mem_util, gpu_utilization, utilization_threshold
+        )
+    )
 
     candidates = []
     for idx, (used, total) in gpu_memory.items():
         planned_limit = gpu_vllm_planned_limit_mib(total, mem_util)
         budget = gpu_vllm_budget_mib(gpu_memory, idx, mem_util)
-        if budget > 0:
+        if budget > 0 and gpu_utilization.get(idx, 0.0) < utilization_threshold:
             candidates.append((idx, budget, planned_limit, total))
 
     candidates.sort(key=lambda x: x[1], reverse=True)
@@ -1217,42 +3055,12 @@ def recommend_gpu() -> dict:
             "analysis": "\n".join(analysis_lines) + "\n没有可用 GPU。",
         }
 
+    current_recommended_ok = False
     if current_ok and current_eval:
         min_budget = min(
             item["vllm_budget_mib"] for item in current_eval.get("details", [])
         )
-        min_planned_limit = min(
-            item["vllm_planned_limit_mib"] for item in current_eval.get("details", [])
-        )
-        recommendation_status = (
-            "满足保守预算"
-            if min_budget >= current_eval["recommended_mib"]
-            else "满足最低启动需求，但低于保守推荐预算"
-        )
-        analysis_lines.append("")
-        analysis_lines.append("推荐:")
-        analysis_lines.append(f"- GPU={','.join(configured_gpus)}, TP={configured_tp}")
-        analysis_lines.append("- 理由: 当前 service.yaml 配置已满足最低启动需求，优先保持当前配置，避免无必要扩卡。")
-        analysis_lines.append(f"- 状态: {recommendation_status}")
-        analysis_lines.append(
-            f"- 权重总需求≈{current_eval['total_mib']} MiB, "
-            f"单卡最低需求≈{current_eval['required_mib']} MiB, "
-            f"保守预算≈{current_eval['recommended_mib']} MiB, "
-            f"组合最小budget≈{min_budget} MiB"
-        )
-        analysis_lines.append(
-            f"- 预计占用: nvidia-smi 通常接近 vLLM规划上限≈{min_planned_limit} MiB/卡，"
-            "并可能因 CUDA/NCCL/runtime 开销略高。"
-        )
-        analysis_lines.append("结论: 以上为启动前粗略分析，不代表一定可启动；最终以 vLLM 启动日志和 service_start_status 为准。")
-
-        return {
-            "ok": True,
-            "current_ok": current_ok,
-            "recommended_gpus": ",".join(configured_gpus),
-            "recommended_tp": configured_tp,
-            "analysis": "\n".join(analysis_lines),
-        }
+        current_recommended_ok = min_budget >= current_eval["recommended_mib"]
 
     for tp in generate_tp_candidates(len(candidates)):
         required, total_weight = estimate_required_memory_mib(profile, tp)
@@ -1290,6 +3098,43 @@ def recommend_gpu() -> dict:
                 "analysis": "\n".join(analysis_lines),
             }
 
+    if current_ok and current_eval:
+        min_budget = min(
+            item["vllm_budget_mib"] for item in current_eval.get("details", [])
+        )
+        min_planned_limit = min(
+            item["vllm_planned_limit_mib"] for item in current_eval.get("details", [])
+        )
+        recommendation_status = (
+            "满足保守预算"
+            if current_recommended_ok
+            else "满足最低启动需求，但低于保守推荐预算"
+        )
+        analysis_lines.append("")
+        analysis_lines.append("推荐:")
+        analysis_lines.append(f"- GPU={','.join(configured_gpus)}, TP={configured_tp}")
+        analysis_lines.append("- 理由: 当前配置满足最低启动需求，且没有更少 GPU 的可行组合。")
+        analysis_lines.append(f"- 状态: {recommendation_status}")
+        analysis_lines.append(
+            f"- 权重总需求≈{current_eval['total_mib']} MiB, "
+            f"单卡最低需求≈{current_eval['required_mib']} MiB, "
+            f"保守预算≈{current_eval['recommended_mib']} MiB, "
+            f"组合最小budget≈{min_budget} MiB"
+        )
+        analysis_lines.append(
+            f"- 预计占用: nvidia-smi 通常接近 vLLM规划上限≈{min_planned_limit} MiB/卡，"
+            "并可能因 CUDA/NCCL/runtime 开销略高。"
+        )
+        analysis_lines.append("结论: 以上为启动前粗略分析，不代表一定可启动；最终以 vLLM 启动日志和 service_start_status 为准。")
+
+        return {
+            "ok": True,
+            "current_ok": current_ok,
+            "recommended_gpus": ",".join(configured_gpus),
+            "recommended_tp": configured_tp,
+            "analysis": "\n".join(analysis_lines),
+        }
+
     analysis_lines.append("")
     analysis_lines.append("所有 GPU 组合均无法满足显存需求。")
     for tp in generate_tp_candidates(len(candidates)):
@@ -1310,6 +3155,190 @@ def recommend_gpu() -> dict:
     }
 
 
+def recommend_gpu() -> dict:
+    """Recommend GPU allocation for the current user's draft config."""
+    resource_error = managed_resource_error(require_gpus=True)
+    if resource_error:
+        return {
+            "ok": False,
+            "current_ok": False,
+            "reason": "resource_context_missing",
+            "analysis": resource_error,
+        }
+    return recommend_gpu_for_config(show_config())
+
+
+def check_service_start_static_config(cfg: dict) -> dict:
+    env = cfg.get("ENV", {})
+    model_path = env.get("MODEL_PATH", "")
+    model_name = env.get("MODEL_NAME", "")
+    start_script = env.get("START_SCRIPT", "")
+    target_ip = env.get("HOST_IP", "")
+
+    if not str(model_name or "").strip():
+        return {
+            "ok": False,
+            "reason": "model_name_missing",
+            "analysis": missing_model_name_analysis(),
+        }
+    full_path = os.path.join(model_path, model_name)
+    if not os.path.exists(full_path):
+        return {
+            "ok": False,
+            "reason": "file_not_found",
+            "analysis": f"ENV.MODEL_NAME 不存在: {model_name}。\nUse model_list() to see all available models.",
+        }
+
+    if not os.path.exists(start_script):
+        return {
+            "ok": False,
+            "reason": "file_not_found",
+            "analysis": f"ENV.START_SCRIPT 不存在: {start_script}",
+        }
+
+    host_ip = get_local_ip()
+    if target_ip != host_ip:
+        return {
+            "ok": False,
+            "reason": "ip_error",
+            "analysis": f"ENV.HOST_IP 错误: {target_ip} 应改为 {host_ip}",
+        }
+
+    return {"ok": True, "analysis": "启动静态配置检查通过。"}
+
+
+def apply_runtime_host_ip(runtime_cfg: dict) -> tuple[str, str]:
+    """Inject this worker's IP into an instance config without changing its draft."""
+    env = runtime_cfg.setdefault("ENV", {})
+    configured_ip = str(env.get("HOST_IP") or "").strip()
+    worker_ip = get_local_ip()
+    env["HOST_IP"] = worker_ip
+    return configured_ip, worker_ip
+
+
+def apply_auto_gpu_allocation(runtime_cfg: dict) -> tuple[bool, str, dict]:
+    recommendation = recommend_gpu_for_config(
+        runtime_cfg,
+        reserve_instances=True,
+        allowed_gpus=(resource_context_gpu_ids() if resource_pool_managed() else None),
+    )
+    if not recommendation.get("ok"):
+        return (
+            False,
+            "自动 GPU 分配失败。\n" + str(recommendation.get("analysis") or ""),
+            {},
+        )
+
+    gpus = str(recommendation.get("recommended_gpus") or "").strip()
+    tp = int(recommendation.get("recommended_tp") or 0)
+    if not gpus or tp <= 0:
+        return (
+            False,
+            "自动 GPU 分配失败：未生成有效的 GPU 或 TP 推荐。\n"
+            + str(recommendation.get("analysis") or ""),
+            {},
+        )
+
+    runtime_cfg.setdefault("ENV", {})["CUDA_VISIBLE_DEVICES"] = gpus
+    runtime_cfg.setdefault("RUNTIME", {})["TENSOR_PARALLEL_SIZE"] = tp
+    allocation = {
+        "mode": "auto",
+        "recommended_gpus": gpus,
+        "recommended_tp": tp,
+        "current_ok": bool(recommendation.get("current_ok")),
+        "analysis": str(recommendation.get("analysis") or ""),
+    }
+    return True, "", allocation
+
+
+def apply_requested_gpu_allocation(
+    runtime_cfg: dict,
+    gpu_ids: str = "",
+    tensor_parallel_size: int = 0,
+    fallback_to_auto: bool = False,
+) -> tuple[bool, str, dict]:
+    requested_text = str(gpu_ids or "").strip()
+    try:
+        requested_tp = int(tensor_parallel_size or 0)
+    except (TypeError, ValueError):
+        return False, "TENSOR_PARALLEL_SIZE 必须是非负整数。", {}
+
+    if not requested_text:
+        if requested_tp:
+            return False, "指定 tensor_parallel_size 时必须同时指定 gpu_ids。", {}
+        return apply_auto_gpu_allocation(runtime_cfg)
+
+    try:
+        requested_gpus = parse_visible_gpus(requested_text)
+    except (SyntaxError, ValueError) as exc:
+        return False, f"gpu_ids 格式错误: {exc}", {}
+    if not requested_gpus:
+        return False, "gpu_ids 不能为空。", {}
+    if any(not gpu_id.isdigit() for gpu_id in requested_gpus):
+        return False, "gpu_ids 必须是逗号分隔的非负整数，例如 4,5。", {}
+    if len(set(requested_gpus)) != len(requested_gpus):
+        return False, "gpu_ids 不能包含重复 GPU。", {}
+
+    requested_tp = requested_tp or len(requested_gpus)
+    if requested_tp != len(requested_gpus):
+        return (
+            False,
+            f"TP={requested_tp} 与指定 GPU 数量={len(requested_gpus)} 不一致。",
+            {},
+        )
+
+    allowed_gpus = None
+    if resource_pool_managed():
+        allowed_gpus = resource_context_gpu_ids()
+        outside = [gpu_id for gpu_id in requested_gpus if gpu_id not in allowed_gpus]
+        if outside:
+            return (
+                False,
+                "指定 GPU 超出资源池边界。\n"
+                f"assigned_gpus={','.join(allowed_gpus)}\n"
+                f"outside_gpus={','.join(outside)}",
+                {},
+            )
+
+    requested_cfg = copy.deepcopy(runtime_cfg)
+    requested_cfg.setdefault("ENV", {})["CUDA_VISIBLE_DEVICES"] = ",".join(
+        requested_gpus
+    )
+    requested_cfg.setdefault("RUNTIME", {})[
+        "TENSOR_PARALLEL_SIZE"
+    ] = requested_tp
+    recommendation = recommend_gpu_for_config(
+        requested_cfg,
+        reserve_instances=True,
+        allowed_gpus=allowed_gpus,
+    )
+    if not recommendation.get("current_ok"):
+        if fallback_to_auto:
+            return apply_auto_gpu_allocation(runtime_cfg)
+        return (
+            False,
+            "指定 GPU 当前不可用于启动，未自动更换 GPU。\n"
+            + str(recommendation.get("analysis") or ""),
+            {},
+        )
+
+    runtime_cfg.setdefault("ENV", {})["CUDA_VISIBLE_DEVICES"] = ",".join(
+        requested_gpus
+    )
+    runtime_cfg.setdefault("RUNTIME", {})["TENSOR_PARALLEL_SIZE"] = requested_tp
+    allocation = {
+        "mode": "manual",
+        "requested_gpus": ",".join(requested_gpus),
+        "requested_tp": requested_tp,
+        "recommended_gpus": ",".join(requested_gpus),
+        "recommended_tp": requested_tp,
+        "current_ok": True,
+        "fallback_to_auto": bool(fallback_to_auto),
+        "analysis": str(recommendation.get("analysis") or ""),
+    }
+    return True, "", allocation
+
+
 def check_config_validity() -> dict:
     """
     Pre-startup configuration validity check.
@@ -1318,20 +3347,28 @@ def check_config_validity() -> dict:
     If not, ok=False and return the reason for failure.
     """
 
-    cfg = show_config()
+    cfg = copy.deepcopy(show_config())
+    configured_ip, runtime_ip = apply_runtime_host_ip(cfg)
 
-    target_ip = cfg["ENV"]["HOST_IP"]
     visible = cfg["ENV"]["CUDA_VISIBLE_DEVICES"]
     model_path = cfg["ENV"]["MODEL_PATH"]
     model_name = cfg["ENV"]["MODEL_NAME"]
     start_script = cfg["ENV"]["START_SCRIPT"]
     tp_size = int(cfg["RUNTIME"]["TENSOR_PARALLEL_SIZE"])
     mem_util = float(cfg["RUNTIME"].get("GPU_MEMORY_UTILIZATION", 0.9))
-    profile = get_model_memory_profile(cfg)
+    utilization_threshold = clamp_int(
+        cfg["RUNTIME"].get("GPU_UTILIZATION_THRESHOLD"), 50, 1, 100
+    )
 
     # ------------------------------------------------
     # 1. PATH check
     # ------------------------------------------------
+    if not str(model_name or "").strip():
+        return {
+            "ok": False,
+            "reason": "model_name_missing",
+            "analysis": missing_model_name_analysis(),
+        }
     full_path = os.path.join(model_path, model_name)
     if not os.path.exists(full_path):
         return {
@@ -1347,20 +3384,16 @@ def check_config_validity() -> dict:
             "analysis": f"ENV.START_SCRIPT 不存在: {start_script}",
         }
 
-    # ------------------------------------------------
-    # 2. IP check
-    # ------------------------------------------------
-    host_ip = get_local_ip()
-
-    if target_ip != host_ip:
+    profile = get_model_memory_profile(cfg)
+    if profile.get("param_billion") is None:
         return {
             "ok": False,
-            "reason": "ip_error",
-            "analysis": f"ENV.HOST_IP 错误: {target_ip} 应改为 {host_ip}",
+            "reason": "model_size_unknown",
+            "analysis": unknown_model_size_analysis(profile),
         }
 
     # ------------------------------------------------
-    # 3. GPU List
+    # 2. GPU List
     # ------------------------------------------------
     if not visible:
         return {
@@ -1387,6 +3420,13 @@ def check_config_validity() -> dict:
             "ok": False,
             "reason": "nvidia_smi_failed",
             "analysis": gpu_error,
+        }
+    gpu_utilization, utilization_error = get_gpu_utilization_map()
+    if utilization_error:
+        return {
+            "ok": False,
+            "reason": "nvidia_smi_failed",
+            "analysis": utilization_error,
         }
 
     # ------------------------------------------------
@@ -1418,12 +3458,23 @@ def check_config_validity() -> dict:
     # 7. GPU Memory Estimate
     # ------------------------------------------------
     current_eval = evaluate_gpu_selection(
-        target_gpus, tp_size, gpu_memory, profile, mem_util
+        target_gpus,
+        tp_size,
+        gpu_memory,
+        profile,
+        mem_util,
+        gpu_utilization,
+        utilization_threshold,
     )
     required_mib = current_eval["required_mib"]
     total_mib = current_eval["total_mib"]
 
     analysis_lines = []
+    if configured_ip != runtime_ip:
+        analysis_lines.append(
+            f"HOST_IP: 启动实例时自动使用当前 worker IP {runtime_ip} "
+            f"(draft 配置值 {configured_ip or 'empty'} 不会被修改)"
+        )
     analysis_lines.append(f"模型路径: {profile['model_dir']}")
     analysis_lines.append(
         f"模型 {profile['param_billion']:.2f}B ({profile['param_source']})"
@@ -1446,7 +3497,8 @@ def check_config_validity() -> dict:
             f"GPU {item['gpu']}: 总 {item['total_mib']} MiB | 已用 {item['used_mib']} MiB "
             f"| vLLM规划上限 {item['vllm_planned_limit_mib']} MiB "
             f"| vLLM剩余预算 {item['vllm_budget_mib']} MiB "
-            f"| {'满足保守预算' if item.get('recommended_ok') else ('满足最低需求' if item['ok'] else '低于最低需求')}"
+            f"| 平均利用率 {item['utilization']:.1f}% "
+            f"| {gpu_eval_status_text(item)}"
         )
 
     if not current_eval["ok"]:
@@ -1466,51 +3518,359 @@ def check_config_validity() -> dict:
     return {"ok": True, "analysis": "\n".join(analysis_lines)}
 
 
-def start_service() -> str:
+def build_instance_runtime_config(cfg: dict, ports: dict) -> dict:
+    runtime_cfg = copy.deepcopy(cfg)
+    runtime_cfg.setdefault("PORTS", {})
+    runtime_cfg.setdefault("ENV", {})
+    runtime_cfg["PORTS"]["VLLM_OPENAI_PORT"] = int(ports["vllm"])
+    runtime_cfg["PORTS"]["INFERENCE_PORT"] = int(ports["inference"])
+    runtime_cfg["PORTS"]["UI_PORT"] = int(ports["ui"])
+    runtime_cfg["PORTS"]["DATA_ANNOTATION_PORT"] = int(ports["case2chat"])
+    runtime_cfg["ENV"]["MASTER_PORT"] = int(ports["master"])
+    return runtime_cfg
+
+
+def write_runtime_config(path: str, cfg: dict) -> None:
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
+    os.replace(tmp_path, path)
+
+
+def instance_ports_from_runtime_config(cfg: dict) -> dict:
+    ports = cfg.get("PORTS", {})
+    env = cfg.get("ENV", {})
+    return {
+        "vllm": int(ports["VLLM_OPENAI_PORT"]),
+        "inference": int(ports["INFERENCE_PORT"]),
+        "ui": int(ports["UI_PORT"]),
+        "case2chat": int(ports["DATA_ANNOTATION_PORT"]),
+        "master": int(env.get("MASTER_PORT") or 50121),
+    }
+
+
+def openai_api_ready_error(cfg: dict, instance_id: str = "") -> str:
+    env = cfg.get("ENV", {})
+    ports = cfg.get("PORTS", {})
+    host = str(env.get("HOST_IP") or "127.0.0.1").strip()
+    port = int(ports.get("VLLM_OPENAI_PORT") or 0)
+    if not port:
+        return "VLLM_OPENAI_PORT 为空，无法运行 benchmark。"
+
+    url = f"http://{host}:{port}/v1/models"
+    try:
+        request = urllib.request.Request(
+            url,
+            headers={"Authorization": "Bearer EMPTY"},
+            method="GET",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            if 200 <= response.status < 300:
+                return ""
+            return f"vLLM OpenAI API 未就绪: url={url}, status={response.status}"
+    except Exception as e:
+        return (
+            "vLLM OpenAI API 暂不可用，已跳过 benchmark。\n"
+            f"instance_id={instance_id}\n"
+            f"base_url=http://{host}:{port}/v1\n"
+            f"error={e}\n"
+            "说明: 端口监听不代表模型 API 已完成加载。请稍后查看 "
+            "service_instance_status/service_log_tail，确认 vLLM ready 后再运行 benchmark。"
+        )
+
+
+def current_time_text() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def pid_is_alive(pid: object) -> bool:
+    try:
+        value = int(pid or 0)
+    except (TypeError, ValueError):
+        return False
+    return bool(value and is_process_running(value))
+
+
+def service_instance_recorded_pids(meta: dict) -> list[int]:
+    pid_dir = str(meta.get("pid_dir") or "")
+    if not pid_dir or not os.path.isdir(pid_dir):
+        return []
+    pids = []
+    for name in os.listdir(pid_dir):
+        if not name.endswith(".pid"):
+            continue
+        try:
+            with open(os.path.join(pid_dir, name), "r", encoding="utf-8") as f:
+                pid = int(f.read().strip())
+            if pid > 0:
+                pids.append(pid)
+        except (OSError, TypeError, ValueError):
+            continue
+    return pids
+
+
+def service_instance_recorded_pid(meta: dict, service: str) -> int:
+    pid_dir = str(meta.get("pid_dir") or "")
+    if not pid_dir:
+        return 0
+    try:
+        with open(os.path.join(pid_dir, f"{service}.pid"), "r", encoding="utf-8") as f:
+            pid = int(f.read().strip())
+        return pid if pid > 0 else 0
+    except (OSError, TypeError, ValueError):
+        return 0
+
+
+def mark_meta_stale_fixed(meta: dict, reason: str, **extra) -> None:
+    meta["stale_status_fixed"] = {
+        "reason": reason,
+        "time": current_time_text(),
+        **extra,
+    }
+
+
+def finish_meta_if_missing(meta: dict, key: str = "finished_at") -> None:
+    if not meta.get(key):
+        meta[key] = current_time_text()
+
+
+def write_meta_if_changed(path: str, meta: dict, changed: bool) -> dict:
+    if changed:
+        atomic_write_json(path, meta)
+    return meta
+
+
+def refresh_service_instance_status(meta: dict) -> dict:
+    if not meta:
+        return {}
+    status_file = meta.get("status_file")
+    script_pid = int(meta.get("script_pid") or 0)
+    start_script_pid = service_instance_recorded_pid(meta, "start-service")
+    vllm_pid = service_instance_recorded_pid(meta, "vllm")
+    port_ownership = service_instance_port_ownership(meta)
+    process_ownership = service_instance_process_ownership(meta, port_ownership)
+    instance_runtime_pids = set(process_ownership["owned"])
+    instance_runtime_pids.update(process_ownership["unverified"])
+    launcher_running = script_pid in instance_runtime_pids or start_script_pid in instance_runtime_pids
+    vllm_running = vllm_pid in instance_runtime_pids
+    auxiliary_running = any(
+        service_instance_recorded_pid(meta, service) in instance_runtime_pids
+        for service in ("inference", "case2chat", "ui", "web")
+    )
+    old_status = str(meta.get("status") or "")
+    script_status = ""
+    if status_file and os.path.exists(status_file):
+        try:
+            with open(status_file, "r", encoding="utf-8") as f:
+                status_meta = json.load(f) or {}
+            script_status = str(status_meta.get("status") or "")
+            if status_meta.get("finished_at"):
+                meta["script_finished_at"] = status_meta.get("finished_at")
+            if status_meta.get("error") is not None:
+                meta["error"] = status_meta.get("error")
+        except Exception:
+            pass
+
+    service_port_names = {"vllm", "inference", "ui", "case2chat"}
+    owned_ports = {item["name"] for item in port_ownership["owned"]}
+    unverified_ports = {item["name"] for item in port_ownership["unverified"]}
+    reused_ports = {item["name"] for item in port_ownership["reused"]}
+    running_ports = owned_ports | unverified_ports
+
+    new_status = old_status
+    was_active = old_status in {"starting", "running", "degraded"}
+    all_ports_running = service_port_names.issubset(running_ports)
+    residual_runtime = auxiliary_running or bool(running_ports - {"vllm"})
+    if script_status == "stopped":
+        new_status = "stopped"
+    elif vllm_running and all_ports_running:
+        new_status = "running"
+    elif launcher_running or vllm_running:
+        new_status = "starting"
+    elif residual_runtime and was_active:
+        new_status = "degraded"
+    elif old_status not in {"stopped", "failed"}:
+        if script_status == "finished":
+            new_status = "failed"
+        elif script_status == "starting":
+            new_status = "failed"
+        elif old_status in {"starting", "running"}:
+            new_status = "failed"
+        else:
+            new_status = old_status or "unknown"
+
+    if new_status != old_status:
+        meta["status"] = new_status
+        mark_meta_stale_fixed(
+            meta,
+            "service_status_refresh",
+            old_status=old_status,
+            new_status=new_status,
+            script_pid=script_pid,
+            vllm_pid=vllm_pid,
+            running_ports=sorted(running_ports),
+            reused_ports=sorted(reused_ports),
+        )
+    if meta.get("status") == "failed":
+        finish_meta_if_missing(meta)
+    meta["updated_at"] = current_time_text()
+    return meta
+
+
+def start_service(
+    gpu_ids: str = "",
+    tensor_parallel_size: int = 0,
+    fallback_to_auto: bool = False,
+):
     """Start inference service stack."""
+    if not current_request_user_id():
+        return "当前请求缺少用户身份，已拒绝启动推理服务。"
+    resource_error = managed_resource_error(
+        require_gpus=True, require_reservation=True
+    )
+    if resource_error:
+        return resource_error
+    draft_config_path = ensure_user_draft_config()
     CONFIG = show_config()
-    ports = CONFIG["PORTS"]
-    env = CONFIG["ENV"]
+    runtime_source = copy.deepcopy(CONFIG)
+    configured_ip, runtime_ip = apply_runtime_host_ip(runtime_source)
+    static_check = check_service_start_static_config(runtime_source)
+    if not static_check["ok"]:
+        return (
+            "检查不通过。\n"
+            f"原因：{static_check['reason']}\n"
+            f"分析：{static_check['analysis']}"
+        )
+
+    if configured_ip != runtime_ip:
+        print(
+            "[service-start] runtime HOST_IP adjusted "
+            f"{configured_ip or 'empty'} -> {runtime_ip}; draft unchanged",
+            flush=True,
+        )
     run_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    instance_id = run_id
+    instance_dir = get_service_instance_dir(instance_id)
     log_root = get_service_run_log_root()
-    run_log_dir = os.path.join(log_root, "runs", run_id)
+    os.makedirs(instance_dir, exist_ok=True)
+    allocated_ports = allocate_instance_ports(runtime_source, instance_id)
+    runtime_config = build_instance_runtime_config(runtime_source, allocated_ports)
+    allocation_ok, allocation_error, gpu_allocation = apply_requested_gpu_allocation(
+        runtime_config,
+        gpu_ids=gpu_ids,
+        tensor_parallel_size=tensor_parallel_size,
+        fallback_to_auto=fallback_to_auto,
+    )
+    if not allocation_ok:
+        release_pending_instance_ports(instance_id, allocated_ports)
+        return allocation_error
+
+    runtime_config_path = os.path.join(instance_dir, "service.runtime.yaml")
+    write_runtime_config(runtime_config_path, runtime_config)
+    ports = runtime_config["PORTS"]
+    runtime_env = runtime_config["ENV"]
+    run_log_dir = instance_dir
+    pid_dir = os.path.join(run_log_dir, "pids")
     status_file = os.path.join(run_log_dir, "status.json")
+    meta_file = os.path.join(instance_dir, "meta.json")
     os.makedirs(run_log_dir, exist_ok=True)
+    os.makedirs(pid_dir, exist_ok=True)
     latest_link = os.path.join(log_root, "latest")
     try:
         if os.path.lexists(latest_link):
             os.unlink(latest_link)
-        os.symlink(os.path.join("runs", run_id), latest_link)
+        os.symlink(run_log_dir, latest_link)
     except OSError:
         pass
     proc_env = os.environ.copy()
     proc_env["SERVICE_RUN_ID"] = run_id
-    proc = subprocess.Popen(
-        ["bash", env["START_SCRIPT"], "start"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        env=proc_env,
-    )
-    atomic_write_json(
-        status_file,
-        {
-            "run_id": run_id,
-            "status": "starting",
-            "script_pid": proc.pid,
-            "config_profile": "service",
-            "config_file": "../config/service.yaml",
-            "log_dir": run_log_dir,
-            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "finished_at": None,
-            "ports": {
-                "vllm": ports["VLLM_OPENAI_PORT"],
-                "inference": ports["INFERENCE_PORT"],
-                "ui": ports["UI_PORT"],
-                "case2chat": ports["DATA_ANNOTATION_PORT"],
-            },
-            "error": None,
+    proc_env["SERVICE_RUN_LOG_DIR"] = run_log_dir
+    proc_env["SERVICE_PID_DIR"] = pid_dir
+    try:
+        proc = subprocess.Popen(
+            ["bash", runtime_env["START_SCRIPT"], "start", runtime_config_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=proc_env,
+            start_new_session=True,
+        )
+    except Exception:
+        release_pending_instance_ports(instance_id, allocated_ports)
+        raise
+    started_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    instance_meta = {
+        "instance_id": instance_id,
+        "run_id": run_id,
+        "owner_user_id": current_request_user_id(),
+        "owner_aliases": current_request_user_aliases(),
+        "owner_context_user_id": current_request_thread_id(),
+        "actual_gpus": ",".join(
+            parse_visible_gpus(runtime_env.get("CUDA_VISIBLE_DEVICES", ""))
+        ),
+        "gpu_allocation": gpu_allocation,
+        "status": "starting",
+        "script_pid": proc.pid,
+        "model": str(runtime_env.get("MODEL_NAME") or ""),
+        "model_path": str(runtime_env.get("MODEL_PATH") or "")
+        + str(runtime_env.get("MODEL_NAME") or ""),
+        "ports": {
+            "vllm": allocated_ports["vllm"],
+            "inference": allocated_ports["inference"],
+            "ui": allocated_ports["ui"],
+            "case2chat": allocated_ports["case2chat"],
+            "master": allocated_ports["master"],
         },
-    )
+        "runtime_config": runtime_config_path,
+        "draft_config": draft_config_path,
+        "log_dir": run_log_dir,
+        "pid_dir": pid_dir,
+        "status_file": status_file,
+        "meta_file": meta_file,
+        "started_at": started_at,
+        "finished_at": None,
+    }
+    resource_context = current_request_resource_context()
+    if resource_pool_managed():
+        instance_meta["resource"] = {
+            "mode": "managed",
+            "runtime_node_id": str(resource_context.get("runtime_node_id") or ""),
+            "reservation_id": str(resource_context.get("reservation_id") or ""),
+            "resource_group_id": str(resource_context.get("resource_group_id") or ""),
+            "training_pool_id": str(resource_context.get("training_pool_id") or ""),
+            "expires_at": str(resource_context.get("expires_at") or ""),
+            "assigned_gpus": resource_context_gpu_ids(resource_context),
+            "actual_gpus": parse_visible_gpus(
+                runtime_env.get("CUDA_VISIBLE_DEVICES", "")
+            ),
+        }
+    save_service_instance(instance_meta)
+    record_inference_pid(instance_meta)
+    release_pending_instance_ports(instance_id, allocated_ports)
+    status_payload = {
+        "run_id": run_id,
+        "instance_id": instance_id,
+        "status": "starting",
+        "script_pid": proc.pid,
+        "config_profile": "runtime",
+        "config_file": runtime_config_path,
+        "draft_config": draft_config_path,
+        "log_dir": run_log_dir,
+        "pid_dir": pid_dir,
+        "started_at": started_at,
+        "finished_at": None,
+        "ports": {
+            "vllm": allocated_ports["vllm"],
+            "inference": allocated_ports["inference"],
+            "ui": allocated_ports["ui"],
+            "case2chat": allocated_ports["case2chat"],
+            "master": allocated_ports["master"],
+        },
+        "error": None,
+        "gpu_allocation": gpu_allocation,
+    }
+    if resource_pool_managed():
+        status_payload["resource"] = instance_meta["resource"]
+    atomic_write_json(status_file, status_payload)
     atomic_write_json(
         get_service_start_latest_path(),
         {
@@ -1518,48 +3878,1210 @@ def start_service() -> str:
             "status_file": status_file,
         },
     )
-
-    return (
+    allocation_mode = str(gpu_allocation.get("mode") or "auto")
+    allocation_text = (
+        "用户指定本次实例 GPU，不修改全局 service.yaml 或用户 draft"
+        if allocation_mode == "manual"
+        else "自动选择本次实例可用 GPU，不修改全局 service.yaml 或用户 draft"
+    )
+    result_text = (
         "启动任务已提交，正在后台启动。\n"
+        f"instance_id: {instance_id}\n"
         f"run_id: {run_id}\n"
-        f"模型: {env['MODEL_NAME']}\n"
-        f"模型路径: {env['MODEL_PATH']}{env['MODEL_NAME']}\n"
-        f"HOST_IP: {env['HOST_IP']}\n"
+        f"模型: {runtime_env['MODEL_NAME']}\n"
+        f"模型路径: {runtime_env['MODEL_PATH']}{runtime_env['MODEL_NAME']}\n"
+        f"HOST_IP: {runtime_env['HOST_IP']}\n"
+        f"GPU分配: {allocation_text}\n"
+        f"GPU: {runtime_env.get('CUDA_VISIBLE_DEVICES', '')}\n"
+        f"TP: {runtime_config['RUNTIME'].get('TENSOR_PARALLEL_SIZE')}\n"
         "端口:\n"
-        f"- vLLM OpenAI API: {ports['VLLM_OPENAI_PORT']}\n"
-        f"- Inference Server: {ports['INFERENCE_PORT']}\n"
-        f"- Web UI: {ports['UI_PORT']}\n"
-        f"- Case2Chat: {ports['DATA_ANNOTATION_PORT']}\n"
+        f"- vLLM OpenAI API: {allocated_ports['vllm']}\n"
+        f"- Inference Server: {allocated_ports['inference']}\n"
+        f"- Web UI: {allocated_ports['ui']}\n"
+        f"- Case2Chat: {allocated_ports['case2chat']}\n"
+        f"- MASTER_PORT: {allocated_ports['master']}\n"
+        f"runtime_config: {format_agent_relative_path(runtime_config_path)}\n"
+        f"draft_config: {format_agent_relative_path(draft_config_path)}\n"
+        f"log_dir: {format_agent_relative_path(run_log_dir)}\n"
         "启动任务已提交不代表服务已启动完成。\n"
         "除非用户明确要求继续执行其他操作，否则请直接返回以上信息，不要继续调用 service_status、service_start_status 或日志工具。"
+    )
+    service_start_payload = {
+        "submitted": True,
+        "instance_id": instance_id,
+        "run_id": run_id,
+        "status": "starting",
+        "reservation_id": str(
+            (instance_meta.get("resource") or {}).get("reservation_id")
+            or resource_context.get("reservation_id")
+            or ""
+        ),
+    }
+    return build_local_tool_response(
+        result_text,
+        {"service_start": service_start_payload},
     )
     # f"- Voice: {ports.get('VOICE_PORT', 9007)}"
     # "您可以稍后调用 service_start_status() 查看推理启动状态。"
 
 
+def service_instance_reservation_id(meta: dict) -> str:
+    resource = meta.get("resource") if isinstance(meta.get("resource"), dict) else {}
+    return str(resource.get("reservation_id") or "").strip()
+
+
+def service_stop_by_reservation_result(reservation_id: str = "") -> dict:
+    resource_context = current_request_resource_context()
+    reservation_id = str(reservation_id or resource_context.get("reservation_id") or "").strip()
+    if not reservation_id:
+        result_text = "资源池关闭推理服务缺少 reservation_id，已拒绝执行。"
+        return {
+            "status": "error",
+            "stopped": False,
+            "reservation_id": "",
+            "service_stop": service_stop_payload(
+                stopped=False,
+                reservation_id="",
+                status="error",
+                result=result_text,
+            ),
+            "result": result_text,
+        }
+
+    matching = []
+    for instance_id in list_service_instance_ids():
+        meta = visible_service_instance_meta(instance_id)
+        if not meta or service_instance_reservation_id(meta) != reservation_id:
+            continue
+        matching.append(meta)
+
+    matching.sort(
+        key=lambda meta: (
+            status_sort_rank(meta.get("status")),
+            -parse_time_sort_value(meta.get("started_at")),
+            str(meta.get("instance_id") or meta.get("run_id") or ""),
+        )
+    )
+
+    active_statuses = {"starting", "running", "degraded"}
+    active = [
+        meta
+        for meta in matching
+        if str(meta.get("status") or "").lower() in active_statuses
+        or service_instance_runtime_active(meta)
+    ]
+    if active:
+        instance_id = str(active[0].get("instance_id") or active[0].get("run_id") or "").strip()
+        if not instance_id:
+            result_text = "匹配到资源预约实例，但实例缺少 instance_id，已拒绝停止。"
+            return {
+                "status": "error",
+                "stopped": False,
+                "reservation_id": reservation_id,
+                "service_stop": service_stop_payload(
+                    stopped=False,
+                    reservation_id=reservation_id,
+                    status="error",
+                    result=result_text,
+                ),
+                "result": result_text,
+            }
+        stop_response = stop_service_instance(instance_id)
+        result_text = local_tool_text(stop_response)
+        stop_data = local_tool_response_data(stop_response)
+        service_stop = stop_data.get("service_stop") if isinstance(stop_data.get("service_stop"), dict) else {}
+        final_meta = visible_service_instance_meta(instance_id)
+        final_active = bool(final_meta) and (
+            str(final_meta.get("status") or "").lower() in active_statuses
+            or service_instance_runtime_active(final_meta)
+        )
+        if not final_active:
+            if not service_stop:
+                service_stop = service_stop_payload(
+                    stopped=True,
+                    instance_id=instance_id,
+                    reservation_id=reservation_id,
+                    status="stopped",
+                    result=result_text,
+                )
+            service_stop = dict(service_stop)
+            service_stop["stopped"] = True
+            service_stop["release_ready"] = True
+            service_stop["reservation_id"] = reservation_id
+            service_stop["instance_id"] = str(service_stop.get("instance_id") or instance_id)
+            service_stop["result"] = str(service_stop.get("result") or result_text)
+            return {
+                "status": "ok",
+                "stopped": True,
+                "reservation_id": reservation_id,
+                "instance_id": instance_id,
+                "service_stop": service_stop,
+                "result": result_text,
+            }
+        service_stop = dict(service_stop) if service_stop else service_stop_payload(
+            stopped=False,
+            instance_id=instance_id,
+            reservation_id=reservation_id,
+            status=str((final_meta or {}).get("status") or "error"),
+            result=result_text,
+        )
+        service_stop["stopped"] = False
+        service_stop["release_ready"] = False
+        service_stop["reservation_id"] = reservation_id
+        service_stop["instance_id"] = str(service_stop.get("instance_id") or instance_id)
+        service_stop["result"] = str(service_stop.get("result") or result_text)
+        return {
+            "status": "error",
+            "stopped": False,
+            "reservation_id": reservation_id,
+            "instance_id": instance_id,
+            "service_stop": service_stop,
+            "result": result_text,
+        }
+
+    if matching:
+        latest = matching[0]
+        instance_id = str(latest.get("instance_id") or latest.get("run_id") or "").strip()
+        status = str(latest.get("status") or "unknown")
+        result_text = (
+            "资源预约绑定的推理服务实例已处于非活动状态，无需重复停止。\n"
+            f"reservation_id={reservation_id}\n"
+            f"instance_id={instance_id}\n"
+            f"status={status}"
+        )
+        return {
+            "status": "ok",
+            "stopped": True,
+            "reservation_id": reservation_id,
+            "instance_id": instance_id,
+            "service_stop": service_stop_payload(
+                stopped=True,
+                instance_id=instance_id,
+                reservation_id=reservation_id,
+                status=status,
+                result=result_text,
+            ),
+            "result": result_text,
+        }
+
+    result_text = f"未找到绑定资源预约的推理服务实例: reservation_id={reservation_id}"
+    return {
+        "status": "error",
+        "stopped": False,
+        "reservation_id": reservation_id,
+        "service_stop": service_stop_payload(
+            stopped=False,
+            reservation_id=reservation_id,
+            status="not_found",
+            result=result_text,
+        ),
+        "result": result_text,
+    }
+
 def stop_service() -> str:
     """Stop inference service stack."""
+    scope = "all" if current_request_is_admin() else "mine"
+    active_instances = active_service_instance_candidates(scope=scope)
+    if len(active_instances) > 1:
+        return instance_stop_choice_required_text(active_instances)
+    if len(active_instances) == 1:
+        instance_id = str(
+            active_instances[0].get("instance_id")
+            or active_instances[0].get("run_id")
+            or ""
+        )
+        if instance_id:
+            return stop_service_instance(instance_id)
+
+    own_latest = resolve_service_instance_id("latest", scope=scope, require_running=False)
+    if own_latest:
+        return stop_service_instance(own_latest)
+    if list_service_instance_ids():
+        return (
+            "未找到当前用户可停止的推理服务实例。\n"
+            "当前节点存在实例记录，但这些实例不属于当前用户；不会执行旧的全局 stop。"
+        )
+
     CONFIG = show_config()
     run_command(f"bash {CONFIG['ENV']['START_SCRIPT']} stop")
     return "Service stopped!"
 
 
+def service_instance_owner(meta: dict) -> str:
+    owner = str(meta.get("owner_user_id") or "").strip()
+    current = current_request_user_id()
+    if owner and current and owner == current:
+        return "self"
+    if owner:
+        return "other"
+    return "unknown"
+
+
+def backfill_task_owner_from_instance(meta: dict) -> bool:
+    if str(meta.get("owner_user_id") or "").strip():
+        return False
+    owner = str(
+        meta.get("created_by_user_id")
+        or meta.get("request_user_id")
+        or meta.get("user_id")
+        or ""
+    ).strip()
+    if not owner:
+        instance_id = str(meta.get("service_instance_id") or "").strip()
+        if instance_id:
+            instance_meta = load_service_instance(instance_id)
+            owner = str(instance_meta.get("owner_user_id") or "").strip()
+    if not owner:
+        return False
+    meta["owner_user_id"] = owner
+    return True
+
+
+def task_owner_user_id(meta: dict) -> str:
+    owner = str(meta.get("owner_user_id") or "").strip()
+    if owner:
+        return owner
+
+    instance_id = str(meta.get("service_instance_id") or "").strip()
+    if instance_id:
+        instance_meta = load_service_instance(instance_id)
+        return str(instance_meta.get("owner_user_id") or "").strip()
+    return ""
+
+
+def task_owner_label(meta: dict) -> str:
+    owner = task_owner_user_id(meta)
+    current = current_request_user_id()
+    if owner and current and owner == current:
+        return "self"
+    if owner:
+        return "other"
+    return "unknown"
+
+
+def task_visible_for_scope(meta: dict, scope: str = "mine") -> bool:
+    scope = str(scope or "mine").strip().lower()
+    if scope == "all":
+        return current_request_is_admin()
+    current = current_request_user_id()
+    if not current:
+        return False
+    return bool(task_owned_by_current(meta))
+
+
+def visible_service_instance_meta(instance_id: str) -> dict:
+    meta = refresh_service_instance_status(load_service_instance(instance_id))
+    if meta:
+        save_service_instance(meta)
+    return meta
+
+
+def service_instance_access_error(instance_id: str, action: str = "操作") -> str:
+    requested = str(instance_id or "").strip()
+    if not requested or requested == "latest" or requested not in list_service_instance_ids():
+        return ""
+    meta = visible_service_instance_meta(requested)
+    if not meta:
+        return ""
+    if current_request_is_admin():
+        return ""
+    owner = str(meta.get("owner_user_id") or "").strip()
+    current = current_request_user_id()
+    if not current:
+        return (
+            f"当前请求缺少用户身份，已拒绝{action}推理服务实例。\n"
+            f"instance_id={requested}"
+        )
+    if not owner:
+        return (
+            f"推理服务实例没有有效的所有者记录，已拒绝{action}。\n"
+            f"instance_id={requested}\n"
+            "请通过服务器运维方式处理该历史实例。"
+        )
+    if not service_instance_owned_by_current(meta):
+        return (
+            f"推理服务实例存在，但属于其他用户，已拒绝{action}。\n"
+            f"instance_id={requested}\n"
+            f"owner=other\n"
+            "当前用户只能操作自己的推理服务实例。\n"
+            '可调用 service_instance_list(scope="mine") 查看当前用户可用实例。'
+        )
+    return ""
+
+
+def resolve_service_instance_id(
+    instance_id: str = "latest",
+    scope: str = "mine",
+    require_running: bool = False,
+) -> str:
+    requested = str(instance_id or "latest").strip()
+    ids = list_service_instance_ids()
+    current = current_request_user_id()
+    if scope == "mine" and current_request_is_admin():
+        scope = "all"
+    if scope == "mine" and not current:
+        return ""
+
+    if requested not in {"", "latest"}:
+        if requested not in ids:
+            return ""
+        meta = visible_service_instance_meta(requested)
+        if not meta:
+            return ""
+        if scope == "mine" and current and not service_instance_owned_by_current(meta):
+            return ""
+        if require_running and not service_instance_task_ready(meta):
+            return ""
+        return requested
+
+    candidates = []
+    for item in ids:
+        meta = visible_service_instance_meta(item)
+        if not meta:
+            continue
+        if scope == "mine" and current and not service_instance_owned_by_current(meta):
+            continue
+        if require_running and not service_instance_task_ready(meta):
+            continue
+        candidates.append(item)
+    return candidates[0] if candidates else ""
+
+
+def running_service_instance_candidates(scope: str = "mine") -> list[dict]:
+    current = current_request_user_id()
+    if scope == "mine" and current_request_is_admin():
+        scope = "all"
+    if scope == "mine" and not current:
+        return []
+    candidates = []
+    for instance_id in list_service_instance_ids():
+        meta = visible_service_instance_meta(instance_id)
+        if not meta:
+            continue
+        if scope == "mine" and current and not service_instance_owned_by_current(meta):
+            continue
+        if not service_instance_task_ready(meta):
+            continue
+        candidates.append(meta)
+    candidates.sort(
+        key=lambda meta: (
+            -parse_time_sort_value(meta.get("started_at")),
+            str(meta.get("instance_id") or meta.get("run_id") or ""),
+        )
+    )
+    return candidates
+
+
+def active_service_instance_candidates(scope: str = "mine") -> list[dict]:
+    current = current_request_user_id()
+    if scope == "mine" and current_request_is_admin():
+        scope = "all"
+    if scope == "mine" and not current:
+        return []
+    candidates = []
+    for instance_id in list_service_instance_ids():
+        meta = visible_service_instance_meta(instance_id)
+        if not meta:
+            continue
+        if scope == "mine" and current and not service_instance_owned_by_current(meta):
+            continue
+        if meta.get("status") not in {"running", "starting", "degraded"}:
+            continue
+        candidates.append(meta)
+    candidates.sort(
+        key=lambda meta: (
+            status_sort_rank(meta.get("status")),
+            -parse_time_sort_value(meta.get("started_at")),
+            str(meta.get("instance_id") or meta.get("run_id") or ""),
+        )
+    )
+    return candidates
+
+
+def instance_choice_required_text(candidates: list[dict], task_name: str) -> str:
+    lines = [
+        f"当前用户有多个运行中的推理服务实例，暂不能自动选择实例运行 {task_name}。",
+        "请指定 instance_id 后重试。",
+        "",
+        "可用实例:",
+    ]
+    for meta in candidates:
+        ports = meta.get("ports") or {}
+        lines.append(
+            "- "
+            f"instance_id={meta.get('instance_id') or meta.get('run_id')} "
+            f"status={meta.get('status', '')} "
+            f"gpus={meta.get('actual_gpus', '')} "
+            f"model={meta.get('model', '')} "
+            f"inference={ports.get('inference', '')} "
+            f"ui={ports.get('ui', '')} "
+            f"started_at={meta.get('started_at', '')}"
+        )
+    return "\n".join(lines)
+
+
+def instance_stop_choice_required_text(candidates: list[dict]) -> str:
+    lines = [
+        "当前用户有多个活跃的推理服务实例，暂不能自动选择要停止的实例。",
+        "请指定 instance_id 后重试，例如 service_instance_stop(instance_id=...)。",
+        "",
+        "可停止实例:",
+    ]
+    for meta in candidates:
+        ports = meta.get("ports") or {}
+        lines.append(
+            "- "
+            f"instance_id={meta.get('instance_id') or meta.get('run_id')} "
+            f"status={meta.get('status', '')} "
+            f"gpus={meta.get('actual_gpus', '')} "
+            f"model={meta.get('model', '')} "
+            f"inference={ports.get('inference', '')} "
+            f"ui={ports.get('ui', '')} "
+            f"started_at={meta.get('started_at', '')}"
+        )
+    return "\n".join(lines)
+
+
+def resolve_task_service_instance_id(
+    instance_id: str = "latest", task_name: str = "task"
+) -> str | None:
+    requested = str(instance_id or "latest").strip()
+    if requested not in {"", "latest"}:
+        resolved = resolve_service_instance_id(
+            requested, scope="mine", require_running=True
+        )
+        return resolved or requested
+
+    candidates = running_service_instance_candidates(scope="mine")
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        raise ValueError(instance_choice_required_text(candidates, task_name))
+    return str(candidates[0].get("instance_id") or candidates[0].get("run_id") or "")
+
+
+def get_running_service_instance_config(
+    instance_id: str = "latest",
+) -> tuple[str, dict, dict] | tuple[None, None, None]:
+    resolved = resolve_service_instance_id(
+        instance_id, scope="mine", require_running=True
+    )
+    if not resolved:
+        return None, None, None
+
+    meta = visible_service_instance_meta(resolved)
+    if not service_instance_task_ready(meta):
+        return None, None, meta
+
+    runtime_config = str(meta.get("runtime_config") or "")
+    if not runtime_config or not os.path.exists(runtime_config):
+        return None, None, meta
+
+    with open(runtime_config, "r") as f:
+        cfg = yaml.safe_load(f) or {}
+    return resolved, cfg, meta
+
+
+def require_running_service_instance_config(
+    instance_id: str = "latest",
+) -> tuple[str, dict, dict] | str:
+    if not current_request_user_id():
+        return "当前请求缺少用户身份，已拒绝运行测试或 benchmark。"
+    access_error = service_instance_access_error(instance_id, "运行测试或 benchmark")
+    if access_error:
+        return access_error
+
+    resolved, cfg, meta = get_running_service_instance_config(instance_id)
+    if resolved and cfg:
+        return resolved, cfg, meta
+
+    if meta and meta.get("status") == "starting":
+        return (
+            "当前用户的推理服务实例仍在启动中，暂不能运行测试或 benchmark。\n"
+            f"instance_id={meta.get('instance_id') or meta.get('run_id')}\n"
+            "请稍后查看启动状态，确认服务启动完成后再重试。"
+        )
+    if meta and meta.get("status") == "degraded":
+        return (
+            "当前用户的推理服务实例处于 degraded（降级）状态："
+            "实例仍有运行时或端口存活，但核心端口未全部就绪，暂不能运行测试或 benchmark。\n"
+            f"instance_id={meta.get('instance_id') or meta.get('run_id')}\n"
+            f"status={meta.get('status')}\n"
+            "degraded 不等同于服务完全不可用；"
+            "当 vllm、inference、case2chat 核心端口均 RUNNING 时可继续运行测试或 benchmark。"
+        )
+    if meta:
+        return (
+            "当前用户没有可用于测试或 benchmark 的推理服务实例。\n"
+            f"instance_id={meta.get('instance_id') or meta.get('run_id')}\n"
+            f"status={meta.get('status')}"
+        )
+    return "未找到当前用户运行中的推理服务实例，请先启动推理服务。"
+
+def list_service_instances_payload(scope: str = "mine", limit: int = DEFAULT_LIST_LIMIT) -> dict:
+    scope = str(scope or "mine").strip().lower()
+    if scope not in {"mine", "all"}:
+        return {
+            "operation": "list",
+            "scope": scope,
+            "limit": limit,
+            "items": [],
+            "summary": {"total": 0, "returned": 0, "error": "Invalid scope. Use mine or all."},
+        }
+    forbidden = scope_all_forbidden_message(scope)
+    if forbidden:
+        return {
+            "operation": "list",
+            "scope": scope,
+            "limit": limit,
+            "items": [],
+            "summary": {"total": 0, "returned": 0, "error": forbidden},
+            "status": "forbidden",
+            "error": forbidden,
+        }
+    limit = clamp_int(limit, DEFAULT_LIST_LIMIT, 1, MAX_LIST_LIMIT)
+
+    items = []
+    for instance_id in list_service_instance_ids():
+        meta = visible_service_instance_meta(instance_id)
+        if not meta:
+            continue
+        owner = service_instance_owner(meta)
+        if scope == "mine" and owner != "self":
+            continue
+        items.append((instance_id, owner, meta))
+
+    items.sort(
+        key=lambda item: (
+            -parse_time_sort_value(item[2].get("started_at")),
+            status_sort_rank(item[2].get("status")),
+            item[0],
+        )
+    )
+
+    visible_items = items[:limit]
+    owner_counts = {"self": 0, "other": 0, "unknown": 0}
+    status_counts = {}
+    for _, owner, meta in items:
+        owner_counts[owner if owner in owner_counts else "unknown"] += 1
+        status = str(meta.get("status") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+    structured_items = []
+    for instance_id, owner, meta in visible_items:
+        resource_meta = meta.get("resource") if isinstance(meta.get("resource"), dict) else {}
+        structured_items.append(
+            {
+                "instance_id": instance_id,
+                "owner": owner,
+                "status": str(meta.get("status") or ""),
+                "gpus": str(meta.get("actual_gpus") or ""),
+                "model": str(meta.get("model") or ""),
+                "ports": meta.get("ports") or {},
+                "runtime_node_id": str(resource_meta.get("runtime_node_id") or ""),
+                "reservation_id": str(resource_meta.get("reservation_id") or ""),
+                "resource_group_id": str(resource_meta.get("resource_group_id") or ""),
+                "training_pool_id": str(resource_meta.get("training_pool_id") or ""),
+                "assigned_gpus": resource_meta.get("assigned_gpus") or [],
+                "resource": resource_meta,
+                "started_at": str(meta.get("started_at") or ""),
+                "finished_at": str(meta.get("finished_at") or ""),
+                "log_dir": format_agent_relative_path(meta.get("log_dir", "")),
+                "port_statuses": service_instance_port_services(meta, include_master=False),
+            }
+        )
+
+    return {
+        "operation": "list",
+        "scope": scope,
+        "limit": limit,
+        "returned": len(structured_items),
+        "items": structured_items,
+        "summary": {
+            "total": len(items),
+            "returned": len(structured_items),
+            "hidden": max(0, len(items) - len(structured_items)),
+            "owners": owner_counts,
+            "statuses": status_counts,
+        },
+    }
+
+
+def list_service_instances_text(scope: str = "mine", limit: int = DEFAULT_LIST_LIMIT) -> str:
+    payload = list_service_instances_payload(scope, limit)
+    if payload["summary"].get("error"):
+        return str(payload["summary"]["error"])
+    if payload["summary"]["total"] == 0:
+        if payload["scope"] == "mine" and current_request_is_admin():
+            return "暂无当前用户的推理服务实例。如需查看所有用户的实例，请使用 `查看所有推理服务实例`。"
+        return "暂无当前用户的推理服务实例。" if payload["scope"] == "mine" else "暂无推理服务实例。"
+
+    lines = [f"推理服务实例列表(scope={payload['scope']}):"]
+    lines.append(f"显示 {payload['returned']} / {payload['summary']['total']} 条，limit={payload['limit']}")
+    if payload["scope"] == "all":
+        owner_counts = payload["summary"]["owners"]
+        lines.append(
+            "owner统计: "
+            f"self={owner_counts['self']}, "
+            f"other={owner_counts['other']}, "
+            f"unknown={owner_counts['unknown']}"
+        )
+    if payload["summary"]["hidden"] > 0:
+        lines.append(f"还有 {payload['summary']['hidden']} 条未显示，可增大 limit 查看。")
+
+    for item in payload["items"]:
+        ports = item.get("ports") or {}
+        lines.append(
+            " | ".join(
+                [
+                    f"instance_id={item.get('instance_id', '')}",
+                    f"owner={item.get('owner', '')}",
+                    f"status={item.get('status', '')}",
+                    f"gpus={item.get('gpus', '')}",
+                    f"model={item.get('model', '')}",
+                    f"vllm={ports.get('vllm', '')}",
+                    f"inference={ports.get('inference', '')}",
+                    f"ui={ports.get('ui', '')}",
+                    f"started_at={item.get('started_at', '')}",
+                ]
+            )
+        )
+    return "\n".join(lines)
+
+
+def service_instance_status_text(instance_id: str = "latest") -> str:
+    access_error = service_instance_access_error(instance_id, "查看状态")
+    if access_error:
+        return access_error
+
+    scope = "all" if current_request_is_admin() else "mine"
+    resolved = resolve_service_instance_id(instance_id, scope=scope)
+    if not resolved:
+        return f"未找到推理服务实例: {instance_id}"
+
+    meta = visible_service_instance_meta(resolved)
+    if not meta:
+        return f"推理服务实例不存在: {resolved}"
+
+    ports = meta.get("ports") or {}
+    lines = [
+        "推理服务实例状态:",
+        f"current_time={time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"instance_id={resolved}",
+        f"owner={service_instance_owner(meta)}",
+        f"status={meta.get('status', '')}",
+        f"model={meta.get('model', '')}",
+        f"gpus={meta.get('actual_gpus', '')}",
+        f"started_at={meta.get('started_at', '')}",
+        f"finished_at={meta.get('finished_at', '')}",
+        f"runtime_config={format_agent_relative_path(meta.get('runtime_config', ''))}",
+        f"log_dir={format_agent_relative_path(meta.get('log_dir', ''))}",
+        "ports:",
+    ]
+    for name in ("vllm", "inference", "ui", "case2chat", "master"):
+        port = ports.get(name, "")
+        if name == "master":
+            mark = "RESERVED"
+        else:
+            try:
+                mark = "RUNNING" if check_port(int(port)) else "STOPPED"
+            except (TypeError, ValueError):
+                mark = "UNKNOWN"
+        lines.append(f"- {name}: {port} {mark}")
+    if str(meta.get("status") or "").lower() == "degraded":
+        lines.append(
+            "note=degraded 表示实例仍有运行时或端口存活，但健康状态未完全收敛；"
+            "若 vllm、inference、case2chat 核心端口均 RUNNING，仍可尝试运行功能测试或 benchmark。"
+        )
+    return "\n".join(lines)
+
+
+def service_instance_status_payload(instance_id: str = "latest") -> dict:
+    requested = str(instance_id or "latest").strip() or "latest"
+    payload = {
+        "operation": "detail",
+        "requested_instance_id": requested,
+        "resolved_instance_id": "",
+    }
+
+    access_error = service_instance_access_error(requested, "查看状态")
+    if access_error:
+        payload.update(
+            {
+                "status": "forbidden" if "其他用户" in access_error else "error",
+                "owner": "other" if "owner=other" in access_error or "其他用户" in access_error else "",
+                "error": access_error,
+            }
+        )
+        return payload
+
+    scope = "all" if current_request_is_admin() else "mine"
+    resolved = resolve_service_instance_id(requested, scope=scope)
+    if not resolved:
+        payload.update(
+            {
+                "status": "not_found",
+                "error": f"未找到推理服务实例: {requested}",
+            }
+        )
+        return payload
+
+    payload["resolved_instance_id"] = resolved
+    meta = visible_service_instance_meta(resolved)
+    if not meta:
+        payload.update(
+            {
+                "status": "not_found",
+                "error": f"推理服务实例不存在: {resolved}",
+            }
+        )
+        return payload
+
+    tasks = running_tasks_for_service_instance(resolved)
+    benchmark_tasks = tasks.get("benchmark") or []
+    test_tasks = tasks.get("tests") or []
+    payload.update(
+        {
+            "instance_id": resolved,
+            "owner": service_instance_owner(meta),
+            "status": str(meta.get("status") or ""),
+            "runtime_active": service_instance_runtime_active(meta),
+            "model": str(meta.get("model") or ""),
+            "model_path": str(meta.get("model_path") or ""),
+            "gpus": str(meta.get("actual_gpus") or ""),
+            "ports": dict(meta.get("ports") or {}),
+            "services": service_instance_port_services(meta),
+            "ready_for_tasks": service_instance_task_ready(meta),
+            "started_at": str(meta.get("started_at") or ""),
+            "finished_at": str(meta.get("finished_at") or ""),
+            "runtime_config": format_agent_relative_path(meta.get("runtime_config", "")),
+            "log_dir": format_agent_relative_path(meta.get("log_dir", "")),
+            "running_tasks": {
+                "benchmark": len(benchmark_tasks),
+                "tests": len(test_tasks),
+            },
+        }
+    )
+    return payload
+
+
+def running_tasks_for_service_instance(instance_id: str) -> dict:
+    benchmark_items = []
+    for job_id, meta_path, meta in iter_json_records(get_benchmark_log_dir(), "meta.json"):
+        meta = refresh_benchmark_job_meta(job_id, meta_path, meta)
+        if str(meta.get("service_instance_id") or "") != instance_id:
+            continue
+        if meta.get("status") != "running":
+            continue
+        benchmark_items.append(
+            {
+                "job_id": meta.get("job_id", job_id),
+                "dataset": meta.get("dataset", ""),
+                "mode": meta.get("mode", ""),
+                "start_time": meta.get("start_time", ""),
+                "output": format_agent_relative_path(meta.get("output", "")),
+            }
+        )
+
+    test_items = []
+    runs_dir = os.path.join(get_test_log_root(), "runs")
+    for test_run_id, status_file, meta in iter_json_records(runs_dir, "status.json"):
+        meta = refresh_test_run_meta(test_run_id, status_file, meta)
+        if str(meta.get("service_instance_id") or "") != instance_id:
+            continue
+        if meta.get("status") != "running":
+            continue
+
+        tests = meta.get("tests") or {}
+        if tests:
+            active_scripts = [
+                name
+                for name, item in tests.items()
+                if item.get("status") in {"running", "pending"}
+            ]
+            test_items.append(
+                {
+                    "test_run_id": meta.get("test_run_id", test_run_id),
+                    "test_name": meta.get("test_name", ""),
+                    "scripts": ",".join(active_scripts) or "all",
+                    "started_at": meta.get("started_at", ""),
+                    "log_file": format_test_path(meta.get("log_file", "")),
+                }
+            )
+            continue
+
+        script_pid = int(meta.get("script_pid") or 0)
+        if script_pid and is_process_running(script_pid):
+            test_items.append(
+                {
+                    "test_run_id": meta.get("test_run_id", test_run_id),
+                    "test_name": meta.get("test_name", ""),
+                    "scripts": meta.get("test_name", ""),
+                    "started_at": meta.get("started_at", ""),
+                    "log_file": format_test_path(
+                        meta.get("response_log_file") or meta.get("log_file", "")
+                    ),
+                }
+            )
+
+    return {
+        "benchmark": sorted(
+            benchmark_items, key=lambda item: item.get("start_time", ""), reverse=True
+        ),
+        "tests": sorted(
+            test_items, key=lambda item: item.get("started_at", ""), reverse=True
+        ),
+    }
+
+
+def running_instance_tasks_block_text(instance_id: str, tasks: dict) -> str:
+    benchmark_items = tasks.get("benchmark") or []
+    test_items = tasks.get("tests") or []
+    if not benchmark_items and not test_items:
+        return ""
+
+    lines = [
+        "检测到该推理服务实例下仍有任务正在运行，暂不停止实例。",
+        f"instance_id={instance_id}",
+        "请先向用户确认是否停止以下任务；未经用户明确确认，不要调用 benchmark_stop、service_test_stop，也不要继续停止该实例。",
+    ]
+
+    if benchmark_items:
+        lines.append("")
+        lines.append("运行中的 benchmark:")
+        for item in benchmark_items:
+            lines.append(
+                "- "
+                f"job_id={item['job_id']} "
+                f"dataset={item['dataset']} "
+                f"mode={item['mode']} "
+                f"start_time={item['start_time']} "
+                f"output={item['output']}"
+            )
+
+    if test_items:
+        lines.append("")
+        lines.append("运行中的功能测试:")
+        for item in test_items:
+            lines.append(
+                "- "
+                f"test_run_id={item['test_run_id']} "
+                f"test_name={item['test_name']} "
+                f"scripts={item['scripts']} "
+                f"started_at={item['started_at']} "
+                f"log_file={item['log_file']}"
+            )
+
+    return "\n".join(lines)
+
+
+def service_instance_runtime_active(
+    meta: dict, tracked_pids: list[int] | None = None
+) -> bool:
+    """Return whether an instance owns or may own a live process or port."""
+    port_ownership = service_instance_port_ownership(meta)
+    process_ownership = service_instance_process_ownership(
+        meta, port_ownership, tracked_pids=tracked_pids
+    )
+    return bool(
+        process_ownership["owned"]
+        or process_ownership["unverified"]
+        or port_ownership["owned"]
+        or port_ownership["unverified"]
+    )
+
+
+def service_instance_is_active(meta: dict) -> bool:
+    status = str(meta.get("status") or "").lower()
+    return status in {"starting", "running"} and service_instance_runtime_active(meta)
+
+
+def stop_service_instance_runtime(meta: dict):
+    """Stop one instance after the caller has completed authorization checks."""
+    instance_id = str(meta.get("instance_id") or meta.get("run_id") or "").strip()
+    runtime_config = str(meta.get("runtime_config") or "")
+    if not runtime_config or not os.path.exists(runtime_config):
+        ownership_cleanup = terminate_instance_owned_processes(meta)
+        meta = refresh_service_instance_status(meta)
+        if service_instance_runtime_active(meta):
+            save_service_instance(meta)
+            result_text = (
+                "推理服务实例停止失败：runtime_config 不存在，但仍检测到存活进程或端口。\n"
+                f"instance_id={instance_id}\n"
+                f"runtime_config={runtime_config}\n"
+                f"status={meta.get('status', '')}\n"
+                f"ownership_cleanup={ownership_cleanup}"
+            )
+            return build_service_stop_response(result_text, stopped=False, meta=meta)
+        meta["status"] = "stopped"
+        meta["finished_at"] = current_time_text()
+        meta["stop_result"] = "runtime_config missing; no live process or port detected"
+        save_service_instance(meta)
+        result_text = (
+            f"推理服务实例已停止（未检测到存活进程或端口）: {instance_id}\n"
+            f"runtime_config={runtime_config}"
+        )
+        return build_service_stop_response(result_text, stopped=True, meta=meta)
+
+    tracked_pids = service_instance_recorded_pids(meta)
+    try:
+        with open(runtime_config, "r", encoding="utf-8") as f:
+            runtime_cfg = yaml.safe_load(f) or {}
+        start_script = str(runtime_cfg.get("ENV", {}).get("START_SCRIPT") or "")
+        if not start_script:
+            raise ValueError("ENV.START_SCRIPT is missing")
+        completed = subprocess.run(
+            ["bash", start_script, "stop", runtime_config],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        result = completed.stdout.strip()
+        return_code = completed.returncode
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        result = f"{type(exc).__name__}: {exc}"
+        return_code = -1
+    except subprocess.TimeoutExpired as exc:
+        result = (exc.stdout or "").strip() if isinstance(exc.stdout, str) else ""
+        result = f"停止命令执行超时。{result}".strip()
+        return_code = -1
+
+    ownership_cleanup = terminate_instance_owned_processes(meta)
+    if ownership_cleanup["matched_pids"]:
+        result = (
+            f"{result}\ninstance_owned_process_cleanup={ownership_cleanup}"
+        ).strip()
+
+    meta["stop_result"] = result
+    meta["stop_return_code"] = return_code
+    for _ in range(10):
+        meta = refresh_service_instance_status(meta)
+        if not service_instance_runtime_active(meta, tracked_pids):
+            break
+        time.sleep(0.5)
+
+    meta = refresh_service_instance_status(meta)
+    stopped = not service_instance_runtime_active(meta, tracked_pids)
+    if stopped:
+        meta["status"] = "stopped"
+        finish_meta_if_missing(meta)
+    save_service_instance(meta)
+
+    if not stopped:
+        result_text = (
+            "推理服务实例未完全停止。\n"
+            f"instance_id={instance_id}\n"
+            f"status={meta.get('status', '')}\n"
+            f"stop_return_code={return_code}\n"
+            f"stop_result={result or '(empty)'}"
+        )
+        return build_service_stop_response(result_text, stopped=False, meta=meta)
+    response = (
+        f"推理服务实例已停止: instance_id={instance_id}\n"
+        f"gpus={meta.get('actual_gpus', '')}\n"
+        f"log_dir={format_agent_relative_path(meta.get('log_dir', ''))}"
+    )
+    if return_code != 0:
+        response += f"\n停止命令返回码={return_code}，但已确认相关 PID 和端口均已释放。"
+    return build_service_stop_response(response, stopped=True, meta=meta)
+
+def preview_service_instance_stop(instance_id: str = "latest") -> dict:
+    access_error = service_instance_access_error(instance_id, "预览停止")
+    if access_error:
+        return build_service_stop_preview_response(access_error, can_apply=False)
+
+    scope = "all" if current_request_is_admin() else "mine"
+    resolved = resolve_service_instance_id(instance_id, scope=scope)
+    if not resolved:
+        text = f"未找到当前用户可预览停止的推理服务实例: {instance_id}"
+        return build_service_stop_preview_response(text, can_apply=False)
+
+    meta = visible_service_instance_meta(resolved)
+    if not meta:
+        text = f"推理服务实例不存在: {resolved}"
+        return build_service_stop_preview_response(text, can_apply=False)
+
+    tasks = running_tasks_for_service_instance(resolved)
+    block_text = running_instance_tasks_block_text(resolved, tasks)
+    runtime_active = service_instance_runtime_active(meta)
+    can_apply = bool(runtime_active and not block_text)
+    lines = [
+        "预览停止推理服务实例（未执行停止）:",
+        f"instance_id={resolved}",
+        f"status={meta.get('status', '')}",
+        f"owner={service_instance_owner(meta)}",
+        f"runtime_active={runtime_active}",
+        f"can_apply={can_apply}",
+        f"gpus={meta.get('actual_gpus', '')}",
+        f"ports={dict(meta.get('ports') or {})}",
+    ]
+    if block_text:
+        lines.extend(["", block_text])
+    elif can_apply:
+        lines.append("该操作将停止当前用户自己的推理服务实例；确认后可调用 service_instance_stop。")
+    else:
+        lines.append("该实例当前无需停止。")
+    text = "\n".join(lines)
+    return build_service_stop_preview_response(
+        text, can_apply=can_apply, meta=meta, running_tasks=tasks
+    )
+
+
+def stop_service_instance(instance_id: str, confirm: bool = False) -> str:
+    meta = visible_service_instance_meta(instance_id)
+    if not meta:
+        return f"推理服务实例不存在: {instance_id}"
+
+    current = current_request_user_id()
+    owner = str(meta.get("owner_user_id") or "").strip()
+    if current_request_is_admin():
+        block_text = running_instance_tasks_block_text(
+            instance_id, running_tasks_for_service_instance(instance_id)
+        )
+        if block_text:
+            return block_text
+        return stop_service_instance_runtime(meta)
+
+    if not current:
+        return (
+            "当前请求缺少用户身份，已拒绝停止推理服务实例。\n"
+            f"instance_id={instance_id}"
+        )
+    if not owner:
+        return (
+            "该推理服务实例没有有效的所有者记录，已拒绝停止。\n"
+            f"instance_id={instance_id}\n"
+            "请通过服务器运维方式处理该历史实例。"
+        )
+    if not service_instance_owned_by_current(meta):
+        return (
+            "该推理服务实例属于其他用户，已拒绝停止。\n"
+            f"instance_id={instance_id}\n"
+            f"status={meta.get('status', '')}\n"
+            "普通工具只允许停止当前用户自己的实例；如需处理残留实例，请由管理员单独处理。"
+        )
+
+    block_text = running_instance_tasks_block_text(
+        instance_id, running_tasks_for_service_instance(instance_id)
+    )
+    if block_text:
+        return block_text
+    return stop_service_instance_runtime(meta)
+
+
+def list_service_instance_tasks_text(instance_id: str = "latest") -> str:
+    access_error = service_instance_access_error(instance_id, "查看关联任务")
+    if access_error:
+        return access_error
+
+    resolved = resolve_service_instance_id(instance_id, scope="mine")
+    if not resolved:
+        return f"未找到推理服务实例: {instance_id}"
+
+    lines = [
+        "推理服务实例任务:",
+        f"current_time={time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"instance_id={resolved}",
+    ]
+
+    benchmark_items = []
+    benchmark_root = get_benchmark_log_dir()
+    for job_id, _, meta in iter_json_records(benchmark_root, "meta.json"):
+        if str(meta.get("service_instance_id") or "") != resolved:
+            continue
+        benchmark_items.append(
+            {
+                "job_id": meta.get("job_id", job_id),
+                "dataset": meta.get("dataset", ""),
+                "mode": meta.get("mode", ""),
+                "status": meta.get("status", ""),
+                "start_time": meta.get("start_time", ""),
+                "end_time": meta.get("end_time", ""),
+                "log": format_agent_relative_path(meta.get("log", "")),
+                "output": format_agent_relative_path(meta.get("output", "")),
+            }
+        )
+    benchmark_items.sort(
+        key=lambda item: (
+            status_sort_rank(item.get("status")),
+            -parse_time_sort_value(item.get("start_time")),
+            str(item.get("job_id") or ""),
+        )
+    )
+
+    test_items = []
+    test_runs_dir = os.path.join(get_test_log_root(), "runs")
+    for test_run_id, _, meta in iter_json_records(test_runs_dir, "status.json"):
+        if str(meta.get("service_instance_id") or "") != resolved:
+            continue
+        test_items.append(
+            {
+                "test_run_id": meta.get("test_run_id", test_run_id),
+                "test_name": meta.get("test_name", ""),
+                "status": meta.get("status", ""),
+                "started_at": meta.get("started_at", ""),
+                "finished_at": meta.get("finished_at", ""),
+                "log_file": format_test_path(meta.get("log_file", "")),
+                "response_log_file": format_test_path(
+                    meta.get("response_log_file", "")
+                ),
+            }
+        )
+    test_items.sort(
+        key=lambda item: (
+            status_sort_rank(item.get("status")),
+            -parse_time_sort_value(item.get("started_at")),
+            str(item.get("test_run_id") or ""),
+        )
+    )
+
+    lines.append("")
+    lines.append(f"Benchmark任务: {len(benchmark_items)}")
+    if benchmark_items:
+        for item in benchmark_items:
+            lines.append(
+                "- "
+                f"job_id={item['job_id']} "
+                f"dataset={item['dataset']} "
+                f"mode={item['mode']} "
+                f"status={item['status']} "
+                f"start_time={item['start_time']} "
+                f"end_time={item['end_time']} "
+                f"log={item['log']} "
+                f"output={item['output']}"
+            )
+    else:
+        lines.append("- none")
+
+    lines.append("")
+    lines.append(f"功能测试任务: {len(test_items)}")
+    if test_items:
+        for item in test_items:
+            lines.append(
+                "- "
+                f"test_run_id={item['test_run_id']} "
+                f"test_name={item['test_name']} "
+                f"status={item['status']} "
+                f"started_at={item['started_at']} "
+                f"finished_at={item['finished_at']} "
+                f"log_file={item['log_file']} "
+                f"response_log_file={item['response_log_file']}"
+            )
+    else:
+        lines.append("- none")
+
+    return "\n".join(lines)
+
+
 def running_benchmark_jobs() -> list[dict]:
     """Return benchmark jobs whose meta.json status is running."""
     base = get_benchmark_log_dir()
-    if not os.path.isdir(base):
-        return []
 
     jobs = []
-    for job_id in os.listdir(base):
-        meta_path = os.path.join(base, job_id, "meta.json")
-        if not os.path.exists(meta_path):
-            continue
-        try:
-            with open(meta_path, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-        except Exception:
-            continue
+    for job_id, meta_path, meta in iter_json_records(base, "meta.json"):
+        meta = refresh_benchmark_job_meta(job_id, meta_path, meta)
         if meta.get("status") != "running":
             continue
         jobs.append(
@@ -1573,7 +5095,49 @@ def running_benchmark_jobs() -> list[dict]:
             }
         )
 
-    return sorted(jobs, key=lambda item: item.get("start_time", ""), reverse=True)
+    return sorted(
+        jobs,
+        key=lambda item: (
+            -parse_time_sort_value(item.get("start_time")),
+            str(item.get("job_id") or ""),
+        ),
+    )
+
+
+def refresh_benchmark_job_meta(
+    job_id: str, meta_path: str, meta: dict, persist: bool = True
+) -> dict:
+    owner_changed = backfill_task_owner_from_instance(meta)
+    if meta.get("status") != "running":
+        return write_meta_if_changed(meta_path, meta, persist and owner_changed)
+
+    pid = int(meta.get("pid") or 0)
+    if pid_is_alive(pid):
+        return write_meta_if_changed(meta_path, meta, persist and owner_changed)
+
+    old_status = str(meta.get("status") or "")
+    return_code = meta.get("return_code")
+    output = str(meta.get("output") or "")
+    has_output = bool(output and os.path.exists(output))
+    if return_code == 0:
+        meta["status"] = "finished"
+    elif return_code is not None:
+        meta["status"] = "failed"
+    elif has_output:
+        meta["status"] = "unknown_finished"
+    else:
+        meta["status"] = "failed"
+        meta["return_code"] = -1
+    finish_meta_if_missing(meta, "end_time")
+    mark_meta_stale_fixed(
+        meta,
+        "benchmark_pid_not_running",
+        job_id=job_id,
+        pid=pid,
+        old_status=old_status,
+        new_status=meta.get("status"),
+    )
+    return write_meta_if_changed(meta_path, meta, persist)
 
 
 def running_benchmark_jobs_text() -> str:
@@ -1601,6 +5165,7 @@ def running_benchmark_jobs_text() -> str:
 
 def tail_logs(service: str = "start", lines: int = 30, run_id: str = "latest") -> str:
     """Summarize important messages in log."""
+    lines = clamp_int(lines, 30, 1, MAX_LOG_LINES)
     paths = get_log_paths(service, run_id)
     existing_paths = [path for path in paths if os.path.exists(path)]
     if not existing_paths:
@@ -1626,6 +5191,7 @@ def logs_search(
     run_id: str = "latest",
 ) -> str:
     """Search keyword in logs."""
+    limit = clamp_int(limit, 20, 1, MAX_LOG_LINES)
     paths = get_log_paths(service, run_id)
     existing_paths = [path for path in paths if os.path.exists(path)]
     if not existing_paths:
@@ -1645,6 +5211,8 @@ def context_log(
     service: str, index: int, window: int = 20, run_id: str = "latest"
 ) -> str:
     """Show log context around a specific line."""
+    index = clamp_int(index, 1, 1, 10**9)
+    window = clamp_int(window, 20, 0, MAX_LOG_CONTEXT_WINDOW)
     if service == "all":
         return 'service="all" is not supported for context_log'
     paths = get_log_paths(service, run_id)
@@ -1660,7 +5228,12 @@ def list_tests() -> str:
     """List all available test scripts."""
     CONFIG = show_config()
     TEST_DIR = CONFIG["ENV"]["TEST_DIR"]
-    return run_command(f"ls {TEST_DIR}/*.sh 2>/dev/null | xargs -n1 basename")
+    if not os.path.isdir(TEST_DIR):
+        return f"测试脚本目录不存在: {TEST_DIR}"
+    scripts = sorted(name for name in os.listdir(TEST_DIR) if name.endswith(".sh"))
+    if not scripts:
+        return "暂无功能测试脚本。"
+    return "\n".join(scripts)
 
 
 def get_test_log_root() -> str:
@@ -1677,9 +5250,26 @@ def get_test_status_path(test_run_id: str) -> str:
     return os.path.join(get_test_log_root(), "runs", test_run_id, "status.json")
 
 
-def resolve_test_run_id(test_run_id: str = "latest") -> str:
+def resolve_test_run_id(test_run_id: str = "latest", scope: str = "mine") -> str:
     if test_run_id and test_run_id != "latest":
         return test_run_id
+    scope = str(scope or "mine").strip().lower()
+    runs_dir = os.path.join(get_test_log_root(), "runs")
+    if os.path.isdir(runs_dir):
+        candidates = []
+        for item_id, status_file, meta in iter_json_records(runs_dir, "status.json"):
+            meta = refresh_test_run_meta(item_id, status_file, meta)
+            if not task_visible_for_scope(meta, scope):
+                continue
+            candidates.append(
+                (
+                    parse_time_sort_value(meta.get("started_at")) or os.path.getmtime(status_file),
+                    item_id,
+                )
+            )
+        if candidates:
+            candidates.sort(key=lambda item: (-item[0], item[1]))
+            return candidates[0][1]
     latest_path = get_test_latest_path()
     if not os.path.exists(latest_path):
         raise FileNotFoundError(f"暂无测试状态记录: {latest_path}")
@@ -1699,20 +5289,216 @@ def format_test_path(path: str) -> str:
     return format_agent_relative_path(resolve_test_runtime_path(path))
 
 
-def running_tests_text() -> str:
+def _refresh_test_run_meta_value(test_run_id: str, meta: dict) -> tuple[dict, bool]:
+    changed = backfill_task_owner_from_instance(meta)
+    if meta.get("status") != "running":
+        return meta, changed
+
+    tests = meta.get("tests") or {}
+    old_status = str(meta.get("status") or "")
+    if tests:
+        active_found = False
+        for item in tests.values():
+            item_status = item.get("status")
+            pid = int(item.get("pid") or 0)
+            if item_status == "pending":
+                active_found = True
+                continue
+            if item_status == "running":
+                if pid_is_alive(pid):
+                    active_found = True
+                else:
+                    item["status"] = "unknown_finished"
+                    finish_meta_if_missing(item)
+                    changed = True
+        if not active_found:
+            statuses = {item.get("status") for item in tests.values()}
+            if "failed" in statuses:
+                meta["status"] = "failed"
+            elif "unknown_finished" in statuses:
+                meta["status"] = "unknown_finished"
+            else:
+                meta["status"] = "finished"
+            finish_meta_if_missing(meta)
+            changed = True
+    else:
+        script_pid = int(meta.get("script_pid") or 0)
+        if not pid_is_alive(script_pid):
+            meta["status"] = "unknown_finished"
+            finish_meta_if_missing(meta)
+            changed = True
+
+    if changed:
+        mark_meta_stale_fixed(
+            meta,
+            "test_pid_not_running",
+            test_run_id=test_run_id,
+            old_status=old_status,
+            new_status=meta.get("status"),
+        )
+    return meta, changed
+
+
+def refresh_test_run_meta(
+    test_run_id: str, status_file: str, meta: dict, persist: bool = True
+) -> dict:
+    if not persist:
+        return _refresh_test_run_meta_value(test_run_id, meta)[0]
+
+    with json_file_lock(status_file):
+        current = load_json_file(status_file, None)
+        if not isinstance(current, dict) or not current:
+            return meta
+        current, changed = _refresh_test_run_meta_value(test_run_id, current)
+        return write_meta_if_changed(status_file, current, changed)
+
+
+def running_tests_payload(
+    instance_id: str = "", limit: int = DEFAULT_LIST_LIMIT, scope: str = "mine"
+) -> dict:
+    runs_dir = os.path.join(get_test_log_root(), "runs")
+    limit = clamp_int(limit, DEFAULT_LIST_LIMIT, 1, MAX_LIST_LIMIT)
+    scope = str(scope or "mine").strip().lower()
+    payload = {
+        "operation": "list_running",
+        "scope": scope,
+        "instance_id": "",
+        "limit": limit,
+        "items": [],
+        "summary": {"total": 0, "returned": 0},
+    }
+    if not os.path.isdir(runs_dir):
+        payload.update({"status": "not_found", "error": f"暂无功能测试运行记录: {runs_dir}"})
+        return payload
+    if scope not in {"mine", "all"}:
+        payload.update({"status": "error", "error": "Invalid scope. Use mine or all."})
+        return payload
+    forbidden = scope_all_forbidden_message(scope)
+    if forbidden:
+        payload.update({"status": "forbidden", "error": forbidden})
+        payload["summary"].update({"error": forbidden})
+        return payload
+
+    resolved_instance_id = ""
+    if instance_id:
+        access_error = (
+            service_instance_access_error(instance_id, "查看功能测试")
+            if scope != "all"
+            else ""
+        )
+        if access_error:
+            payload.update({"status": "forbidden", "error": access_error})
+            return payload
+        resolved_instance_id = resolve_service_instance_id(
+            instance_id, scope=scope, require_running=False
+        )
+        if not resolved_instance_id:
+            payload.update({"status": "not_found", "error": f"未找到推理服务实例: {instance_id}"})
+            return payload
+        payload["instance_id"] = resolved_instance_id
+
+    running_items = []
+    records = sorted(
+        iter_json_records(runs_dir, "status.json"),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+    for test_run_id, status_file, meta in records:
+        meta = refresh_test_run_meta(test_run_id, status_file, meta)
+        if resolved_instance_id and str(meta.get("service_instance_id") or "") != resolved_instance_id:
+            continue
+        if not task_visible_for_scope(meta, scope):
+            continue
+        if meta.get("status") != "running":
+            continue
+        tests = meta.get("tests") or {}
+        if tests:
+            for name, item in tests.items():
+                if item.get("status") == "running":
+                    running_items.append({
+                        "test_run_id": test_run_id,
+                        "test_name": meta.get("test_name"),
+                        "script": name,
+                        "pid": item.get("pid"),
+                        "port": item.get("port"),
+                        "started_at": item.get("started_at"),
+                        "log_file": format_test_path(item.get("log_file")),
+                        "run_started_at": meta.get("started_at"),
+                        "owner_user_id": task_owner_user_id(meta),
+                        "owner": task_owner_label(meta),
+                    })
+        else:
+            script_pid = int(meta.get("script_pid") or 0)
+            if script_pid and is_process_running(script_pid):
+                running_items.append({
+                    "test_run_id": test_run_id,
+                    "test_name": meta.get("test_name"),
+                    "script": meta.get("test_name"),
+                    "pid": script_pid,
+                    "port": None,
+                    "started_at": meta.get("started_at"),
+                    "log_file": format_test_path(meta.get("response_log_file") or meta.get("log_file")),
+                    "run_started_at": meta.get("started_at"),
+                    "owner_user_id": task_owner_user_id(meta),
+                    "owner": task_owner_label(meta),
+                })
+
+    visible_items = running_items[:limit]
+    payload["items"] = visible_items
+    payload["summary"] = {
+        "total": len(running_items),
+        "returned": len(visible_items),
+        "scope": scope,
+        "instance_id": resolved_instance_id or None,
+        "limit": limit,
+    }
+    payload["status"] = "ok"
+    return payload
+
+
+def running_tests_text(
+    instance_id: str = "", limit: int = DEFAULT_LIST_LIMIT, scope: str = "mine"
+) -> str:
     runs_dir = os.path.join(get_test_log_root(), "runs")
     if not os.path.isdir(runs_dir):
         return f"暂无功能测试运行记录: {runs_dir}"
+    limit = clamp_int(limit, DEFAULT_LIST_LIMIT, 1, MAX_LIST_LIMIT)
+    scope = str(scope or "mine").strip().lower()
+    if scope not in {"mine", "all"}:
+        return "Invalid scope. Use mine or all."
+    forbidden = scope_all_forbidden_message(scope)
+    if forbidden:
+        return forbidden
+
+    resolved_instance_id = ""
+    if instance_id:
+        access_error = (
+            service_instance_access_error(instance_id, "查看功能测试")
+            if scope != "all"
+            else ""
+        )
+        if access_error:
+            return access_error
+        resolved_instance_id = resolve_service_instance_id(
+            instance_id, scope=scope, require_running=False
+        )
+        if not resolved_instance_id:
+            return f"未找到推理服务实例: {instance_id}"
 
     running_items = []
-    for test_run_id in sorted(os.listdir(runs_dir), reverse=True):
-        status_file = os.path.join(runs_dir, test_run_id, "status.json")
-        if not os.path.isfile(status_file):
+    records = sorted(
+        iter_json_records(runs_dir, "status.json"),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+    for test_run_id, status_file, meta in records:
+        meta = refresh_test_run_meta(test_run_id, status_file, meta)
+        if (
+            resolved_instance_id
+            and str(meta.get("service_instance_id") or "") != resolved_instance_id
+        ):
             continue
-        try:
-            with open(status_file, "r") as f:
-                meta = json.load(f)
-        except json.JSONDecodeError:
+        if not task_visible_for_scope(meta, scope):
             continue
         if meta.get("status") != "running":
             continue
@@ -1731,6 +5517,7 @@ def running_tests_text() -> str:
                             "started_at": item.get("started_at"),
                             "log_file": format_test_path(item.get("log_file")),
                             "run_started_at": meta.get("started_at"),
+                            "owner": task_owner_label(meta),
                         }
                     )
         else:
@@ -1748,25 +5535,58 @@ def running_tests_text() -> str:
                             meta.get("response_log_file") or meta.get("log_file")
                         ),
                         "run_started_at": meta.get("started_at"),
+                        "owner": task_owner_label(meta),
                     }
                 )
 
     if not running_items:
+        if resolved_instance_id:
+            return (
+                "当前实例没有正在运行的功能测试脚本。\n"
+                f"instance_id={resolved_instance_id}\n"
+                f"current_time={time.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
         return (
             "当前没有正在运行的功能测试脚本。\n"
             f"current_time={time.strftime('%Y-%m-%d %H:%M:%S')}"
         )
 
+    running_items.sort(
+        key=lambda item: (
+            -parse_time_sort_value(item.get("started_at") or item.get("run_started_at")),
+            str(item.get("test_run_id") or ""),
+            str(item.get("script") or ""),
+        )
+    )
+
+    visible_items = running_items[:limit]
     lines = [
-        "正在运行的功能测试脚本:",
+        f"正在运行的功能测试脚本(scope={scope}):",
         f"current_time={time.strftime('%Y-%m-%d %H:%M:%S')}",
         f"running={len(running_items)}",
+        f"显示 {len(visible_items)} / {len(running_items)} 条，limit={limit}",
     ]
-    for item in running_items:
+    if scope == "all":
+        owner_counts = {"self": 0, "other": 0, "unknown": 0}
+        for item in running_items:
+            owner = item.get("owner") if item.get("owner") in owner_counts else "unknown"
+            owner_counts[owner] += 1
+        lines.append(
+            "owner统计: "
+            f"self={owner_counts['self']}, "
+            f"other={owner_counts['other']}, "
+            f"unknown={owner_counts['unknown']}"
+        )
+    if len(running_items) > limit:
+        lines.append(f"还有 {len(running_items) - limit} 条未显示，可增大 limit 查看。")
+    if resolved_instance_id:
+        lines.append(f"instance_id={resolved_instance_id}")
+    for item in visible_items:
         lines.append(
             "- "
             f"test_run_id={item['test_run_id']}, "
             f"test_name={item.get('test_name')}, "
+            f"owner={item.get('owner')}, "
             f"script={item.get('script')}, "
             f"pid={item.get('pid')}, "
             f"port={item.get('port')}, "
@@ -1778,22 +5598,24 @@ def running_tests_text() -> str:
 
 def monitor_test_job(test_run_id: str, proc: subprocess.Popen, status_file: str):
     exit_code = proc.wait()
-    with open(status_file, "r") as f:
-        meta = json.load(f)
-    if meta.get("status") != "running":
-        return
-    meta["status"] = "finished" if exit_code == 0 else "failed"
-    meta["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    meta["exit_code"] = exit_code
-    atomic_write_json(status_file, meta)
+
+    def finish(meta):
+        if meta.get("status") != "running":
+            return
+        meta["status"] = "finished" if exit_code == 0 else "failed"
+        meta["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        meta["exit_code"] = exit_code
+
+    update_all_test_status(status_file, finish)
 
 
 def update_all_test_status(status_file: str, update_fn):
-    with open(status_file, "r") as f:
-        meta = json.load(f)
-    update_fn(meta)
-    atomic_write_json(status_file, meta)
-    return meta
+    with json_file_lock(status_file):
+        with open(status_file, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        update_fn(meta)
+        atomic_write_json(status_file, meta)
+        return meta
 
 
 def mark_remaining_tests(tests: dict, status: str):
@@ -1814,14 +5636,15 @@ def run_all_test_job(
 ):
     failed = False
     for script_name in scripts:
-        with open(status_file, "r") as f:
-            meta = json.load(f)
+        def prepare(meta):
+            if meta.get("status") != "running":
+                mark_remaining_tests(meta.get("tests", {}), "stopped")
+                meta["finished_at"] = meta.get("finished_at") or time.strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+
+        meta = update_all_test_status(status_file, prepare)
         if meta.get("status") != "running":
-            mark_remaining_tests(meta.get("tests", {}), "stopped")
-            meta["finished_at"] = meta.get("finished_at") or time.strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-            atomic_write_json(status_file, meta)
             return
 
         port = (
@@ -1843,60 +5666,77 @@ def run_all_test_job(
                 stderr=subprocess.STDOUT,
                 env=proc_env,
                 cwd=test_cwd,
-                preexec_fn=os.setsid,
+                start_new_session=True,
             )
 
         def mark_running(meta):
+            if meta.get("status") != "running":
+                return
             item = meta["tests"][script_name]
             item["status"] = "running"
             item["pid"] = proc.pid
             item["port"] = port
             item["started_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
 
-        update_all_test_status(status_file, mark_running)
+        meta = update_all_test_status(status_file, mark_running)
+        if meta.get("status") != "running":
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            return
         exit_code = proc.wait()
 
-        with open(status_file, "r") as f:
-            meta = json.load(f)
-        if meta.get("status") != "running":
-            if is_process_running(proc.pid):
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
+        def finish_script(meta):
             item = meta["tests"][script_name]
-            item["status"] = "stopped"
+            if meta.get("status") != "running":
+                item["status"] = "stopped"
+                item["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                item["exit_code"] = None
+                mark_remaining_tests(meta.get("tests", {}), "stopped")
+                meta["finished_at"] = meta.get("finished_at") or time.strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                return
+            item["status"] = "finished" if exit_code == 0 else "failed"
             item["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            item["exit_code"] = None
-            mark_remaining_tests(meta.get("tests", {}), "stopped")
-            meta["finished_at"] = meta.get("finished_at") or time.strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-            atomic_write_json(status_file, meta)
+            item["exit_code"] = exit_code
+            item["pid"] = proc.pid
+
+        meta = update_all_test_status(status_file, finish_script)
+        if meta.get("status") != "running":
             return
-
-        item = meta["tests"][script_name]
-        item["status"] = "finished" if exit_code == 0 else "failed"
-        item["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        item["exit_code"] = exit_code
-        item["pid"] = proc.pid
         failed = failed or exit_code != 0
-        atomic_write_json(status_file, meta)
 
-    with open(status_file, "r") as f:
-        meta = json.load(f)
-    if meta.get("status") != "running":
-        return
-    meta["status"] = "failed" if failed else "finished"
-    meta["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    meta["exit_code"] = 1 if failed else 0
-    atomic_write_json(status_file, meta)
+    def finish_all(meta):
+        if meta.get("status") != "running":
+            return
+        meta["status"] = "failed" if failed else "finished"
+        meta["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        meta["exit_code"] = 1 if failed else 0
+
+    update_all_test_status(status_file, finish_all)
 
 
 def start_test_job(
-    test_name: str = "basicmedicalrecord.sh", run_all: bool = False
+    test_name: str = "basicmedicalrecord.sh",
+    run_all: bool = False,
+    instance_id: str = "latest",
 ) -> str:
-    CONFIG = show_config()
+    try:
+        resolved_task_instance_id = resolve_task_service_instance_id(
+            instance_id, "功能测试"
+        )
+    except ValueError as e:
+        return str(e)
+    if resolved_task_instance_id:
+        instance_id = resolved_task_instance_id
+
+    instance_config = require_running_service_instance_config(instance_id)
+    if isinstance(instance_config, str):
+        return instance_config
+    resolved_instance_id, CONFIG, instance_meta = instance_config
+
     TEST_DIR = CONFIG["ENV"]["TEST_DIR"]
     test_cwd = os.path.abspath(TEST_DIR)
     host = CONFIG["ENV"]["HOST_IP"]
@@ -1971,7 +5811,7 @@ def start_test_job(
                 stderr=subprocess.STDOUT,
                 env=proc_env,
                 cwd=test_cwd,
-                preexec_fn=os.setsid,
+                start_new_session=True,
             )
 
     meta = {
@@ -1987,6 +5827,12 @@ def start_test_job(
         "response_log_dir": response_log_dir,
         "response_log_file": response_log_file,
         "status_file": status_file_rel,
+        "service_instance_id": resolved_instance_id,
+        "service_run_id": instance_meta.get("run_id"),
+        "owner_user_id": instance_meta.get("owner_user_id") or current_request_user_id(),
+        "created_by_user_id": current_request_user_id(),
+        "request_user_id": current_request_user_id(),
+        "service_ports": instance_ports_from_runtime_config(CONFIG),
     }
     if run_all:
         meta["tests"] = tests
@@ -2022,6 +5868,7 @@ def start_test_job(
     return (
         "测试任务已提交，正在后台运行。\n"
         f"test_run_id: {test_run_id}\n"
+        f"service_instance_id: {resolved_instance_id}\n"
         f"test_name: {selected_test}\n"
         f"script_pid: {None if run_all else proc.pid}\n"
         f"log_file: {format_agent_relative_path(log_file)}\n"
@@ -2029,12 +5876,21 @@ def start_test_job(
     )
 
 
-def test_status_text(test_run_id: str = "latest", lines: int = 30) -> str:
+def test_status_text(
+    test_run_id: str = "latest",
+    lines: int = 30,
+    instance_id: str = "",
+    limit: int = DEFAULT_LIST_LIMIT,
+    scope: str = "mine",
+) -> str:
     if test_run_id == "all":
-        return running_tests_text()
+        return running_tests_text(instance_id, limit, scope)
+    scope = str(scope or "mine").strip().lower()
+    if scope not in {"mine", "all"}:
+        return "Invalid scope. Use mine or all."
 
     try:
-        test_run_id = resolve_test_run_id(test_run_id)
+        test_run_id = resolve_test_run_id(test_run_id, scope)
     except FileNotFoundError as e:
         return str(e)
 
@@ -2048,6 +5904,13 @@ def test_status_text(test_run_id: str = "latest", lines: int = 30) -> str:
 
     with open(status_file, "r") as f:
         meta = json.load(f)
+    meta = refresh_test_run_meta(test_run_id, status_file, meta)
+    if not task_visible_for_scope(meta, scope):
+        return (
+            "该功能测试任务属于其他用户，默认不显示。\n"
+            f"test_run_id={test_run_id}\n"
+            "如需只读查看全部任务，请使用 scope=all。"
+        )
 
     script_pid = int(meta.get("script_pid") or 0)
     script_running = is_process_running(script_pid) if script_pid else False
@@ -2096,6 +5959,9 @@ def test_status_text(test_run_id: str = "latest", lines: int = 30) -> str:
                 f"stored_status={meta.get('status')}",
                 f"test_run_id={meta.get('test_run_id', test_run_id)}",
                 f"test_name={meta.get('test_name')}",
+                f"owner={task_owner_label(meta)}",
+                f"service_instance_id={meta.get('service_instance_id', '')}",
+                f"service_run_id={meta.get('service_run_id', '')}",
                 f"script_pid={script_pid}",
                 f"script_running={script_running}",
                 f"exit_code={meta.get('exit_code')}",
@@ -2110,9 +5976,82 @@ def test_status_text(test_run_id: str = "latest", lines: int = 30) -> str:
     )
 
 
-def test_stop_text(test_run_id: str = "latest") -> str:
+def test_run_is_active(meta: dict) -> bool:
+    if meta.get("status") != "running":
+        return False
+    tests = meta.get("tests") or {}
+    if tests:
+        for item in tests.values():
+            if item.get("status") == "running" and pid_is_alive(item.get("pid")):
+                return True
+        return False
+    script_pid = int(meta.get("script_pid") or 0)
+    return bool(script_pid and pid_is_alive(script_pid))
+
+
+def stop_test_run_runtime(test_run_id: str, status_file: str, meta: dict) -> str:
+    """Stop one test run after the caller has completed authorization checks."""
+    with json_file_lock(status_file):
+        meta = load_json_file(status_file, {})
+        status = meta.get("status")
+        script_pid = int(meta.get("script_pid") or 0)
+        if status != "running":
+            return (
+                f"测试任务无需停止: status={status}, test_run_id={test_run_id}, "
+                f"log_file={format_test_path(meta.get('log_file'))}"
+            )
+
+        tests = meta.get("tests") or {}
+        stopped_pid = None
+        if tests:
+            for item in tests.values():
+                if item.get("status") == "running" and item.get("pid"):
+                    stopped_pid = int(item["pid"])
+                    try:
+                        os.killpg(os.getpgid(stopped_pid), signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    except Exception as e:
+                        return (
+                            f"停止测试失败: test_run_id={test_run_id}, "
+                            f"pid={stopped_pid}, error={e}"
+                        )
+                    break
+            mark_remaining_tests(tests, "stopped")
+        elif script_pid and is_process_running(script_pid):
+            try:
+                os.killpg(os.getpgid(script_pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except Exception as e:
+                return (
+                    f"停止测试失败: test_run_id={test_run_id}, "
+                    f"pid={script_pid}, error={e}"
+                )
+
+        meta["status"] = "stopped"
+        meta["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        meta["exit_code"] = None
+        atomic_write_json(status_file, meta)
+
+    if tests:
+        return (
+            f"测试任务已停止: test_run_id={test_run_id}, pid={stopped_pid}\n"
+            f"log_file={format_test_path(meta.get('log_file'))}"
+        )
+    if not script_pid or not is_process_running(script_pid):
+        return f"测试进程已不存在，状态已标记为 stopped: test_run_id={test_run_id}"
+    return (
+        f"测试任务已停止: test_run_id={test_run_id}, pid={script_pid}\n"
+        f"log_file={format_test_path(meta.get('log_file'))}"
+    )
+
+
+def test_stop_text(
+    test_run_id: str = "latest", confirm: bool = False, scope: str = "mine"
+) -> str:
     try:
-        test_run_id = resolve_test_run_id(test_run_id)
+        test_run_id = resolve_test_run_id(test_run_id, scope)
         status_file = get_test_status_path(test_run_id)
     except FileNotFoundError as e:
         return str(e)
@@ -2124,89 +6063,172 @@ def test_stop_text(test_run_id: str = "latest") -> str:
 
     with open(status_file, "r") as f:
         meta = json.load(f)
+    meta = refresh_test_run_meta(test_run_id, status_file, meta)
 
     status = meta.get("status")
-    script_pid = int(meta.get("script_pid") or 0)
-    if status != "running":
-        return (
-            f"测试任务无需停止: status={status}, test_run_id={test_run_id}, "
-            f"log_file={format_test_path(meta.get('log_file'))}"
-        )
+    owner = task_owner_user_id(meta)
+    current = current_request_user_id()
+    if not current:
+        return "当前请求缺少用户身份，已拒绝停止功能测试任务。"
+    if not current_request_is_admin():
+        if not owner:
+            return (
+                "该功能测试任务没有有效的所有者记录，已拒绝停止。\n"
+                f"test_run_id={test_run_id}"
+            )
+        if not task_owned_by_current(meta):
+            return (
+                "该功能测试任务属于其他用户，已拒绝停止。\n"
+                f"test_run_id={test_run_id}\n"
+                f"status={status}\n"
+                "普通工具只允许停止当前用户自己的功能测试任务。"
+            )
 
-    tests = meta.get("tests") or {}
-    if tests:
-        stopped_pid = None
-        for item in tests.values():
-            if item.get("status") == "running" and item.get("pid"):
-                stopped_pid = int(item["pid"])
-                try:
-                    os.killpg(os.getpgid(stopped_pid), signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                except Exception as e:
-                    return (
-                        f"停止测试失败: test_run_id={test_run_id}, "
-                        f"pid={stopped_pid}, error={e}"
-                    )
-                break
+    return stop_test_run_runtime(test_run_id, status_file, meta)
 
-        meta["status"] = "stopped"
-        meta["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        meta["exit_code"] = None
-        mark_remaining_tests(tests, "stopped")
-        atomic_write_json(status_file, meta)
-        return (
-            f"测试任务已停止: test_run_id={test_run_id}, pid={stopped_pid}\n"
-            f"log_file={format_test_path(meta.get('log_file'))}"
-        )
 
-    if not script_pid or not is_process_running(script_pid):
-        meta["status"] = "stopped"
-        meta["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        meta["exit_code"] = None
-        atomic_write_json(status_file, meta)
-        return f"测试进程已不存在，状态已标记为 stopped: test_run_id={test_run_id}"
-
+def preview_test_stop(
+    test_run_id: str = "latest", scope: str = "mine"
+) -> dict:
+    operation = "preview"
     try:
-        os.killpg(os.getpgid(script_pid), signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    except Exception as e:
-        return f"停止测试失败: test_run_id={test_run_id}, pid={script_pid}, error={e}"
+        resolved = resolve_test_run_id(test_run_id, scope)
+        status_file = get_test_status_path(resolved)
+    except FileNotFoundError as e:
+        text = str(e)
+        return build_local_tool_response(
+            text,
+            {
+                "test_run_stop": {
+                    "operation": operation,
+                    "test_run_id": test_run_id,
+                    "can_apply": False,
+                    "stopped": False,
+                    "result": text,
+                }
+            },
+        )
+    except ValueError:
+        text = "Invalid test_run_id"
+        return build_local_tool_response(
+            text,
+            {
+                "test_run_stop": {
+                    "operation": operation,
+                    "test_run_id": test_run_id,
+                    "can_apply": False,
+                    "stopped": False,
+                    "result": text,
+                }
+            },
+        )
 
-    meta["status"] = "stopped"
-    meta["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    meta["exit_code"] = None
-    atomic_write_json(status_file, meta)
-    return (
-        f"测试任务已停止: test_run_id={test_run_id}, pid={script_pid}\n"
-        f"log_file={format_test_path(meta.get('log_file'))}"
+    if not os.path.exists(status_file):
+        text = f"测试状态文件不存在: {status_file}"
+        return build_local_tool_response(
+            text,
+            {
+                "test_run_stop": {
+                    "operation": operation,
+                    "test_run_id": resolved,
+                    "can_apply": False,
+                    "stopped": False,
+                    "result": text,
+                }
+            },
+        )
+
+    with open(status_file, "r") as f:
+        meta = json.load(f)
+    meta = refresh_test_run_meta(resolved, status_file, meta, persist=False)
+    status = str(meta.get("status") or "")
+    owner = task_owner_user_id(meta)
+    current = current_request_user_id()
+    if not current:
+        text = "当前请求缺少用户身份，已拒绝预览停止功能测试任务。"
+        can_apply = False
+    elif not current_request_is_admin() and not owner:
+        text = f"该功能测试任务没有有效的所有者记录，已拒绝预览停止。\ntest_run_id={resolved}"
+        can_apply = False
+    elif not current_request_is_admin() and not task_owned_by_current(meta):
+        text = (
+            "该功能测试任务属于其他用户，已拒绝预览停止。\n"
+            f"test_run_id={resolved}\n"
+            f"status={status}\n"
+            "普通工具只允许预览停止当前用户自己的功能测试任务。"
+        )
+        can_apply = False
+    else:
+        can_apply = status == "running"
+        text = (
+            "预览停止功能测试（未执行停止）:\n"
+            f"test_run_id={resolved}\n"
+            f"status={status}\n"
+            f"owner={task_owner_label(meta)}\n"
+            f"service_instance_id={meta.get('service_instance_id', '')}\n"
+            f"pid={int(meta.get('script_pid') or 0)}\n"
+            f"log_file={format_test_path(meta.get('log_file', ''))}\n"
+            f"can_apply={can_apply}"
+        )
+        if can_apply:
+            text += "\n该操作将停止当前用户自己的功能测试任务；确认后可调用 service_test_stop。"
+        else:
+            text += "\n该测试任务当前无需停止。"
+
+    return build_local_tool_response(
+        text,
+        {
+            "test_run_stop": {
+                "operation": operation,
+                "test_run_id": resolved,
+                "test_status": status,
+                "owner_user_id": owner,
+                "service_instance_id": str(meta.get("service_instance_id") or ""),
+                "pid": int(meta.get("script_pid") or 0),
+                "can_apply": can_apply,
+                "stopped": False,
+                "result": text,
+            }
+        },
     )
 
 
-def start_single_test(test_name: str) -> str:
+def start_single_test(test_name: str, instance_id: str = "latest") -> str:
     """Run a specific test script."""
-    return start_test_job(test_name=test_name, run_all=False)
+    return start_test_job(test_name=test_name, run_all=False, instance_id=instance_id)
 
 
-def start_all_tests() -> str:
+def start_all_tests(instance_id: str = "latest") -> str:
     """Run all test scripts in test directory."""
-    return start_test_job(run_all=True)
+    return start_test_job(run_all=True, instance_id=instance_id)
 
-
-def restart_service_stack() -> str:
-    """Restart inference service stack."""
-    stop_result = stop_service()
-    time.sleep(10)
-    config_msg = check_config_validity()
-    if not config_msg["ok"]:
-        return (
-            "旧服务已停止，并已等待 15 秒释放 GPU 资源，但重启前检查不通过，新服务未启动。\n"
-            f"停止结果: {stop_result}\n"
-            f"原因: {config_msg['reason']}\n"
-            f"分析: {config_msg['analysis']}"
+#deepseek
+#def restart_service_stack() -> str:
+def restart_service_stack():
+    """Restart the current user's latest inference service instance."""
+    stop_response = stop_service()
+    stop_result = local_tool_text(stop_response)
+    if any(
+        marker in stop_result
+        for marker in (
+            "暂不能自动选择",
+            "暂不停止",
+            "已拒绝",
+            "不能停止",
         )
-    return start_service()
+    ):
+        return f"停止结果:\n{stop_result}\n\n未继续重新启动。"
+    time.sleep(10)
+    #deepseek
+    #start_result = start_service()
+    #return f"停止结果:\n{stop_result}\n\n重新启动结果:\n{start_result}"
+    start_response = start_service()
+    start_text = local_tool_text(start_response)
+    result_text = f"停止结果:\n{stop_result}\n\n重新启动结果:\n{start_text}"
+    return build_local_tool_response(
+        result_text,
+        local_tool_response_data(start_response),
+    )
 
 
 def flatten_config_keys(d, prefix=""):
@@ -2222,18 +6244,96 @@ def flatten_config_keys(d, prefix=""):
 
 
 def update_config(key: str, value: str) -> dict:
-    """Update service config value."""
-    if isinstance(value, str):
-        run_command(f"yq -y -i '.{key} = \"{value}\"' {CONFIG_FILE}")
-    else:
-        run_command(f"yq -y -i '.{key} = {value}' {CONFIG_FILE}")
-    return f"更新配置文件 {CONFIG_FILE}: .{key} = {value}"
+    """Update current user's draft service config value."""
+    if not current_request_user_id():
+        return "当前请求缺少 user_id，拒绝修改全局配置。"
+    config_path = ensure_user_draft_config()
+    cfg = show_config()
+    current = cfg
+    parts = key.split(".")
+    for part in parts[:-1]:
+        current = current.setdefault(part, {})
+        if not isinstance(current, dict):
+            return f"Invalid key path: {key}"
+    old_value = current.get(parts[-1])
+    new_value = value
+    if isinstance(old_value, bool):
+        new_value = str(value).strip().lower() in {"1", "true", "yes", "on"}
+    elif isinstance(old_value, int) and not isinstance(old_value, bool):
+        try:
+            new_value = int(value)
+        except (TypeError, ValueError):
+            return f"Invalid integer value for {key}: {value}"
+    elif isinstance(old_value, float):
+        try:
+            new_value = float(value)
+        except (TypeError, ValueError):
+            return f"Invalid float value for {key}: {value}"
+    current[parts[-1]] = new_value
+    write_user_draft_config(config_path, cfg)
+
+    user_id = current_request_user_id()
+    if user_id:
+        meta_path = get_user_config_meta_path(user_id)
+        meta = load_json_file(meta_path, {})
+        if not isinstance(meta, dict):
+            meta = {}
+        meta.update(
+            {
+                "user_id": user_id,
+                "user_key": user_config_key(user_id),
+                "source_config": CONFIG_FILE,
+                "draft_config": config_path,
+                "updated_at": current_time_text(),
+            }
+        )
+        if "created_at" not in meta:
+            meta["created_at"] = current_time_text()
+        atomic_write_json(meta_path, meta)
+
+    return f"更新当前用户配置草稿 {config_path}: .{key} = {new_value}"
+
+
+def get_config_value(cfg: dict, key: str):
+    current = cfg
+    for part in key.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def config_value_equal(current, value) -> bool:
+    if isinstance(current, (int, float)) and str(value).strip():
+        try:
+            return float(current) == float(value)
+        except ValueError:
+            return False
+    return str(current) == str(value)
 
 
 def restore_default_config() -> str:
-    """Restore config file from default backup."""
-    run_command(f"cp {DEFAULT_CONFIG_FILE} {CONFIG_FILE}")
-    return "Configuration restored to defaults."
+    """Restore current user's draft config from default backup."""
+    user_id = current_request_user_id()
+    if not user_id:
+        return "当前请求缺少 user_id，拒绝恢复全局配置。"
+    draft_path = get_user_draft_config_path(user_id)
+    os.makedirs(os.path.dirname(draft_path), exist_ok=True)
+    with open(DEFAULT_CONFIG_FILE) as f:
+        cfg = yaml.safe_load(f) or {}
+    write_user_draft_config(draft_path, cfg)
+    atomic_write_json(
+        get_user_config_meta_path(user_id),
+        {
+            "user_id": user_id,
+            "user_key": user_config_key(user_id),
+            "source_config": DEFAULT_CONFIG_FILE,
+            "draft_config": draft_path,
+            "created_at": current_time_text(),
+            "updated_at": current_time_text(),
+        },
+    )
+    return f"当前用户配置草稿已恢复默认: {draft_path}"
 
 
 def model_list_text() -> str:
@@ -2317,8 +6417,10 @@ def format_dataset_candidates(files: list[str], query: str, limit: int = 40) -> 
     return "\n".join(lines)
 
 
-def resolve_medical_choice_dataset_path(dataset: str) -> str:
-    benchmark_dir = get_medical_benchmark_dir()
+def resolve_medical_choice_dataset_path(
+    dataset: str, benchmark_dir: Optional[str] = None
+) -> str:
+    benchmark_dir = benchmark_dir or get_medical_benchmark_dir()
     dataset = dataset.strip()
     if dataset.startswith("medical/choice/"):
         dataset = dataset.split("/", 2)[2]
@@ -2335,16 +6437,24 @@ def resolve_medical_choice_dataset_path(dataset: str) -> str:
     return resolve_benchmark_path(benchmark_dir, relative + ".json")
 
 
-def medical_choice_candidates(dataset: str) -> str:
-    choice_dir = get_medical_choice_dir()
+def medical_choice_candidates(dataset: str, benchmark_dir: Optional[str] = None) -> str:
+    choice_dir = (
+        os.path.join(benchmark_dir, "choice")
+        if benchmark_dir
+        else get_medical_choice_dir()
+    )
     if not os.path.isdir(choice_dir):
         return f"医疗选择题目录不存在: {choice_dir}"
     files = sorted(f for f in os.listdir(choice_dir) if f.endswith(".json"))
     return format_dataset_candidates(files, dataset)
 
 
-def medbench_candidates(dataset: str) -> str:
-    medbench_dir = get_medbench_dir()
+def medbench_candidates(dataset: str, benchmark_dir: Optional[str] = None) -> str:
+    medbench_dir = (
+        os.path.join(benchmark_dir, "medbench")
+        if benchmark_dir
+        else get_medbench_dir()
+    )
     if not os.path.isdir(medbench_dir):
         return f"MedBench目录不存在: {medbench_dir}"
     files = sorted(f for f in os.listdir(medbench_dir) if f.endswith(".jsonl"))
@@ -2379,34 +6489,195 @@ def monitor_job(job_id: str, proc: subprocess.Popen, meta_path: str):
     atomic_write_json(meta_path, meta)
 
 
+def make_benchmark_job_paths(output_name: str = "result.json", output_is_dir: bool = False) -> dict:
+    start_time = time.strftime("%Y-%m-%d %H:%M:%S")
+    job_id = f"{int(time.time())}_{str(uuid.uuid4())[:6]}"
+    job_dir = os.path.join(get_benchmark_log_dir(), job_id)
+    os.makedirs(job_dir, exist_ok=True)
+
+    output_path = os.path.join(job_dir, output_name)
+    if output_is_dir:
+        os.makedirs(output_path, exist_ok=True)
+
+    return {
+        "job_id": job_id,
+        "job_dir": job_dir,
+        "meta_file": os.path.join(job_dir, "meta.json"),
+        "log_file": os.path.join(job_dir, "run.log"),
+        "output": output_path,
+        "start_time": start_time,
+    }
+
+
+def start_benchmark_process(cmd: list[str], log_file: str) -> subprocess.Popen:
+    log_f = open(log_file, "w")
+    return subprocess.Popen(
+        cmd,
+        stdout=log_f,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+
+
+def benchmark_service_meta(
+    resolved_instance_id: str, cfg: dict, instance_meta: dict
+) -> dict:
+    return {
+        "owner_user_id": instance_meta.get("owner_user_id") or current_request_user_id(),
+        "service_instance_id": resolved_instance_id,
+        "service_run_id": instance_meta.get("run_id"),
+        "service_ports": instance_ports_from_runtime_config(cfg),
+    }
+
+
+def benchmark_submit_key(
+    instance_id: str, benchmark_type: str, dataset: str, split: str
+) -> str:
+    normalized = [
+        str(instance_id or "").strip(),
+        normalize_benchmark_type(benchmark_type),
+        str(dataset or "").strip().lower(),
+        str(split or "default").strip().lower(),
+    ]
+    return "|".join(normalized)
+
+
+def benchmark_submit_lock_path(submit_key: str) -> str:
+    lock_dir = os.path.join(get_benchmark_log_dir(), "submit_locks")
+    os.makedirs(lock_dir, exist_ok=True)
+    name = hashlib.sha1(submit_key.encode("utf-8")).hexdigest()
+    return os.path.join(lock_dir, f"{name}.json")
+
+
+def benchmark_duplicate_message(meta: dict) -> str:
+    return (
+        "检测到相同 benchmark 任务已存在，已跳过重复提交。\n"
+        f"job_id={meta.get('job_id')}\n"
+        f"status={meta.get('status')}\n"
+        f"dataset={meta.get('dataset')}\n"
+        f"service_instance_id={meta.get('service_instance_id')}\n"
+        f"log_file={format_agent_relative_path(meta.get('log', ''))}\n"
+        f"output={format_agent_relative_path(meta.get('output', ''))}\n"
+        "可调用 benchmark_report(job_id) 查看进度和结果。"
+    )
+
+
+def benchmark_submit_lock_message(lock: dict) -> str:
+    return (
+        "检测到相同 benchmark 任务正在提交中，已跳过重复提交。\n"
+        f"dataset={lock.get('dataset')}\n"
+        f"benchmark_type={lock.get('benchmark_type')}\n"
+        f"split={lock.get('split')}\n"
+        f"service_instance_id={lock.get('instance_id')}\n"
+        f"created_at={lock.get('created_at')}\n"
+        "请稍后调用 benchmark_jobs 或 benchmark_report 查看任务。"
+    )
+
+
+def find_existing_benchmark_submit(submit_key: str) -> Optional[dict]:
+    base = get_benchmark_log_dir()
+    for job_id, meta_path, meta in iter_json_records(base, "meta.json"):
+        if str(meta.get("submit_key") or "") != submit_key:
+            continue
+        meta = refresh_benchmark_job_meta(job_id, meta_path, meta)
+        status = str(meta.get("status") or "").lower()
+        if status in {"running", "submitting"}:
+            return meta
+    return None
+
+
+def acquire_benchmark_submit_lock(
+    submit_key: str,
+    dataset: str,
+    benchmark_type: str,
+    split: str,
+    instance_id: str,
+) -> tuple[bool, str]:
+    existing = find_existing_benchmark_submit(submit_key)
+    if existing:
+        return False, benchmark_duplicate_message(existing)
+
+    lock_path = benchmark_submit_lock_path(submit_key)
+    now = time.time()
+    payload = {
+        "submit_key": submit_key,
+        "dataset": dataset,
+        "benchmark_type": benchmark_type,
+        "split": split,
+        "instance_id": instance_id,
+        "owner_user_id": current_request_user_id(),
+        "owner_aliases": current_request_user_aliases(),
+        "owner_context_user_id": current_request_thread_id(),
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "created_ts": now,
+    }
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        try:
+            with open(lock_path, "r") as f:
+                lock = json.load(f)
+            created_ts = float(lock.get("created_ts") or 0)
+        except Exception:
+            created_ts = 0
+            lock = {}
+        if created_ts and now - created_ts < BENCHMARK_SUBMIT_LOCK_TTL:
+            return False, benchmark_submit_lock_message(lock)
+        try:
+            os.remove(lock_path)
+        except FileNotFoundError:
+            pass
+        return acquire_benchmark_submit_lock(
+            submit_key, dataset, benchmark_type, split, instance_id
+        )
+
+    with os.fdopen(fd, "w") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return True, ""
+
+
+def release_benchmark_submit_lock(submit_key: str):
+    try:
+        os.remove(benchmark_submit_lock_path(submit_key))
+    except FileNotFoundError:
+        pass
+
+
 def run_medical_choice_benchmark(
-    dataset: str, max_workers: int = 5, save_every: int = 2
+    dataset: str,
+    max_workers: int = 5,
+    save_every: int = 2,
+    instance_id: str = "latest",
+    submit_key: str = "",
+    instance_context: Optional[tuple[str, dict, dict]] = None,
 ) -> str:
     """Start a benchmark evaluation job (runs asynchronously in the background)."""
 
-    start_time = time.strftime("%Y-%m-%d %H:%M:%S")
-    job_id = f"{int(time.time())}_{str(uuid.uuid4())[:6]}"
+    instance_config = instance_context or require_running_service_instance_config(
+        instance_id
+    )
+    if isinstance(instance_config, str):
+        return instance_config
+    resolved_instance_id, cfg, instance_meta = instance_config
 
-    cfg = show_config()
     model = cfg["ENV"]["MODEL_NAME"]
-    benchmark_dir = get_medical_benchmark_dir()
-    log_dir = get_benchmark_log_dir()
+    benchmark_dir = cfg["ENV"]["BENCHMARK_DIR"]
     base_url = f"http://{cfg['ENV']['HOST_IP']}:{cfg['PORTS']['VLLM_OPENAI_PORT']}/v1"
-    dataset_path = resolve_medical_choice_dataset_path(dataset)
+    dataset_path = resolve_medical_choice_dataset_path(dataset, benchmark_dir)
 
     if not os.path.exists(dataset_path):
-        return f"Benchmark dataset not found: {dataset}\n" + medical_choice_candidates(
-            dataset
+        return (
+            f"Benchmark dataset not found: {dataset}\n"
+            + medical_choice_candidates(dataset, benchmark_dir)
         )
     if not os.path.isfile(dataset_path):
         return f"Benchmark dataset is not a file: {dataset}"
 
-    job_dir = os.path.join(log_dir, job_id)
-    os.makedirs(job_dir, exist_ok=True)
-
-    meta_file = os.path.join(job_dir, "meta.json")
-    log_file = os.path.join(job_dir, "run.log")
-    output_file = os.path.join(job_dir, "result.json")
+    job = make_benchmark_job_paths()
+    job_id = job["job_id"]
+    meta_file = job["meta_file"]
+    log_file = job["log_file"]
+    output_file = job["output"]
 
     cmd = [
         sys.executable,
@@ -2428,35 +6699,26 @@ def run_medical_choice_benchmark(
         "--save-every",
         str(save_every),
     ]
-    log_f = open(log_file, "w")
-
-    proc = subprocess.Popen(
-        cmd,
-        stdout=log_f,
-        stderr=subprocess.STDOUT,
-        preexec_fn=os.setsid,
-    )
+    proc = start_benchmark_process(cmd, log_file)
 
     pid = proc.pid
 
-    with open(meta_file, "w") as f:
-        json.dump(
-            {
-                "job_id": job_id,
-                "pid": pid,
-                "model": model,
-                "dataset": dataset,
-                "mode": "eval",
-                "log": log_file,
-                "output": output_file,
-                "start_time": start_time,
-                "status": "running",
-                "return_code": None,
-                "end_time": "",
-            },
-            f,
-            indent=2,
-        )
+    meta = {
+        "job_id": job_id,
+        "pid": pid,
+        "model": model,
+        "dataset": dataset,
+        "submit_key": submit_key,
+        **benchmark_service_meta(resolved_instance_id, cfg, instance_meta),
+        "mode": "eval",
+        "log": log_file,
+        "output": output_file,
+        "start_time": job["start_time"],
+        "status": "running",
+        "return_code": None,
+        "end_time": "",
+    }
+    atomic_write_json(meta_file, meta)
 
     threading.Thread(
         target=monitor_job, args=(job_id, proc, meta_file), daemon=True
@@ -2468,6 +6730,7 @@ def run_medical_choice_benchmark(
         f"pid={pid}\n"
         f"model={model}\n"
         f"dataset={dataset}\n"
+        f"service_instance_id={resolved_instance_id}\n"
         "benchmark_type=medical_choice\n"
         f"log_file={format_agent_relative_path(log_file)}\n"
         f"output={format_agent_relative_path(output_file)}\n"
@@ -2475,91 +6738,448 @@ def run_medical_choice_benchmark(
     )
 
 
-def list_benchmark_jobs_text() -> str:
+def list_benchmark_jobs_text(
+    instance_id: str = "", limit: int = DEFAULT_LIST_LIMIT, scope: str = "mine"
+) -> str:
     """List all benchmark jobs with their current status."""
 
     base = get_benchmark_log_dir()
-
-    if not os.path.exists(base):
-        return "暂无任务"
+    limit = clamp_int(limit, DEFAULT_LIST_LIMIT, 1, MAX_LIST_LIMIT)
+    scope = str(scope or "mine").strip().lower()
+    if scope not in {"mine", "all"}:
+        return "Invalid scope. Use mine or all."
+    forbidden = scope_all_forbidden_message(scope)
+    if forbidden:
+        return forbidden
+    resolved_instance_id = ""
+    if instance_id:
+        access_error = (
+            service_instance_access_error(instance_id, "查看 benchmark 任务")
+            if scope != "all"
+            else ""
+        )
+        if access_error:
+            return access_error
+        resolved_instance_id = resolve_service_instance_id(
+            instance_id, scope=scope, require_running=False
+        )
+        if not resolved_instance_id:
+            return f"未找到推理服务实例: {instance_id}"
 
     jobs = []
 
-    for job_id in os.listdir(base):
-        meta_path = os.path.join(base, job_id, "meta.json")
-        if not os.path.exists(meta_path):
+    for job_id, meta_path, meta in iter_json_records(base, "meta.json"):
+        meta = refresh_benchmark_job_meta(job_id, meta_path, meta)
+        if (
+            resolved_instance_id
+            and str(meta.get("service_instance_id") or "") != resolved_instance_id
+        ):
             continue
-
-        meta = json.load(open(meta_path))
+        if not task_visible_for_scope(meta, scope):
+            continue
         start_time = meta.get("start_time", "")
-        try:
-            sort_key = time.mktime(time.strptime(start_time, "%Y-%m-%d %H:%M:%S"))
-        except Exception:
+        sort_time = parse_time_sort_value(start_time)
+        if not sort_time:
+            sort_time = parse_time_sort_value(meta.get("job_id", job_id))
+        if not sort_time:
+            sort_time = os.path.getmtime(meta_path)
+        jobs.append((sort_time, status_sort_rank(meta.get("status")), meta))
+
+    lock_dir = os.path.join(base, "submit_locks")
+    if os.path.isdir(lock_dir):
+        now = time.time()
+        for filename in os.listdir(lock_dir):
+            if not filename.endswith(".json"):
+                continue
+            lock_path = os.path.join(lock_dir, filename)
+            lock = load_json_file(lock_path, {})
+            if not isinstance(lock, dict):
+                continue
             try:
-                sort_key = int(str(meta.get("job_id", job_id)).split("_", 1)[0])
-            except Exception:
-                sort_key = os.path.getmtime(meta_path)
-        jobs.append((sort_key, meta))
+                created_ts = float(lock.get("created_ts") or 0)
+            except (TypeError, ValueError):
+                created_ts = 0
+            if created_ts and now - created_ts >= BENCHMARK_SUBMIT_LOCK_TTL:
+                try:
+                    os.remove(lock_path)
+                except FileNotFoundError:
+                    pass
+                continue
+            if (
+                resolved_instance_id
+                and str(lock.get("instance_id") or "") != resolved_instance_id
+            ):
+                continue
+            if not task_visible_for_scope(lock, scope):
+                continue
+            lock_id = os.path.splitext(filename)[0][:12]
+            meta = {
+                "job_id": f"submitting:{lock_id}",
+                "model": "",
+                "dataset": lock.get("dataset", ""),
+                "status": "submitting",
+                "owner_user_id": lock.get("owner_user_id", ""),
+                "service_instance_id": lock.get("instance_id", ""),
+                "output": "",
+                "start_time": lock.get("created_at", ""),
+            }
+            sort_time = created_ts or os.path.getmtime(lock_path)
+            jobs.append((sort_time, status_sort_rank("submitting"), meta))
 
     if not jobs:
-        return "暂无任务"
+        if resolved_instance_id:
+            return f"该实例暂无 benchmark 任务: instance_id={resolved_instance_id}"
+        return "暂无当前用户的 benchmark 任务。" if scope == "mine" else "暂无任务"
 
-    lines = []
-    for idx, (_, meta) in enumerate(
-        sorted(jobs, key=lambda item: item[0], reverse=True), start=1
+    sorted_jobs = sorted(
+        jobs, key=lambda item: (-item[0], item[1], str(item[2].get("job_id", "")))
+    )
+    visible_jobs = sorted_jobs[:limit]
+    lines = [
+        f"Benchmark任务列表(scope={scope}): 显示 {len(visible_jobs)} / {len(sorted_jobs)} 条，limit={limit}"
+    ]
+    if scope == "all":
+        owner_counts = {"self": 0, "other": 0, "unknown": 0}
+        for _, _, meta in sorted_jobs:
+            owner = task_owner_label(meta)
+            owner_counts[owner if owner in owner_counts else "unknown"] += 1
+        lines.append(
+            "owner统计: "
+            f"self={owner_counts['self']}, "
+            f"other={owner_counts['other']}, "
+            f"unknown={owner_counts['unknown']}"
+        )
+    if len(sorted_jobs) > limit:
+        lines.append(f"还有 {len(sorted_jobs) - limit} 条未显示，可增大 limit 查看。")
+
+    for idx, (_, _, meta) in enumerate(
+        visible_jobs,
+        start=1,
     ):
-        latest = " latest" if idx == 1 else ""
+        latest = " latest_by_time" if idx == 1 else ""
         lines.append(
             f"#{idx}{latest} | {meta.get('job_id')} | {meta.get('start_time', '')} | "
             f"{meta.get('model')} | {meta.get('dataset')} | {meta.get('status')} | "
+            f"owner={task_owner_label(meta)} | "
+            f"instance={meta.get('service_instance_id', '')} | "
             f"output={format_agent_relative_path(meta.get('output', ''))}"
         )
 
     return "\n".join(lines)
 
+def benchmark_job_list_record(meta: dict) -> dict:
+    mode = meta.get("mode")
+    output_file = meta.get("output")
+    log_file = meta.get("log")
+    pid = meta.get("pid")
+    record = {
+        "action": "list",
+        "job_id": meta.get("job_id"),
+        "status": meta.get("status"),
+        "mode": mode,
+        "benchmark_type": benchmark_type_from_mode(mode),
+        "dataset": meta.get("dataset"),
+        "model": meta.get("model"),
+        "owner_user_id": task_owner_user_id(meta),
+        "owner": task_owner_label(meta),
+        "service_instance_id": meta.get("service_instance_id"),
+        "service_run_id": meta.get("service_run_id"),
+        "service_ports": meta.get("service_ports"),
+        "pid": pid,
+        "return_code": meta.get("return_code"),
+        "start_time": meta.get("start_time"),
+        "end_time": meta.get("end_time"),
+        "artifacts": {
+            "log": format_agent_relative_path(log_file),
+            "output": format_agent_relative_path(output_file),
+        },
+    }
+    if pid:
+        record["process_running"] = pid_is_alive(int(pid))
+    return record
 
-def stop_benchmark_job(job_id: str) -> str:
+
+def list_benchmark_jobs_payload(
+    instance_id: str = "", limit: int = DEFAULT_LIST_LIMIT, scope: str = "mine"
+) -> dict:
+    base = get_benchmark_log_dir()
+    limit = clamp_int(limit, DEFAULT_LIST_LIMIT, 1, MAX_LIST_LIMIT)
+    scope = str(scope or "mine").strip().lower()
+    payload = {
+        "operation": "list",
+        "scope": scope,
+        "instance_id": "",
+        "limit": limit,
+        "items": [],
+        "summary": {"total": 0, "returned": 0},
+    }
+    if scope not in {"mine", "all"}:
+        payload.update({"status": "error", "error": "Invalid scope. Use mine or all."})
+        return payload
+    forbidden = scope_all_forbidden_message(scope)
+    if forbidden:
+        payload.update({"status": "forbidden", "error": forbidden})
+        payload["summary"].update({"error": forbidden})
+        return payload
+
+    resolved_instance_id = ""
+    if instance_id:
+        access_error = (
+            service_instance_access_error(instance_id, "查看 benchmark 任务")
+            if scope != "all"
+            else ""
+        )
+        if access_error:
+            payload.update({"status": "forbidden", "error": access_error})
+            return payload
+        resolved_instance_id = resolve_service_instance_id(
+            instance_id, scope=scope, require_running=False
+        )
+        if not resolved_instance_id:
+            payload.update(
+                {"status": "not_found", "error": f"未找到推理服务实例: {instance_id}"}
+            )
+            return payload
+        payload["instance_id"] = resolved_instance_id
+
+    jobs = []
+    for job_id, meta_path, meta in iter_json_records(base, "meta.json"):
+        meta = refresh_benchmark_job_meta(job_id, meta_path, meta)
+        if (
+            resolved_instance_id
+            and str(meta.get("service_instance_id") or "") != resolved_instance_id
+        ):
+            continue
+        if not task_visible_for_scope(meta, scope):
+            continue
+        start_time = meta.get("start_time", "")
+        sort_time = parse_time_sort_value(start_time)
+        if not sort_time:
+            sort_time = parse_time_sort_value(meta.get("job_id", job_id))
+        if not sort_time:
+            sort_time = os.path.getmtime(meta_path)
+        jobs.append((sort_time, status_sort_rank(meta.get("status")), meta))
+
+    lock_dir = os.path.join(base, "submit_locks")
+    if os.path.isdir(lock_dir):
+        now = time.time()
+        for filename in os.listdir(lock_dir):
+            if not filename.endswith(".json"):
+                continue
+            lock_path = os.path.join(lock_dir, filename)
+            lock = load_json_file(lock_path, {})
+            if not isinstance(lock, dict):
+                continue
+            try:
+                created_ts = float(lock.get("created_ts") or 0)
+            except (TypeError, ValueError):
+                created_ts = 0
+            if created_ts and now - created_ts >= BENCHMARK_SUBMIT_LOCK_TTL:
+                try:
+                    os.remove(lock_path)
+                except FileNotFoundError:
+                    pass
+                continue
+            if (
+                resolved_instance_id
+                and str(lock.get("instance_id") or "") != resolved_instance_id
+            ):
+                continue
+            if not task_visible_for_scope(lock, scope):
+                continue
+            lock_id = os.path.splitext(filename)[0][:12]
+            meta = {
+                "job_id": f"submitting:{lock_id}",
+                "model": "",
+                "dataset": lock.get("dataset", ""),
+                "status": "submitting",
+                "owner_user_id": lock.get("owner_user_id", ""),
+                "service_instance_id": lock.get("instance_id", ""),
+                "output": "",
+                "start_time": lock.get("created_at", ""),
+            }
+            sort_time = created_ts or os.path.getmtime(lock_path)
+            jobs.append((sort_time, status_sort_rank("submitting"), meta))
+
+    sorted_jobs = sorted(
+        jobs, key=lambda item: (-item[0], item[1], str(item[2].get("job_id", "")))
+    )
+    visible_jobs = sorted_jobs[:limit]
+    items = [benchmark_job_list_record(meta) for _, _, meta in visible_jobs]
+    payload["items"] = items
+    payload["summary"] = {
+        "total": len(sorted_jobs),
+        "returned": len(items),
+        "scope": scope,
+        "instance_id": resolved_instance_id or None,
+        "limit": limit,
+    }
+    payload["status"] = "ok"
+    return payload
+
+
+
+def stop_benchmark_job_runtime(job_id: str, meta_file: str, meta: dict) -> str:
+    """Stop one benchmark after the caller has completed authorization checks."""
+    pid = int(meta.get("pid") or 0)
+    if meta.get("status") != "running":
+        return (
+            f"benchmark任务无需停止: status={meta.get('status')}, job_id={job_id}, "
+            f"pid={pid}, output={format_agent_relative_path(meta.get('output', ''))}"
+        )
+
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+
+        meta["status"] = "stopped"
+        meta["end_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        if "progress" in meta and "files" in meta["progress"]:
+            for file_stat in meta["progress"]["files"].values():
+                if file_stat.get("status") == "running":
+                    file_stat["status"] = "stopped"
+
+        atomic_write_json(meta_file, meta)
+        return f"stopped successfully: job_id={job_id} pid={pid}"
+    except ProcessLookupError:
+        meta = refresh_benchmark_job_meta(job_id, meta_file, meta)
+        return (
+            "benchmark进程已不存在，状态已同步: "
+            f"status={meta.get('status')}, job_id={job_id}, pid={pid}"
+        )
+    except Exception as exc:
+        return f"error: {exc}"
+
+
+def stop_benchmark_job(job_id: str, confirm: bool = False) -> str:
     """Stop a running benchmark job."""
 
-    cfg = show_config()
     job_dir = os.path.join(get_benchmark_log_dir(), job_id)
     meta_file = os.path.join(job_dir, "meta.json")
 
     if not os.path.exists(meta_file):
         return f"not found: {meta_file}"
 
-    meta = json.load(open(meta_file))
-    pid = int(meta["pid"])
+    with open(meta_file, "r") as f:
+        meta = refresh_benchmark_job_meta(job_id, meta_file, json.load(f))
+    pid = int(meta.get("pid") or 0)
+    owner = task_owner_user_id(meta)
+    current = current_request_user_id()
+    if not current:
+        return "当前请求缺少用户身份，已拒绝停止 benchmark 任务。"
+    if not current_request_is_admin():
+        if not owner:
+            return (
+                "该 benchmark 任务没有有效的所有者记录，已拒绝停止。\n"
+                f"job_id={job_id}"
+            )
+        if not task_owned_by_current(meta):
+            return (
+                "该 benchmark 任务属于其他用户，已拒绝停止。\n"
+                f"job_id={job_id}\n"
+                f"status={meta.get('status', '')}\n"
+                "普通工具只允许停止当前用户自己的 benchmark 任务。"
+            )
 
-    if meta["status"] == "running":
-        try:
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
+    if meta.get("status") != "running":
+        return (
+            f"benchmark任务无需停止: status={meta.get('status')}, job_id={job_id}, "
+            f"pid={pid}, output={format_agent_relative_path(meta.get('output', ''))}"
+        )
+    return stop_benchmark_job_runtime(job_id, meta_file, meta)
 
-            meta["status"] = "stopped"
-            meta["end_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
 
-            # add, for medbench stop
-            if "progress" in meta and "files" in meta["progress"]:
-                for file_stat in meta["progress"]["files"].values():
-                    if file_stat.get("status") == "running":
-                        file_stat["status"] = "stopped"
+def preview_benchmark_stop(job_id: str) -> dict:
+    operation = "preview"
+    job_id = str(job_id or "").strip()
+    if not job_id or "/" in job_id or ".." in job_id:
+        text = "Invalid job_id"
+        return build_local_tool_response(
+            text,
+            {
+                "benchmark_stop": {
+                    "operation": operation,
+                    "job_id": job_id,
+                    "can_apply": False,
+                    "stopped": False,
+                    "result": text,
+                }
+            },
+        )
 
-            with open(meta_file, "w") as f:
-                json.dump(meta, f, indent=2)
+    meta_file = os.path.join(get_benchmark_log_dir(), job_id, "meta.json")
+    if not os.path.exists(meta_file):
+        text = f"not found: {meta_file}"
+        return build_local_tool_response(
+            text,
+            {
+                "benchmark_stop": {
+                    "operation": operation,
+                    "job_id": job_id,
+                    "can_apply": False,
+                    "stopped": False,
+                    "result": text,
+                }
+            },
+        )
 
-            return f"stopped successfully: job_id={job_id} pid={pid}"
-
-        except Exception as e:
-            return f"error: {str(e)}"
-
-    elif meta["status"] == "finished":
-        return "already finished: no action taken"
-
-    elif meta["status"] == "stopped":
-        return "already stopped: no action taken"
-
+    with open(meta_file, "r") as f:
+        meta = refresh_benchmark_job_meta(job_id, meta_file, json.load(f), persist=False)
+    status = str(meta.get("status") or "")
+    owner = task_owner_user_id(meta)
+    current = current_request_user_id()
+    pid = int(meta.get("pid") or 0)
+    if not current:
+        text = "当前请求缺少用户身份，已拒绝预览停止 benchmark 任务。"
+        can_apply = False
+    elif not current_request_is_admin() and not owner:
+        text = f"该 benchmark 任务没有有效的所有者记录，已拒绝预览停止。\njob_id={job_id}"
+        can_apply = False
+    elif not current_request_is_admin() and not task_owned_by_current(meta):
+        text = (
+            "该 benchmark 任务属于其他用户，已拒绝预览停止。\n"
+            f"job_id={job_id}\n"
+            f"status={status}\n"
+            "普通工具只允许预览停止当前用户自己的 benchmark 任务。"
+        )
+        can_apply = False
     else:
-        return f"unvalid status: {meta['status']}"
+        can_apply = status == "running"
+        text = (
+            "预览停止 benchmark（未执行停止）:\n"
+            f"job_id={job_id}\n"
+            f"status={status}\n"
+            f"owner={task_owner_label(meta)}\n"
+            f"dataset={meta.get('dataset', '')}\n"
+            f"model={meta.get('model', '')}\n"
+            f"service_instance_id={meta.get('service_instance_id', '')}\n"
+            f"pid={pid}\n"
+            f"output={format_agent_relative_path(meta.get('output', ''))}\n"
+            f"can_apply={can_apply}"
+        )
+        if can_apply:
+            text += "\n该操作将停止当前用户自己的 benchmark 任务；确认后可调用 benchmark_stop。"
+        else:
+            text += "\n该 benchmark 任务当前无需停止。"
+
+    return build_local_tool_response(
+        text,
+        {
+            "benchmark_stop": {
+                "operation": operation,
+                "job_id": job_id,
+                "job_status": status,
+                "owner_user_id": owner,
+                "service_instance_id": str(meta.get("service_instance_id") or ""),
+                "dataset": str(meta.get("dataset") or ""),
+                "pid": pid,
+                "output": format_agent_relative_path(meta.get("output", "")),
+                "can_apply": can_apply,
+                "stopped": False,
+                "result": text,
+            }
+        },
+    )
 
 
 def medbench_list():
@@ -2742,16 +7362,24 @@ def resolve_medbench_dataset_path(benchmark_dir: str, dataset: str) -> str:
     return resolve_benchmark_path(benchmark_dir, relative)
 
 
-def run_medbench_benchmark(dataset: str, max_workers: int = 5) -> str:
+def run_medbench_benchmark(
+    dataset: str,
+    max_workers: int = 5,
+    instance_id: str = "latest",
+    submit_key: str = "",
+    instance_context: Optional[tuple[str, dict, dict]] = None,
+) -> str:
     """Start a medbench evaluation job (runs asynchronously in the background)."""
 
-    start_time = time.strftime("%Y-%m-%d %H:%M:%S")
-    job_id = f"{int(time.time())}_{str(uuid.uuid4())[:6]}"
+    instance_config = instance_context or require_running_service_instance_config(
+        instance_id
+    )
+    if isinstance(instance_config, str):
+        return instance_config
+    resolved_instance_id, cfg, instance_meta = instance_config
 
-    cfg = show_config()
     model = cfg["ENV"]["MODEL_NAME"]
-    benchmark_dir = get_medical_benchmark_dir()
-    log_dir = get_benchmark_log_dir()
+    benchmark_dir = cfg["ENV"]["BENCHMARK_DIR"]
     base_url = f"http://{cfg['ENV']['HOST_IP']}:{cfg['PORTS']['VLLM_OPENAI_PORT']}/v1"
 
     try:
@@ -2763,7 +7391,7 @@ def run_medbench_benchmark(dataset: str, max_workers: int = 5) -> str:
         return (
             f'Not Found: {dataset_path}. Please use `benchmark_list(benchmark_type="medbench")` to check available MedBench jsonl files, \
             or run the entire dataset: medical/medbench.\n'
-            + medbench_candidates(dataset)
+            + medbench_candidates(dataset, benchmark_dir)
         )
     if dataset.endswith(".jsonl"):
         # dataset_type = "file"
@@ -2772,13 +7400,11 @@ def run_medbench_benchmark(dataset: str, max_workers: int = 5) -> str:
         # dataset_type = "folder"
         files = [f for f in os.listdir(dataset_path) if f.endswith(".jsonl")]
 
-    job_dir = os.path.join(log_dir, job_id)
-    os.makedirs(job_dir, exist_ok=True)
-
-    meta_file = os.path.join(job_dir, "meta.json")
-    log_file = os.path.join(job_dir, "run.log")
-    output_dir = os.path.join(job_dir, "results")
-    os.makedirs(output_dir, exist_ok=True)
+    job = make_benchmark_job_paths("results", output_is_dir=True)
+    job_id = job["job_id"]
+    meta_file = job["meta_file"]
+    log_file = job["log_file"]
+    output_dir = job["output"]
 
     cmd = [
         sys.executable,
@@ -2798,40 +7424,31 @@ def run_medbench_benchmark(dataset: str, max_workers: int = 5) -> str:
         "--max-workers",
         str(max_workers),
     ]
-    log_f = open(log_file, "w")
-
-    proc = subprocess.Popen(
-        cmd,
-        stdout=log_f,
-        stderr=subprocess.STDOUT,
-        preexec_fn=os.setsid,
-    )
+    proc = start_benchmark_process(cmd, log_file)
 
     pid = proc.pid
 
-    with open(meta_file, "w") as f:
-        json.dump(
-            {
-                "job_id": job_id,
-                "pid": pid,
-                "model": model,
-                "mode": "medbench",
-                "dataset": dataset,
-                "input_dir": dataset_path
-                if os.path.isdir(dataset_path)
-                else os.path.dirname(dataset_path),
-                # "dataset_type": dataset_type,
-                "files": files,
-                "log": log_file,
-                "output": output_dir,
-                "start_time": start_time,
-                "status": "running",
-                "return_code": None,
-                "end_time": "",
-            },
-            f,
-            indent=2,
-        )
+    meta = {
+        "job_id": job_id,
+        "pid": pid,
+        "model": model,
+        "mode": "medbench",
+        "dataset": dataset,
+        "submit_key": submit_key,
+        **benchmark_service_meta(resolved_instance_id, cfg, instance_meta),
+        "input_dir": dataset_path
+        if os.path.isdir(dataset_path)
+        else os.path.dirname(dataset_path),
+        # "dataset_type": dataset_type,
+        "files": files,
+        "log": log_file,
+        "output": output_dir,
+        "start_time": job["start_time"],
+        "status": "running",
+        "return_code": None,
+        "end_time": "",
+    }
+    atomic_write_json(meta_file, meta)
 
     threading.Thread(
         target=monitor_medbench_job, args=(job_id, proc, meta_file), daemon=True
@@ -2843,6 +7460,7 @@ def run_medbench_benchmark(dataset: str, max_workers: int = 5) -> str:
         f"pid={pid}\n"
         f"model={model}\n"
         f"dataset={dataset}\n"
+        f"service_instance_id={resolved_instance_id}\n"
         "benchmark_type=medbench\n"
         f"log_file={format_agent_relative_path(log_file)}\n"
         f"output={format_agent_relative_path(output_dir)}\n"
@@ -2962,16 +7580,25 @@ def update_progress(meta: dict) -> bool:
 
 
 def atomic_write_json(path: str, data: dict):
-    tmp_path = path + ".tmp"
-    with open(tmp_path, "w") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp_path, path)
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 def medbench_progress_text(job_id: str) -> str:
     """Get MedBench job progress summary."""
 
-    cfg = show_config()
     meta_file = os.path.join(get_benchmark_log_dir(), job_id, "meta.json")
 
     if not os.path.exists(meta_file):
@@ -2992,6 +7619,8 @@ def medbench_progress_text(job_id: str) -> str:
     files = progress.get("files", [])
     log = meta.get("log", "")
     output = meta.get("output", "")
+    service_instance_id = meta.get("service_instance_id", "")
+    service_run_id = meta.get("service_run_id", "")
 
     if not files:
         return f"""任务 {job_id}
@@ -2999,6 +7628,8 @@ def medbench_progress_text(job_id: str) -> str:
 PID: {pid}
 返回码: {return_code}
 数据集: {dataset}
+服务实例: {service_instance_id}
+服务启动任务: {service_run_id}
 日志位置: {format_agent_relative_path(log)}
 结果位置: {format_agent_relative_path(output)}
 （暂无进度信息）"""
@@ -3033,6 +7664,8 @@ PID: {pid}
     lines.append(f"状态: {status}")
     lines.append(f"模型: {model}")
     lines.append(f"数据集: {dataset}")
+    lines.append(f"服务实例: {service_instance_id}")
+    lines.append(f"服务启动任务: {service_run_id}")
     lines.append(f"PID: {pid}")
     lines.append(f"返回码: {return_code}")
     lines.append(f"开始时间: {start_time}")
@@ -3090,14 +7723,16 @@ def general_benchmark_list() -> str:
     return safe_output(output)
 
 
-def general_benchmark_inspect(dataset: str, split: str = "default") -> str:
+def general_benchmark_inspect(
+    dataset: str, split: str = "default", dataset_root: Optional[str] = None
+) -> str:
     """Inspect a supported public benchmark dataset."""
     output = run_general_runner(
         [
             "--action",
             "inspect",
             "--dataset-root",
-            get_general_benchmark_dir(),
+            dataset_root or get_general_benchmark_dir(),
             "--dataset",
             dataset,
             "--split",
@@ -3113,21 +7748,26 @@ def run_general_benchmark_job(
     max_workers: int = 5,
     limit: Optional[int] = None,
     save_every: int = 2,
+    instance_id: str = "latest",
+    submit_key: str = "",
+    instance_context: Optional[tuple[str, dict, dict]] = None,
 ) -> str:
     """Start a public benchmark job (runs asynchronously in the background)."""
-    start_time = time.strftime("%Y-%m-%d %H:%M:%S")
-    job_id = f"{int(time.time())}_{str(uuid.uuid4())[:6]}"
+    instance_config = instance_context or require_running_service_instance_config(
+        instance_id
+    )
+    if isinstance(instance_config, str):
+        return instance_config
+    resolved_instance_id, cfg, instance_meta = instance_config
 
-    cfg = show_config()
     model = cfg["ENV"]["MODEL_NAME"]
-    log_dir = get_benchmark_log_dir()
-    general_dir = get_general_benchmark_dir()
+    general_dir = cfg["ENV"].get("GENERAL_BENCHMARK_DIR", "../benchmark/general")
     base_url = f"http://{cfg['ENV']['HOST_IP']}:{cfg['PORTS']['VLLM_OPENAI_PORT']}/v1"
 
     if not os.path.exists(general_dir):
         return f"GENERAL_BENCHMARK_DIR not found: {general_dir}"
 
-    inspect_output = general_benchmark_inspect(dataset, split)
+    inspect_output = general_benchmark_inspect(dataset, split, general_dir)
     if inspect_output.startswith("[ERROR]"):
         return inspect_output
 
@@ -3160,12 +7800,11 @@ def run_general_benchmark_job(
                         "add the service user to the docker group"
                     )
                 return f"Docker executor unavailable: Docker image not found: {humaneval_image}"
-    job_dir = os.path.join(log_dir, job_id)
-    os.makedirs(job_dir, exist_ok=True)
-
-    meta_file = os.path.join(job_dir, "meta.json")
-    log_file = os.path.join(job_dir, "run.log")
-    output_file = os.path.join(job_dir, "result.json")
+    job = make_benchmark_job_paths()
+    job_id = job["job_id"]
+    meta_file = job["meta_file"]
+    log_file = job["log_file"]
+    output_file = job["output"]
 
     cmd = [
         sys.executable,
@@ -3219,13 +7858,7 @@ def run_general_benchmark_job(
     if limit is not None and limit > 0:
         cmd.extend(["--limit", str(limit)])
 
-    log_f = open(log_file, "w")
-    proc = subprocess.Popen(
-        cmd,
-        stdout=log_f,
-        stderr=subprocess.STDOUT,
-        preexec_fn=os.setsid,
-    )
+    proc = start_benchmark_process(cmd, log_file)
 
     pid = proc.pid
 
@@ -3235,11 +7868,13 @@ def run_general_benchmark_job(
         "pid": pid,
         "model": model,
         "dataset": dataset,
+        "submit_key": submit_key,
         "split": split,
         "mode": "general",
+        **benchmark_service_meta(resolved_instance_id, cfg, instance_meta),
         "log": log_file,
         "output": output_file,
-        "start_time": start_time,
+        "start_time": job["start_time"],
         "status": "running",
         "return_code": None,
         "end_time": "",
@@ -3259,8 +7894,7 @@ def run_general_benchmark_job(
             }
         )
 
-    with open(meta_file, "w") as f:
-        json.dump(meta, f, indent=2)
+    atomic_write_json(meta_file, meta)
 
     threading.Thread(
         target=monitor_job, args=(job_id, proc, meta_file), daemon=True
@@ -3273,6 +7907,7 @@ def run_general_benchmark_job(
         f"model={model}\n"
         f"dataset={dataset}\n"
         f"split={split}\n"
+        f"service_instance_id={resolved_instance_id}\n"
         "benchmark_type=general\n"
         f"log_file={format_agent_relative_path(log_file)}\n"
         f"output={format_agent_relative_path(output_file)}\n"
@@ -3297,7 +7932,12 @@ def normalize_benchmark_type(benchmark_type: str) -> str:
     return aliases.get(value, value)
 
 
-def infer_benchmark_type(dataset: str, split: str = "default") -> str:
+def infer_benchmark_type(
+    dataset: str,
+    split: str = "default",
+    medical_dir: Optional[str] = None,
+    general_dir: Optional[str] = None,
+) -> str:
     name = dataset.strip()
     lowered = name.lower()
 
@@ -3306,16 +7946,18 @@ def infer_benchmark_type(dataset: str, split: str = "default") -> str:
     if lowered.endswith(".json") or lowered.startswith(("medical/choice/", "medical_choice/", "choice/")):
         return "medical_choice"
 
-    choice_path = resolve_medical_choice_dataset_path(name)
+    choice_path = resolve_medical_choice_dataset_path(name, medical_dir)
     if os.path.isfile(choice_path):
         return "medical_choice"
 
-    inspect_output = general_benchmark_inspect(name, split)
+    inspect_output = general_benchmark_inspect(name, split, general_dir)
     if not inspect_output.startswith("[ERROR]"):
         return "general"
 
     try:
-        medbench_path = resolve_medbench_dataset_path(get_medical_benchmark_dir(), name)
+        medbench_path = resolve_medbench_dataset_path(
+            medical_dir or get_medical_benchmark_dir(), name
+        )
         if os.path.exists(medbench_path):
             return "medbench"
     except ValueError:
@@ -3324,8 +7966,14 @@ def infer_benchmark_type(dataset: str, split: str = "default") -> str:
     return "unknown"
 
 
-def correct_benchmark_type(dataset: str, benchmark_type: str, split: str = "default"):
-    inferred = infer_benchmark_type(dataset, split)
+def correct_benchmark_type(
+    dataset: str,
+    benchmark_type: str,
+    split: str = "default",
+    medical_dir: Optional[str] = None,
+    general_dir: Optional[str] = None,
+):
+    inferred = infer_benchmark_type(dataset, split, medical_dir, general_dir)
     if benchmark_type in {"auto", "unknown"}:
         return inferred, ""
     if inferred in {"medical_choice", "medbench"} and inferred != benchmark_type:
@@ -3386,43 +8034,101 @@ def benchmark_run_unified(
     max_workers: int = 5,
     limit: int = 0,
     save_every: int = 2,
+    instance_id: str = "latest",
 ) -> str:
     """Run a benchmark job by unified type."""
+    try:
+        resolved_task_instance_id = resolve_task_service_instance_id(
+            instance_id, "benchmark"
+        )
+    except ValueError as e:
+        return str(e)
+    if resolved_task_instance_id:
+        instance_id = resolved_task_instance_id
+
+    instance_config = require_running_service_instance_config(instance_id)
+    if isinstance(instance_config, str):
+        return instance_config
+    resolved_instance_id, cfg, instance_meta = instance_config
+    instance_context = (resolved_instance_id, cfg, instance_meta)
+    ready_error = openai_api_ready_error(cfg, resolved_instance_id)
+    if ready_error:
+        return ready_error
+
+    medical_dir = cfg["ENV"]["BENCHMARK_DIR"]
+    general_dir = cfg["ENV"].get("GENERAL_BENCHMARK_DIR", "../benchmark/general")
+
     benchmark_type = normalize_benchmark_type(benchmark_type)
     benchmark_type, correction_note = correct_benchmark_type(
-        dataset, benchmark_type, split
+        dataset, benchmark_type, split, medical_dir, general_dir
     )
-
-    if benchmark_type == "general":
-        return correction_note + run_general_benchmark_job(
-            dataset,
-            split,
-            max_workers,
-            limit if limit > 0 else None,
-            save_every,
+    if benchmark_type not in {"general", "medical_choice", "medbench"}:
+        return (
+            f"无法识别数据集类型: dataset={dataset}, benchmark_type={benchmark_type}。\n"
+            "请先调用 benchmark_list 或显式指定 benchmark_type=general/medical_choice/medbench。"
         )
 
-    if benchmark_type == "medical_choice":
-        return correction_note + run_medical_choice_benchmark(
-            dataset, max_workers, save_every
-        )
-
-    if benchmark_type == "medbench":
-        return correction_note + run_medbench_benchmark(dataset, max_workers)
-
-    return (
-        f"无法识别数据集类型: dataset={dataset}, benchmark_type={benchmark_type}。\n"
-        "请先调用 benchmark_list 或显式指定 benchmark_type=general/medical_choice/medbench。"
+    submit_key = benchmark_submit_key(
+        resolved_instance_id, benchmark_type, dataset, split
     )
+    lock_acquired, lock_message = acquire_benchmark_submit_lock(
+        submit_key, dataset, benchmark_type, split, resolved_instance_id
+    )
+    if not lock_acquired:
+        return correction_note + lock_message
+
+    try:
+        if benchmark_type == "general":
+            return correction_note + run_general_benchmark_job(
+                dataset,
+                split,
+                max_workers,
+                limit if limit > 0 else None,
+                save_every,
+                instance_id,
+                submit_key,
+                instance_context,
+            )
+
+        if benchmark_type == "medical_choice":
+            return correction_note + run_medical_choice_benchmark(
+                dataset,
+                max_workers,
+                save_every,
+                instance_id,
+                submit_key,
+                instance_context,
+            )
+
+        if benchmark_type == "medbench":
+            return correction_note + run_medbench_benchmark(
+                dataset,
+                max_workers,
+                instance_id,
+                submit_key,
+                instance_context,
+            )
+    finally:
+        release_benchmark_submit_lock(submit_key)
 
 
-def benchmark_report_text(job_id: str) -> str:
+def benchmark_report_text(job_id: str, scope: str = "mine") -> str:
     """Return benchmark status, progress and available result metrics."""
+    scope = str(scope or "mine").strip().lower()
+    if scope not in {"mine", "all"}:
+        return "Invalid scope. Use mine or all."
     meta_path = os.path.join(get_benchmark_log_dir(), job_id, "meta.json")
     if not os.path.exists(meta_path):
         return f"job_id 不存在: {job_id}"
 
-    meta = json.load(open(meta_path))
+    with open(meta_path, "r") as f:
+        meta = refresh_benchmark_job_meta(job_id, meta_path, json.load(f))
+    if not task_visible_for_scope(meta, scope):
+        return (
+            "该 benchmark 任务属于其他用户，默认不显示。\n"
+            f"job_id={job_id}\n"
+            "如需只读查看全部任务，请使用 scope=all。"
+        )
     mode = meta.get("mode")
 
     if mode == "medbench":
@@ -3440,6 +8146,9 @@ def benchmark_report_text(job_id: str) -> str:
         f"mode={mode}",
         f"dataset={meta.get('dataset')}",
         f"model={meta.get('model')}",
+        f"owner={task_owner_label(meta)}",
+        f"service_instance_id={meta.get('service_instance_id', '')}",
+        f"service_run_id={meta.get('service_run_id', '')}",
         f"pid={meta.get('pid')}",
         f"return_code={meta.get('return_code')}",
         f"start_time={meta.get('start_time')}",
@@ -3505,13 +8214,12 @@ def benchmark_type_from_mode(mode: str) -> str:
     return "medical_choice" if mode == "eval" else mode
 
 
-def benchmark_report_data(job_id: str, text: str) -> dict:
+def benchmark_report_data(job_id: str, scope: str = "mine") -> dict:
     """Build structured benchmark report data from the same files as report text."""
     data = {
         "action": "report",
         "job_id": job_id,
         "current_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "text": str(text),
     }
     meta_path = os.path.join(get_benchmark_log_dir(), job_id, "meta.json")
     if not os.path.exists(meta_path):
@@ -3531,7 +8239,22 @@ def benchmark_report_data(job_id: str, text: str) -> dict:
             {
                 "status": "error",
                 "error": f"读取 meta.json 失败: {e}",
-                "meta_path": format_agent_relative_path(meta_path),
+                "artifacts": {
+                    "meta": format_agent_relative_path(meta_path),
+                },
+            }
+        )
+        return data
+
+    scope = str(scope or "mine").strip().lower()
+    if scope not in {"mine", "all"}:
+        data.update({"status": "error", "error": "Invalid scope. Use mine or all."})
+        return data
+    if not task_visible_for_scope(meta, scope):
+        data.update(
+            {
+                "status": "forbidden",
+                "error": "该 benchmark 任务属于其他用户，默认不返回结构化结果。",
             }
         )
         return data
@@ -3545,13 +8268,18 @@ def benchmark_report_data(job_id: str, text: str) -> dict:
             "benchmark_type": benchmark_type_from_mode(mode),
             "dataset": meta.get("dataset"),
             "model": meta.get("model"),
+            "service_instance_id": meta.get("service_instance_id"),
+            "service_run_id": meta.get("service_run_id"),
+            "service_ports": meta.get("service_ports"),
             "pid": meta.get("pid"),
             "return_code": meta.get("return_code"),
             "start_time": meta.get("start_time"),
             "end_time": meta.get("end_time"),
-            "log": format_agent_relative_path(meta.get("log")),
-            "output": format_agent_relative_path(output_file),
-            "meta_path": format_agent_relative_path(meta_path),
+            "artifacts": {
+                "log": format_agent_relative_path(meta.get("log")),
+                "output": format_agent_relative_path(output_file),
+                "meta": format_agent_relative_path(meta_path),
+            },
         }
     )
 
@@ -3588,7 +8316,7 @@ def benchmark_report_data(job_id: str, text: str) -> dict:
         return data
 
     if os.path.isdir(output_file):
-        data["result_dir"] = format_agent_relative_path(output_file)
+        data["artifacts"]["result_dir"] = format_agent_relative_path(output_file)
         return data
 
     try:
@@ -3600,18 +8328,26 @@ def benchmark_report_data(job_id: str, text: str) -> dict:
 
     summary = result.get("summary", {})
     if isinstance(summary, dict):
-        data["summary"] = summary
-        for key in ("total", "processed", "progress", "split", "task_type"):
-            if key in summary:
-                data[key] = summary[key]
-        metrics = summary.get("metrics")
-        if isinstance(metrics, dict):
-            data["metrics"] = metrics
-        else:
-            metric_keys = ["correct", "accuracy", "avg_f1", "invalid", "invalid_rate"]
-            metrics = {key: summary[key] for key in metric_keys if key in summary}
+        normalized_summary = dict(summary)
+        normalized_summary.pop("dataset", None)
+        metrics = normalized_summary.get("metrics")
+        if not isinstance(metrics, dict):
+            normalized_summary.pop("metrics", None)
+            metric_keys = [
+                "correct",
+                "accuracy",
+                "avg_f1",
+                "invalid",
+                "invalid_rate",
+            ]
+            metrics = {
+                key: normalized_summary.pop(key)
+                for key in metric_keys
+                if key in normalized_summary
+            }
             if metrics:
-                data["metrics"] = metrics
+                normalized_summary["metrics"] = metrics
+        data["summary"] = normalized_summary
 
     if meta.get("status") == "running":
         data["note"] = (
@@ -3624,27 +8360,38 @@ def benchmark_report_data(job_id: str, text: str) -> dict:
 
 
 @tool
-def get_ip() -> str:
-    """Show current ip"""
-    return get_local_ip()
-
-
-@tool
 def config_show() -> dict:
     """Show current service config"""
     config = show_public_config()
-    return build_local_tool_response(config, {"config": config})
+    return build_local_tool_response(
+        config,
+        {
+            "config_draft": {
+                "operation": "show",
+                "applies_to": "new_instances",
+                "values": config,
+            }
+        },
+    )
 
 
 @tool
 def service_status() -> dict:
-    """Check current inference service ports.
+    """Check current inference service status.
 
-    Use this for current running/stopped port status. If the user asks whether a
-    background startup has completed, use service_start_status instead.
+    The structured response contains only the current user's instances:
+    starting/running/degraded instances in full, plus the five most recent
+    failed and stopped instances. If the user asks whether one background
+    startup has completed, use service_start_status instead.
     """
     status = service_status_data()
-    return build_local_tool_response(status["text"], {"services": status["services"]})
+    return build_local_tool_response(
+        status["text"],
+        {
+            "service_instances": status["service_instances"],
+            "services": status["services"],
+        },
+    )
 
 
 @tool
@@ -3661,13 +8408,13 @@ def gpu_status() -> str:
 
 @tool
 def gpu_recommend_allocation() -> dict:
-    """Recommend gpu allocation."""
+    """Recommend GPU allocation for starting a future new instance from the current user's draft config."""
     return recommend_gpu()
 
 
 @tool
 def config_check() -> dict:
-    """Check configuration before starting service."""
+    """Check the current user's draft config before starting a future new instance."""
     config_msg = check_config_validity()
     if config_msg["ok"]:
         return {"ok": True, "msg": f"检查通过。\n分析：{config_msg['analysis']}"}
@@ -3679,19 +8426,33 @@ def config_check() -> dict:
 
 
 @tool
-def service_start() -> str:
-    """Start the full inference service stack.
+def service_start(
+    gpu_ids: str = "",
+    tensor_parallel_size: int = 0,
+    fallback_to_auto: bool = False,
+):
+    """Start a new inference service instance.
 
-    Prerequisites:
-    1. Execute service_status() - if any services are running, run service_stop() before proceeding
-    2. Execute config_check()
+    Existing instances do not need to be stopped first. When gpu_ids is empty,
+    this tool selects GPUs automatically. When users explicitly request GPUs,
+    pass the physical indexes through gpu_ids, for example "4,5". The requested
+    GPUs are strictly validated and written only to the new instance runtime
+    config; do not call config_update for a one-time GPU selection.
+
+    Args:
+    - gpu_ids: comma-separated physical GPU indexes, or empty for automatic
+      allocation.
+    - tensor_parallel_size: defaults to the number of specified GPUs. If set,
+      it must equal the number of gpu_ids.
+    - fallback_to_auto: set true only when the user explicitly permits using
+      other GPUs if the requested GPUs are unavailable.
 
     Startup runs asynchronously. Do not immediately call service_status after
-    this tool. Use service_start_status after a short wait or when the user asks
-    for startup progress.
+    this tool. Use service_start_status or service_instance_status after a short
+    wait or when the user asks for startup progress.
     """
 
-    return start_service()
+    return start_service(gpu_ids, tensor_parallel_size, fallback_to_auto)
 
 
 @tool
@@ -3702,32 +8463,137 @@ def service_start_status(run_id: str = "latest") -> str:
     started successfully, or what the startup progress is.
 
     Args:
-    - run_id: startup run id, or "latest" for the latest startup.
+    - run_id: startup run id, service instance id, or "latest" for the current
+      user's latest startup.
     """
 
-    return service_start_status_text(run_id)
+    text = service_start_status_text(run_id)
+    return build_local_tool_response(
+        text,
+        service_start_status_response_data(text, run_id),
+    )
 
 
 @tool
-def service_stop() -> str:
-    """Stop all inference services."""
+def service_stop():
+    """Stop the current user's active inference service instance.
+
+    If the current user has multiple active instances, this tool asks for an
+    explicit instance_id instead of choosing one automatically. Use
+    service_instance_stop(instance_id=...) after the target instance is known.
+    """
     return stop_service()
 
 
 @tool
-def service_restart() -> str:
-    """Restart all inference services.
+def service_stop_by_reservation(reservation_id: str = ""):
+    """Stop the inference service instance bound to a resource reservation."""
+    result = service_stop_by_reservation_result(reservation_id)
+    return build_local_tool_response(
+        str(result.get("result") or ""),
+        {
+            "service_stop": result.get("service_stop"),
+            "inference_service_stop": result,
+        },
+    )
 
-    Prerequisites:
-    1. Execute service_status() - if any services are running, run service_stop() before proceeding
-    2. Execute config_check()
+
+@tool
+def service_instance_list(
+    scope: str = "mine", limit: int = DEFAULT_LIST_LIMIT
+) -> dict:
+    """
+    List inference service instances on this node.
+
+    Args:
+    - scope: "mine" shows only current user's instances; "all" shows all
+      instances for resource visibility. Other users' instances are visible but
+      cannot be stopped or modified by the current user.
+    - limit: maximum instances to show, default 20, max 100.
+    """
+
+    payload = list_service_instances_payload(scope, limit)
+    return build_local_tool_response(
+        list_service_instances_text(scope, limit),
+        {"service_instances": payload},
+    )
+
+
+@tool
+def service_instance_status(instance_id: str = "latest") -> str:
+    """
+    Show one inference service instance status.
+
+    Args:
+    - instance_id: instance id returned by service_start/service_instance_list,
+      or latest for the current user's latest instance.
+    """
+
+    text = service_instance_status_text(instance_id)
+    return build_local_tool_response(
+        text,
+        {"service_instance": service_instance_status_payload(instance_id)},
+    )
+
+@tool
+def service_instance_tasks(instance_id: str = "latest") -> str:
+    """
+    List benchmark and service-test tasks associated with one service instance.
+
+    Args:
+    - instance_id: instance id returned by service_start/service_instance_list,
+      or latest for the current user's latest instance.
+    """
+
+    return list_service_instance_tasks_text(instance_id)
+
+
+@tool
+def service_instance_stop_preview(instance_id: str = "latest"):
+    """Preview stopping one current-user-owned inference service instance."""
+
+    return preview_service_instance_stop(instance_id)
+
+
+@tool
+def service_instance_stop(instance_id: str = "latest"):
+    """
+    Stop one inference service instance.
+
+    Default behavior:
+    - Stop current user's own instance.
+    - Refuse to stop any instance owned by another user.
+
+    Args:
+    - instance_id: instance id returned by service_start/service_instance_list,
+      or latest for the current user's latest instance.
+    """
+
+    access_error = service_instance_access_error(instance_id, "停止")
+    if access_error:
+        return access_error
+
+    scope = "all" if current_request_is_admin() else "mine"
+    resolved = resolve_service_instance_id(instance_id, scope=scope)
+    if not resolved:
+        return f"未找到当前用户可停止的推理服务实例: {instance_id}"
+    return stop_service_instance(resolved)
+
+
+@tool
+def service_restart() -> str:
+    """Restart the current user's latest inference service instance.
+
+    This stops the current user's latest instance, waits briefly, then starts a
+    new instance with automatic GPU and port allocation. It does not restart
+    other users' instances.
     """
 
     return restart_service_stack()
 
 
 @tool
-def service_log_runs(limit: int = 10) -> str:
+def service_log_runs(limit: int = 10, instance_id: str = "") -> str:
     """
     List recent service log runs.
 
@@ -3737,17 +8603,25 @@ def service_log_runs(limit: int = 10) -> str:
       service_log_search, or service_log_context with a specific run_id.
     - Use this before service_log_tail/service_log_search/service_log_context
       when the user asks for historical logs or run_id is unknown.
+    - In multi-instance scenarios, prefer passing instance_id to list logs for
+      the selected service instance. Without instance_id, latest resolves to
+      the current user's latest instance when possible.
 
     Args:
-        limit: maximum number of recent runs to list.
+        limit: maximum number of recent runs to list, max 100.
+        instance_id: optional service instance id. When provided, only logs for
+                     that instance are listed.
     """
 
-    return list_service_log_runs_text(limit)
+    return list_service_log_runs_text(limit, instance_id)
 
 
 @tool
 def service_log_tail(
-    service: str = "start", lines: int = 30, run_id: str = "latest"
+    service: str = "start",
+    lines: int = 30,
+    run_id: str = "latest",
+    instance_id: str = "",
 ) -> str:
     """
     Summarize important messages in log.
@@ -3757,17 +8631,27 @@ def service_log_tail(
     - WARNINGS: grep for warn (last 20 matches)
     - LAST LOG: last N lines with line numbers
 
-    If the user asks for historical logs or provides no clear run_id, call
-    service_log_runs first to discover valid run IDs. Use run_id="latest" only
-    when the user asks for the latest/current service logs.
+    In multi-instance scenarios, pass instance_id whenever the user refers to a
+    specific service instance. If the user asks for historical logs or provides
+    no clear run_id/instance_id, call service_log_runs first to discover valid
+    IDs. Use run_id="latest" only when the user asks for the latest/current
+    service logs; latest resolves to the current user's latest instance when
+    possible.
 
     Args:
         service: one of ["start","vllm","inference","ui","web","case2chat"]
-        lines: number of recent log lines to show (default: 30)
-        run_id: service startup run id, or "latest" for the newest run.
+        lines: number of recent log lines to show (default: 30, max: 80)
+        run_id: service startup run id, or "latest" for the current user's
+                newest run when possible.
                 Do not use "all" here; use service="all" to search all service logs.
+        instance_id: service instance id. If provided, it overrides run_id.
     """
 
+    if instance_id:
+        access_error = service_instance_access_error(instance_id, "查看日志")
+        if access_error:
+            return access_error
+        run_id = instance_id
     return tail_logs(service, lines, run_id)
 
 
@@ -3777,45 +8661,70 @@ def service_log_search(
     service: str = "all",
     lines: int = 20,
     run_id: str = "latest",
+    instance_id: str = "",
 ) -> str:
     """
     Search keyword or extended regex in logs with case-insensitive matching.
 
-    If the user asks for historical logs or provides no clear run_id, call
-    service_log_runs first to discover valid run IDs. Use run_id="latest" only
-    when the user asks for the latest/current service logs.
+    In multi-instance scenarios, pass instance_id whenever the user refers to a
+    specific service instance. If the user asks for historical logs or provides
+    no clear run_id/instance_id, call service_log_runs first to discover valid
+    IDs. Use run_id="latest" only when the user asks for the latest/current
+    service logs; latest resolves to the current user's latest instance when
+    possible.
 
     Args:
         keyword: search text or extended regex, case-insensitive
                  (e.g., error, exception, "runtime|memory|permission denied", etc.)
         service: specific service or "all"
-        line: number of results
-        run_id: service startup run id, or "latest" for the newest run.
+        lines: number of matching results (default: 20, max: 80)
+        run_id: service startup run id, or "latest" for the current user's
+                newest run when possible.
                 Do not use "all" here; use service="all" to search all service logs.
+        instance_id: service instance id. If provided, it overrides run_id.
     """
 
+    if instance_id:
+        access_error = service_instance_access_error(instance_id, "搜索日志")
+        if access_error:
+            return access_error
+        run_id = instance_id
     return logs_search(keyword, service, lines, run_id)
 
 
 @tool
 def service_log_context(
-    service: str, index: int, window: int = 20, run_id: str = "latest"
+    service: str,
+    index: int,
+    window: int = 20,
+    run_id: str = "latest",
+    instance_id: str = "",
 ) -> str:
     """
     Show log context around a specific line.
 
-    If the user asks for historical logs or provides no clear run_id, call
-    service_log_runs first to discover valid run IDs. Use run_id="latest" only
-    when the user asks for the latest/current service logs.
+    In multi-instance scenarios, pass instance_id whenever the user refers to a
+    specific service instance. If the user asks for historical logs or provides
+    no clear run_id/instance_id, call service_log_runs first to discover valid
+    IDs. Use run_id="latest" only when the user asks for the latest/current
+    service logs; latest resolves to the current user's latest instance when
+    possible.
 
     Args:
         service: log name
         index: line number
-        window: lines before and after
-        run_id: service startup run id, or "latest" for the newest run.
+        window: lines before and after (default: 20, max: 40)
+        run_id: service startup run id, or "latest" for the current user's
+                newest run when possible.
                 Do not use "all" here.
+        instance_id: service instance id. If provided, it overrides run_id.
     """
 
+    if instance_id:
+        access_error = service_instance_access_error(instance_id, "查看日志上下文")
+        if access_error:
+            return access_error
+        run_id = instance_id
     return context_log(service, index, window, run_id)
 
 
@@ -3832,7 +8741,9 @@ def service_test_list() -> str:
 
 
 @tool
-def service_test_run(test_name: str = "basicmedicalrecord.sh") -> str:
+def service_test_run(
+    test_name: str = "basicmedicalrecord.sh", instance_id: str = "latest"
+) -> str:
     """
     Run a specific test script.
 
@@ -3843,20 +8754,29 @@ def service_test_run(test_name: str = "basicmedicalrecord.sh") -> str:
         test_name (str, optional): Name of the test script to execute.
                                    Defaults to "basicmedicalrecord.sh".
                                    Example: "diagnosis.sh", "inpatient.sh"
+        instance_id: Service instance id, or latest for the current user's
+                     latest running instance. If the current user has multiple
+                     running instances, pass a specific instance_id.
 
     """
 
-    return start_single_test(test_name)
+    return start_single_test(test_name, instance_id)
 
 
 @tool
-def service_test_run_all() -> str:
-    """Run all test scripts in test directory."""
-    return start_all_tests()
+def service_test_run_all(instance_id: str = "latest") -> str:
+    """Run all test scripts using the current user's running service instance."""
+    return start_all_tests(instance_id)
 
 
 @tool
-def service_test_status(test_run_id: str = "latest", lines: int = 30) -> str:
+def service_test_status(
+    test_run_id: str = "latest",
+    lines: int = 30,
+    instance_id: str = "",
+    limit: int = DEFAULT_LIST_LIMIT,
+    scope: str = "mine",
+) -> str:
     """
     Check background service test status.
 
@@ -3864,43 +8784,76 @@ def service_test_status(test_run_id: str = "latest", lines: int = 30) -> str:
         test_run_id: test run id, or "latest" for the latest submitted test.
                      Use "all" to list all currently running test scripts.
         lines: number of recent log lines to include.
+        instance_id: When test_run_id="all", filter running tests by service instance id.
+        limit: When test_run_id="all", maximum running tests to show, default 20, max 100.
+        scope: mine shows current user's tasks by default; all shows all users' tasks read-only.
     """
 
-    return test_status_text(test_run_id, lines)
+    if test_run_id == "all":
+        text = running_tests_text(instance_id, limit, scope)
+        payload = running_tests_payload(instance_id, limit, scope)
+        return build_local_tool_response(text, {"test_runs": payload})
+    return test_status_text(test_run_id, lines, instance_id, limit, scope)
 
 
 @tool
-def service_test_stop(test_run_id: str = "latest") -> str:
+def service_test_stop_preview(test_run_id: str = "latest", scope: str = "mine") -> str:
+    """Preview stopping a service function test without terminating it."""
+
+    return preview_test_stop(test_run_id, scope)
+
+
+@tool
+def service_test_stop(test_run_id: str = "latest", scope: str = "mine") -> str:
     """
     Stop a running background service test.
 
     Args:
         test_run_id: test run id, or "latest" for the latest submitted test.
+        scope: mine resolves latest within current user's tasks; all allows selecting
+               latest across all users.
     """
 
-    return test_stop_text(test_run_id)
+    text = test_stop_text(test_run_id, False, scope)
+    return build_local_tool_response(
+        text,
+        {
+            "test_run_stop": {
+                "operation": "apply",
+                "test_run_id": test_run_id,
+                "scope": scope,
+                "result": text,
+            }
+        },
+    )
 
 
 @tool
 def config_keys() -> str:
     """
-    Return all valid config keys that can be updated.
+    Return all valid current-user draft config keys that can be updated.
     LLM must choose one of these keys before calling config_update.
+
+    This updates the current user's service.draft.yaml for future new instances only; it does not modify
+    a running instance's service.runtime.yaml.
     """
 
     cfg = show_config()
-    keys = flatten_config_keys(cfg)
+    keys = [key for key in flatten_config_keys(cfg) if key != "ENV.HOST_IP"]
     return "\n".join(keys)
 
 
 @tool
 def config_update(key: str, value: str) -> dict | str:
     """
-    Update config value. Key must be one of config_keys().
+    Update the current user's service.draft.yaml config value. Key must be one of config_keys().
+    This affects future new instances only; it does not modify already running
+    service.runtime.yaml files.
     CUDA_VISIBLE_DEVICES GPU count must equal RUNTIME.TENSOR_PARALLEL_SIZE.
     """
 
-    valid = flatten_config_keys(show_config())
+    cfg = show_config()
+    valid = [key for key in flatten_config_keys(cfg) if key != "ENV.HOST_IP"]
 
     if key not in valid:
         # suffix match
@@ -3916,8 +8869,35 @@ def config_update(key: str, value: str) -> dict | str:
 
     if key == "ENV.CUDA_VISIBLE_DEVICES" and value.startswith("["):
         value = ",".join(map(str, ast.literal_eval(value)))
+    if key == "ENV.CUDA_VISIBLE_DEVICES":
+        try:
+            parse_visible_gpus(value)
+        except Exception:
+            return "CUDA_VISIBLE_DEVICES 格式错误，应使用逗号分隔，例如 '0,1,2,3'"
+    current_value = get_config_value(cfg, key)
+    if config_value_equal(current_value, value):
+        text = f"配置未变化，无需更新: {ensure_user_draft_config()}: .{key} = {value}"
+        return build_local_tool_response(
+            text,
+            {
+                "config_draft": {
+                    "operation": "update",
+                    "applies_to": "new_instances",
+                    "values": show_public_config(),
+                }
+            },
+        )
     text = update_config(key, value)
-    return build_local_tool_response(text, {"config": show_public_config()})
+    return build_local_tool_response(
+        text,
+        {
+            "config_draft": {
+                "operation": "update",
+                "applies_to": "new_instances",
+                "values": show_public_config(),
+            }
+        },
+    )
 
 
 @tool
@@ -3989,6 +8969,7 @@ def benchmark_run(
     max_workers: int = 5,
     limit: int = 0,
     save_every: int = 2,
+    instance_id: str = "latest",
 ) -> str:
     """
     Run a benchmark evaluation job asynchronously.
@@ -4006,6 +8987,11 @@ def benchmark_run(
       step1.json; do not add medical_choice/ prefix.
     - If service_start was just submitted and the service is still starting,
       do not call this tool yet; ask the user to retry after startup is ready.
+    - The tool checks the selected instance's /v1/models endpoint before
+      submitting the job. If the API is not ready, report the message to the
+      user and ask them to retry later.
+    - If the current user has multiple running service instances, pass a
+      specific instance_id. Do not rely on latest.
     - For TruthfulQA, if the user says only "truthfulqa" without specifying a
       mode, pass dataset="truthfulqa" unchanged. Do not infer mc1 or mc2 from
       conversation context. Use truthfulqa-mc1 only when the user explicitly
@@ -4020,32 +9006,42 @@ def benchmark_run(
     - max_workers: Concurrent model requests.
     - limit: Optional sample limit for general benchmarks. Use 0 for full dataset.
     - save_every: Save partial result every N completed samples.
+    - instance_id: Service instance id, or latest for the current user's latest
+      running instance.
     """
 
     return benchmark_run_unified(
-        dataset, benchmark_type, split, max_workers, limit, save_every
+        dataset, benchmark_type, split, max_workers, limit, save_every, instance_id
     )
 
 
 @tool
-def benchmark_report(job_id: str) -> str:
+def benchmark_report(job_id: str, scope: str = "mine") -> str:
     """
     Retrieve benchmark report by job_id.
 
     The report includes status, progress, partial results, final metrics, log path
     and output path. Use this for user requests about benchmark progress, result,
     score, completion state, or "how is this job going".
+    scope: mine shows current user's report by default; all allows read-only
+    viewing of all users' benchmark reports.
     """
 
-    text = benchmark_report_text(job_id)
-    report = benchmark_report_data(job_id, text)
+    text = benchmark_report_text(job_id, scope)
     return build_local_tool_response(
-        text, {"benchmark": report, "benchmark_reports": [report]}
+        text,
+        {
+            "benchmark_reports": [
+                benchmark_report_data(job_id, scope)
+            ]
+        },
     )
 
 
 @tool
-def benchmark_jobs() -> str:
+def benchmark_jobs(
+    instance_id: str = "", limit: int = DEFAULT_LIST_LIMIT, scope: str = "mine"
+) -> str:
     """
     List all benchmark jobs with their current status.
 
@@ -4059,9 +9055,32 @@ def benchmark_jobs() -> str:
        - model name
        - dataset name
        - status (running / finished / stopped / failed / not found)
+       - service instance id
+
+    Args:
+        instance_id: optional service instance id. When provided, only jobs
+                     associated with that instance are listed.
+        limit: maximum jobs to show, default 20, max 100.
+        scope: mine shows current user's jobs by default; all shows all users'
+               jobs read-only.
     """
 
-    return list_benchmark_jobs_text()
+    text = list_benchmark_jobs_text(instance_id, limit, scope)
+    payload = list_benchmark_jobs_payload(instance_id, limit, scope)
+    return build_local_tool_response(
+        text,
+        {
+            "benchmark_jobs": payload,
+            "benchmark_reports": payload.get("items", []),
+        },
+    )
+
+
+@tool
+def benchmark_stop_preview(job_id: str) -> str:
+    """Preview stopping a benchmark job without terminating it."""
+
+    return preview_benchmark_stop(job_id)
 
 
 @tool
@@ -4088,7 +9107,17 @@ def benchmark_stop(job_id: str) -> str:
       Do not call it automatically just because service_stop was blocked.
     """
 
-    return stop_benchmark_job(job_id)
+    text = stop_benchmark_job(job_id)
+    return build_local_tool_response(
+        text,
+        {
+            "benchmark_stop": {
+                "operation": "apply",
+                "job_id": job_id,
+                "result": text,
+            }
+        },
+    )
 
 
 @tool
@@ -4107,10 +9136,17 @@ def node_list(show_disabled: bool = False) -> str:
     if not nodes:
         return f"暂无节点配置: {NODES_CONFIG_FILE}"
 
+    if resource_pool_managed():
+        resource_error = managed_resource_error()
+        if resource_error:
+            return resource_error
+
     lines = ["多节点推理 Agent 配置:"]
     for key, node in nodes.items():
         enabled = is_node_enabled(node)
         if not enabled and not show_disabled:
+            continue
+        if resource_pool_managed() and not node_matches_resource(key, node):
             continue
         lines.append(
             " | ".join(
@@ -4120,6 +9156,7 @@ def node_list(show_disabled: bool = False) -> str:
                     f"enabled={enabled}",
                     f"role={node.get('ROLE', '')}",
                     f"host={node.get('HOST', '')}",
+                    f"resource_node_id={node.get('RESOURCE_NODE_ID', key)}",
                     f"tool_url={node.get('TOOL_URL') or get_node_tool_url(node.get('URL', ''))}",
                 ]
             )
@@ -4184,7 +9221,7 @@ def node_disable(node: str) -> str:
 
 
 @tool
-def node_service_status(node: str) -> str:
+def node_service_status(node: str = "") -> str:
     """
     Check one remote node's local inference service status.
 
@@ -4199,12 +9236,11 @@ def node_service_status(node: str) -> str:
         node: node key/name/host from nodes.yaml.
     """
 
-    response = call_node_tool(node, "service_status")
-    return build_node_tool_response(node, response)
+    return node_tool_structured(node, "service_status")
 
 
 @tool
-def node_gpu_status(node: str) -> str:
+def node_gpu_status(node: str = "") -> str:
     """
     Check one remote node's local GPU status.
 
@@ -4217,12 +9253,11 @@ def node_gpu_status(node: str) -> str:
         node: node key/name/host from nodes.yaml.
     """
 
-    response = call_node_tool(node, "gpu_status")
-    return format_node_tool_response(node, response)
+    return node_tool_text(node, "gpu_status")
 
 
 @tool
-def node_config_show(node: str) -> str:
+def node_config_show(node: str = "") -> str:
     """
     Show one remote node's local inference service config.
 
@@ -4237,12 +9272,11 @@ def node_config_show(node: str) -> str:
         node: node key/name/host from nodes.yaml.
     """
 
-    response = call_node_tool(node, "config_show")
-    return build_node_tool_response(node, response)
+    return node_tool_structured(node, "config_show")
 
 
 @tool
-def node_config_keys(node: str) -> str:
+def node_config_keys(node: str = "") -> str:
     """
     Return config keys that can be updated on one remote node.
 
@@ -4251,12 +9285,11 @@ def node_config_keys(node: str) -> str:
     the returned keys or a unique suffix accepted by the remote worker.
     """
 
-    response = call_node_tool(node, "config_keys")
-    return format_node_tool_response(node, response)
+    return node_tool_text(node, "config_keys")
 
 
 @tool
-def node_config_update(node: str, key: str, value: str) -> str:
+def node_config_update(node: str = "", key: str = "", value: str = "") -> str:
     """
     Update one whitelisted config key on a remote node.
 
@@ -4283,12 +9316,11 @@ def node_config_update(node: str, key: str, value: str) -> str:
         value: new value as string.
     """
 
-    response = call_node_tool(node, "config_update", {"key": key, "value": value})
-    return build_node_tool_response(node, response)
+    return node_tool_structured(node, "config_update", {"key": key, "value": value})
 
 
 @tool
-def node_port_status(node: str, port: int) -> str:
+def node_port_status(node: str = "", port: int = 0) -> str:
     """
     Check one port status on one remote node.
 
@@ -4297,12 +9329,11 @@ def node_port_status(node: str, port: int) -> str:
     service status.
     """
 
-    response = call_node_tool(node, "port_status", {"port": port})
-    return format_node_tool_response(node, response)
+    return node_tool_text(node, "port_status", {"port": port})
 
 
 @tool
-def node_model_list(node: str) -> str:
+def node_model_list(node: str = "") -> str:
     """
     List available models on one remote node.
 
@@ -4310,26 +9341,24 @@ def node_model_list(node: str) -> str:
     has not provided the exact model name/path available on that node.
     """
 
-    response = call_node_tool(node, "model_list")
-    return format_node_tool_response(node, response)
+    return node_tool_text(node, "model_list")
 
 
 @tool
-def node_config_check(node: str) -> str:
+def node_config_check(node: str = "") -> str:
     """
     Check whether one remote node's service config is valid before startup.
 
-    This validates the selected node's current service.yaml, model path, GPU
+    This validates the selected node's current user's draft config, model path, GPU
     allocation, tensor parallel size, and ports. It does not start, stop, or
     modify anything.
     """
 
-    response = call_node_tool(node, "config_check")
-    return format_node_tool_response(node, response)
+    return node_tool_text(node, "config_check")
 
 
 @tool
-def node_gpu_recommend_allocation(node: str) -> str:
+def node_gpu_recommend_allocation(node: str = "") -> str:
     """
     Recommend GPU allocation for one remote node.
 
@@ -4340,8 +9369,7 @@ def node_gpu_recommend_allocation(node: str) -> str:
     node_service_start.
     """
 
-    response = call_node_tool(node, "gpu_recommend_allocation")
-    return format_node_tool_response(node, response)
+    return node_tool_text(node, "gpu_recommend_allocation")
 
 
 @tool
@@ -4362,13 +9390,19 @@ def node_recommend_start_target(target_node: str = "auto") -> str:
     nodes = load_nodes_config()
     if not nodes:
         return f"暂无节点配置: {NODES_CONFIG_FILE}"
+    if resource_pool_managed():
+        resource_error = managed_resource_error(require_gpus=True)
+        if resource_error:
+            return resource_error
 
+    target_text = str(target_node or "auto").strip()
     preferred_key = ""
-    if str(target_node or "auto").strip().lower() not in {"", "auto"}:
+
+    if target_text.lower() not in {"", "auto"}:
         try:
-            preferred_key, _ = resolve_node_config(target_node)
+            preferred_key, _ = resolve_node_config(target_text)
         except Exception as e:
-            return f"目标节点无效: {target_node}\nerror={e}"
+            return f"目标节点无效: {target_text}\nerror={e}"
 
     candidates = []
     skipped = []
@@ -4380,14 +9414,10 @@ def node_recommend_start_target(target_node: str = "auto") -> str:
         if not node_is_worker(node_cfg):
             skipped.append(f"{node_key}: not worker")
             continue
-
+        if resource_pool_managed() and not node_matches_resource(node_key, node_cfg):
+            skipped.append(f"{node_key}: outside resource boundary")
+            continue
         try:
-            status_response = call_node_tool(node_key, "service_status")
-            status_text = response_result_text(status_response)
-            if service_status_has_running(status_text):
-                skipped.append(f"{node_key}: service already running")
-                continue
-
             recommend_response = call_node_tool(node_key, "gpu_recommend_allocation")
             recommend = parse_recommend_result(recommend_response)
             if not recommend["ok"]:
@@ -4449,34 +9479,23 @@ def node_recommend_start_target(target_node: str = "auto") -> str:
 
     lines.append(f"- 推荐节点: {best['node']}")
     lines.append(
-        f"- 推荐配置: ENV.CUDA_VISIBLE_DEVICES={best['recommended_gpus']}, "
-        f"RUNTIME.TENSOR_PARALLEL_SIZE={best['recommended_tp']}"
+        f"- 预计自动分配: GPU={best['recommended_gpus']}, "
+        f"TP={best['recommended_tp']}"
     )
-    if best.get("current_ok"):
-        lines.append("- 说明: 推荐节点当前 service.yaml 已满足最低启动需求，可直接调用 node_service_start。")
-    else:
-        lines.append("- 说明: 推荐节点需要先按推荐配置更新 service.yaml，再启动。")
+    lines.append(
+        "- 说明: node_service_start 会为新实例自动选择 GPU 和端口，"
+        "不要为了使用推荐 GPU 而调用 node_config_update。"
+    )
 
     lines.append("")
     lines.append("后续操作建议:")
-    if not best.get("current_ok"):
-        lines.append(
-            f"1. node_config_update(node='{best['node']}', key='ENV.CUDA_VISIBLE_DEVICES', "
-            f"value='{best['recommended_gpus']}')"
-        )
-        lines.append(
-            f"2. node_config_update(node='{best['node']}', key='RUNTIME.TENSOR_PARALLEL_SIZE', "
-            f"value='{best['recommended_tp']}')"
-        )
-        lines.append(f"3. node_service_start(node='{best['node']}')")
-    else:
-        lines.append(f"1. node_service_start(node='{best['node']}')")
-        lines.append(f"2. node_service_start_status(node='{best['node']}', run_id='latest')")
+    lines.append(f"1. node_service_start(node='{best['node']}')")
+    lines.append(f"2. node_service_start_status(node='{best['node']}', run_id='latest')")
 
     lines.append("")
     lines.append("候选节点摘要:")
     for item in usable:
-        status = "current_ok" if item.get("current_ok") else "needs_config_update"
+        status = "template_ok" if item.get("current_ok") else "auto_allocation_available"
         lines.append(
             f"- {item['node']}: {status}, gpu={item.get('recommended_gpus')}, "
             f"tp={item.get('recommended_tp')}"
@@ -4489,7 +9508,12 @@ def node_recommend_start_target(target_node: str = "auto") -> str:
 
 
 @tool
-def node_service_start(node: str) -> str:
+def node_service_start(
+    node: str = "",
+    gpu_ids: str = "",
+    tensor_parallel_size: int = 0,
+    fallback_to_auto: bool = False,
+) -> str:
     """
     Start one remote node's local inference service.
 
@@ -4497,14 +9521,12 @@ def node_service_start(node: str) -> str:
     such as node1/main. The remote node will run its own service_start policy
     checks before starting.
 
-    This tool only starts the service with the node's current service.yaml.
-    It does not modify CUDA_VISIBLE_DEVICES, TENSOR_PARALLEL_SIZE, model name,
-    ports, or any other config.
+    This tool starts from the remote current user's draft config. For a one-time
+    GPU selection, pass gpu_ids directly instead of calling node_config_update.
+    The worker writes the selection only to the new instance runtime config.
 
-    If the user requested any config change before startup, such as "use GPU 0",
-    "set TP=1", "switch model", or "change port", call node_config_update for
-    every requested config change first. Only call node_service_start after all
-    required node_config_update calls have succeeded.
+    Use node_config_update first only for persistent settings such as model name,
+    memory utilization, max tokens, or other draft configuration.
 
     If this tool returns blocked/insufficient_memory, call
     node_recommend_start_target with the same node to find another available
@@ -4516,14 +9538,35 @@ def node_service_start(node: str) -> str:
 
     Args:
         node: node key/name/host from nodes.yaml.
+        gpu_ids: comma-separated physical GPU indexes, or empty for automatic
+            allocation.
+        tensor_parallel_size: defaults to the number of specified GPUs and must
+            match that count when provided.
+        fallback_to_auto: set true only when the user explicitly permits using
+            other GPUs if the requested GPUs are unavailable.
     """
 
-    response = call_node_tool(node, "service_start")
-    return append_start_target_hint(format_node_tool_response(node, response), node)
+    response = call_node_tool(
+        node,
+        "service_start",
+        {
+            "gpu_ids": gpu_ids,
+            "tensor_parallel_size": tensor_parallel_size,
+            "fallback_to_auto": fallback_to_auto,
+        },
+    )
+    structured = build_node_tool_response(node, response)
+    structured["_tool_text"] = append_start_target_hint(
+        str(structured.get("_tool_text") or ""),
+        node,
+    )
+    return structured
 
 
 @tool
-def node_service_start_status(node: str, run_id: str = "latest") -> str:
+def node_service_start_status(
+    node: str = "", run_id: str = "latest", instance_id: str = ""
+) -> str:
     """
     Check one remote node's latest service start task status.
 
@@ -4533,39 +9576,115 @@ def node_service_start_status(node: str, run_id: str = "latest") -> str:
 
     Args:
         node: node key/name/host from nodes.yaml.
-        run_id: service start run_id on that node, or latest.
+        run_id: service start run_id on that node, service instance id, or latest.
+        instance_id: service instance id. If provided, it overrides run_id.
     """
 
-    response = call_node_tool(node, "service_start_status", {"run_id": run_id})
-    return format_node_tool_response(node, response)
+    if instance_id:
+        run_id = instance_id
+    return node_tool_text(node, "service_start_status", {"run_id": run_id})
 
 
 @tool
-def node_service_stop(node: str) -> str:
+def node_service_stop(node: str = ""):
     """
-    Stop one remote node's local inference service.
+    Stop the current user's active inference service instance on one remote node.
 
     Use this controller-side tool when the user explicitly specifies a node such
-    as node1/main or asks to stop service on a remote node. This stops the
-    remote node's local service stack only; it does not disable the node in
-    nodes.yaml. Use node_disable separately if the user wants to disable routing
-    after service is stopped.
+    as node1/main or asks to stop service on a remote node. If that remote node
+    has multiple active instances for the current user, the worker asks for an
+    explicit instance_id. Use node_service_instance_stop(instance_id=...) after
+    the target instance is known. This does not disable the node in nodes.yaml.
+    Use node_disable separately if the user wants to disable routing.
 
     Args:
         node: node key/name/host from nodes.yaml.
     """
 
-    response = call_node_tool(node, "service_stop")
-    return format_node_tool_response(node, response)
+    return node_tool_structured(node, "service_stop")
 
 
 @tool
-def node_service_restart(node: str) -> str:
+def node_service_instance_list(
+    node: str = "", scope: str = "mine", limit: int = DEFAULT_LIST_LIMIT
+) -> str:
+    """
+    List inference service instances on one remote node.
+
+    Args:
+        node: node key/name/host from nodes.yaml.
+        scope: mine or all.
+        limit: maximum instances to show, default 20, max 100.
+    """
+
+    return node_tool_structured(
+        node, "service_instance_list", {"scope": scope, "limit": limit}
+    )
+
+
+@tool
+def node_service_instance_status(node: str = "", instance_id: str = "latest") -> str:
+    """
+    Show one inference service instance status on a remote node.
+
+    Args:
+        node: node key/name/host from nodes.yaml.
+        instance_id: instance id, or latest for current user's latest instance.
+    """
+
+    return node_tool_structured(
+        node, "service_instance_status", {"instance_id": instance_id}
+    )
+
+
+@tool
+def node_service_instance_tasks(node: str = "", instance_id: str = "latest") -> str:
+    """
+    List benchmark and service-test tasks associated with one remote service instance.
+
+    Args:
+        node: node key/name/host from nodes.yaml.
+        instance_id: instance id, or latest for current user's latest instance.
+    """
+
+    return node_tool_text(
+        node, "service_instance_tasks", {"instance_id": instance_id}
+    )
+
+
+@tool
+def node_service_instance_stop_preview(node: str = "", instance_id: str = "latest"):
+    """Preview stopping one current-user-owned remote inference service instance."""
+
+    return node_tool_structured(
+        node, "service_instance_stop_preview", {"instance_id": instance_id}
+    )
+
+
+@tool
+def node_service_instance_stop(node: str = "", instance_id: str = "latest"):
+    """
+    Stop one current-user-owned inference service instance on a remote node.
+
+    Cross-user stop is not allowed by ordinary tools.
+
+    Args:
+        node: node key/name/host from nodes.yaml.
+        instance_id: instance id, or latest for current user's latest instance.
+    """
+
+    return node_tool_structured(
+        node, "service_instance_stop", {"instance_id": instance_id}
+    )
+
+
+@tool
+def node_service_restart(node: str = "") -> str:
     """
     Restart one remote node's local inference service.
 
     Use this controller-side tool when the user explicitly specifies a node such
-    as node1/main. The remote node restarts with its current service.yaml.
+    as node1/main. The remote node restarts with its current user's draft config.
 
     This tool does not modify GPU, TP, model, or port config. If the user asks
     to change config and restart, call node_config_update for every requested
@@ -4576,30 +9695,41 @@ def node_service_restart(node: str) -> str:
         node: node key/name/host from nodes.yaml.
     """
 
-    response = call_node_tool(node, "service_restart")
-    return format_node_tool_response(node, response)
+    return node_tool_text(node, "service_restart")
 
 
 @tool
-def node_service_log_runs(node: str, limit: int = 10) -> str:
+def node_service_log_runs(
+    node: str = "", limit: int = 10, instance_id: str = ""
+) -> str:
     """
     List recent service log runs on one remote node.
 
     Use this to discover valid run_id values before calling
     node_service_log_tail, node_service_log_search, or node_service_log_context
     for historical logs. Use run_id="latest" only for the newest/current logs.
+    In multi-instance scenarios, prefer instance_id to avoid reading the wrong
+    instance logs.
+
+    Args:
+        node: node key/name/host from nodes.yaml.
+        limit: maximum number of recent runs to list, max 100.
+        instance_id: optional service instance id. When provided, only logs for
+          that instance are listed.
     """
 
-    response = call_node_tool(node, "service_log_runs", {"limit": limit})
-    return format_node_tool_response(node, response)
+    return node_tool_text(
+        node, "service_log_runs", {"limit": limit, "instance_id": instance_id}
+    )
 
 
 @tool
 def node_service_log_tail(
-    node: str,
+    node: str = "",
     service: str = "all",
     lines: int = 80,
     run_id: str = "latest",
+    instance_id: str = "",
 ) -> str:
     """
     Summarize important service log messages on one remote node.
@@ -4607,29 +9737,37 @@ def node_service_log_tail(
     Use this to inspect errors, warnings, and recent log lines for one remote
     startup run. If the user asks for historical logs and no run_id is clear,
     call node_service_log_runs first.
+    In multi-instance scenarios, pass instance_id whenever the user refers to a
+    specific service instance.
 
     Args:
         node: node key/name/host from nodes.yaml.
         service: one of start, vllm, inference, ui, web, case2chat, or all.
-        lines: number of recent lines to include.
+        lines: number of recent lines to include (max: 80).
         run_id: service startup run id, or latest.
+        instance_id: service instance id. If provided, it overrides run_id.
     """
 
-    response = call_node_tool(
+    return node_tool_text(
         node,
         "service_log_tail",
-        {"service": service, "lines": lines, "run_id": run_id},
+        {
+            "service": service,
+            "lines": lines,
+            "run_id": run_id,
+            "instance_id": instance_id,
+        },
     )
-    return format_node_tool_response(node, response)
 
 
 @tool
 def node_service_log_search(
-    node: str,
+    node: str = "",
     keyword: str = "error",
     service: str = "all",
     lines: int = 20,
     run_id: str = "latest",
+    instance_id: str = "",
 ) -> str:
     """
     Search service logs on one remote node.
@@ -4638,41 +9776,62 @@ def node_service_log_search(
     case-insensitively. Use service="all" to search all service logs on that
     node. If the user asks for historical logs and no run_id is clear, call
     node_service_log_runs first.
+    In multi-instance scenarios, pass instance_id whenever the user refers to a
+    specific service instance.
+
+    Args:
+        lines: number of matching results (max: 80).
     """
 
-    response = call_node_tool(
+    return node_tool_text(
         node,
         "service_log_search",
-        {"keyword": keyword, "service": service, "lines": lines, "run_id": run_id},
+        {
+            "keyword": keyword,
+            "service": service,
+            "lines": lines,
+            "run_id": run_id,
+            "instance_id": instance_id,
+        },
     )
-    return format_node_tool_response(node, response)
 
 
 @tool
 def node_service_log_context(
-    node: str,
-    service: str,
-    index: int,
+    node: str = "",
+    service: str = "start",
+    index: int = 1,
     window: int = 20,
     run_id: str = "latest",
+    instance_id: str = "",
 ) -> str:
     """
     Show service log context around a line number on one remote node.
 
     Use this after node_service_log_tail or node_service_log_search returns a
     specific line number and the user wants surrounding lines.
+    In multi-instance scenarios, pass instance_id whenever the user refers to a
+    specific service instance.
+
+    Args:
+        window: lines before and after the target line (max: 40).
     """
 
-    response = call_node_tool(
+    return node_tool_text(
         node,
         "service_log_context",
-        {"service": service, "index": index, "window": window, "run_id": run_id},
+        {
+            "service": service,
+            "index": index,
+            "window": window,
+            "run_id": run_id,
+            "instance_id": instance_id,
+        },
     )
-    return format_node_tool_response(node, response)
 
 
 @tool
-def node_service_test_list(node: str) -> str:
+def node_service_test_list(node: str = "") -> str:
     """
     List service function test scripts on one remote node.
 
@@ -4680,13 +9839,14 @@ def node_service_test_list(node: str) -> str:
     evaluation datasets. Use node_benchmark_list for benchmark datasets.
     """
 
-    response = call_node_tool(node, "service_test_list")
-    return format_node_tool_response(node, response)
+    return node_tool_text(node, "service_test_list")
 
 
 @tool
 def node_service_test_run(
-    node: str, test_name: str = "basicmedicalrecord.sh"
+    node: str = "",
+    test_name: str = "basicmedicalrecord.sh",
+    instance_id: str = "latest",
 ) -> str:
     """
     Run one service function test script on one remote node.
@@ -4697,16 +9857,15 @@ def node_service_test_run(
     to stop it.
     """
 
-    response = call_node_tool(
+    return node_tool_text(
         node,
         "service_test_run",
-        {"test_name": test_name},
+        {"test_name": test_name, "instance_id": instance_id},
     )
-    return format_node_tool_response(node, response)
 
 
 @tool
-def node_service_test_run_all(node: str) -> str:
+def node_service_test_run_all(node: str = "", instance_id: str = "latest") -> str:
     """
     Run all service function test scripts on one remote node.
 
@@ -4715,13 +9874,17 @@ def node_service_test_run_all(node: str) -> str:
     Do not use this for benchmark datasets.
     """
 
-    response = call_node_tool(node, "service_test_run_all")
-    return format_node_tool_response(node, response)
+    return node_tool_text(node, "service_test_run_all", {"instance_id": instance_id})
 
 
 @tool
 def node_service_test_status(
-    node: str, test_run_id: str = "latest", lines: int = 30
+    node: str = "",
+    test_run_id: str = "latest",
+    lines: int = 30,
+    instance_id: str = "",
+    limit: int = DEFAULT_LIST_LIMIT,
+    scope: str = "mine",
 ) -> str:
     """
     Check service function test status on one remote node.
@@ -4730,36 +9893,64 @@ def node_service_test_status(
         node: node key/name/host from nodes.yaml.
         test_run_id: test run id, latest, or all for currently running tests.
         lines: number of recent log lines to include.
+        instance_id: when test_run_id=all, filter tests by service instance id.
+        limit: when test_run_id=all, maximum running tests to show, default 20, max 100.
+        scope: mine shows current user's tasks by default; all shows all users' tasks read-only.
     """
 
-    response = call_node_tool(
+    return node_tool_structured(
         node,
         "service_test_status",
-        {"test_run_id": test_run_id, "lines": lines},
+        {
+            "test_run_id": test_run_id,
+            "lines": lines,
+            "instance_id": instance_id,
+            "limit": limit,
+            "scope": scope,
+        },
     )
-    return format_node_tool_response(node, response)
 
 
 @tool
-def node_service_test_stop(node: str, test_run_id: str = "latest") -> str:
+def node_service_test_stop_preview(
+    node: str = "",
+    test_run_id: str = "latest",
+    scope: str = "mine",
+) -> str:
+    """Preview stopping a service function test on one remote node."""
+
+    return node_tool_structured(
+        node,
+        "service_test_stop_preview",
+        {"test_run_id": test_run_id, "scope": scope},
+    )
+
+
+@tool
+def node_service_test_stop(
+    node: str = "",
+    test_run_id: str = "latest",
+    scope: str = "mine",
+) -> str:
     """
     Stop a running service function test on one remote node.
 
     Args:
         node: node key/name/host from nodes.yaml.
         test_run_id: test run id, or latest for the latest submitted test.
+        scope: mine resolves latest within current user's tasks; all allows selecting
+          latest across all users.
     """
 
-    response = call_node_tool(
+    return node_tool_structured(
         node,
         "service_test_stop",
-        {"test_run_id": test_run_id},
+        {"test_run_id": test_run_id, "scope": scope},
     )
-    return format_node_tool_response(node, response)
 
 
 @tool
-def node_benchmark_list(node: str, benchmark_type: str = "all") -> str:
+def node_benchmark_list(node: str = "", benchmark_type: str = "all") -> str:
     """
     List available benchmark evaluation datasets on one remote node.
 
@@ -4774,18 +9965,13 @@ def node_benchmark_list(node: str, benchmark_type: str = "all") -> str:
         benchmark_type: all, general, medical_choice, or medbench.
     """
 
-    response = call_node_tool(
-        node,
-        "benchmark_list",
-        {"benchmark_type": benchmark_type},
-    )
-    return format_node_tool_response(node, response)
+    return node_tool_text(node, "benchmark_list", {"benchmark_type": benchmark_type})
 
 
 @tool
 def node_benchmark_inspect(
-    node: str,
-    dataset: str,
+    node: str = "",
+    dataset: str = "",
     benchmark_type: str = "auto",
     split: str = "default",
 ) -> str:
@@ -4801,23 +9987,23 @@ def node_benchmark_inspect(
     explicitly asks for that mode.
     """
 
-    response = call_node_tool(
+    return node_tool_text(
         node,
         "benchmark_inspect",
         {"dataset": dataset, "benchmark_type": benchmark_type, "split": split},
     )
-    return format_node_tool_response(node, response)
 
 
 @tool
 def node_benchmark_run(
-    node: str,
-    dataset: str,
+    node: str = "",
+    dataset: str = "",
     benchmark_type: str = "auto",
     split: str = "default",
     max_workers: int = 5,
     limit: int = 0,
     save_every: int = 2,
+    instance_id: str = "latest",
 ) -> str:
     """
     Run one benchmark evaluation job asynchronously on one remote node.
@@ -4832,6 +10018,8 @@ def node_benchmark_run(
       step1.json; do not add medical_choice/ prefix.
     - If node_service_start was just submitted and the service is still starting,
       do not call this tool yet; ask the user to retry after startup is ready.
+    - Uses the selected node's current user's latest running service instance by
+      default. Pass instance_id only when the user selected a specific instance.
     - For TruthfulQA, if the user says only "truthfulqa" without specifying a
       mode, pass dataset="truthfulqa" unchanged. Do not infer mc1 or mc2 from
       conversation context. Use truthfulqa-mc1 only when the user explicitly
@@ -4843,7 +10031,7 @@ def node_benchmark_run(
     partial result, final metrics, log path, and output path.
     """
 
-    response = call_node_tool(
+    return node_tool_text(
         node,
         "benchmark_run",
         {
@@ -4853,39 +10041,65 @@ def node_benchmark_run(
             "max_workers": max_workers,
             "limit": limit,
             "save_every": save_every,
+            "instance_id": instance_id,
         },
     )
-    return format_node_tool_response(node, response)
 
 
 @tool
-def node_benchmark_report(node: str, job_id: str) -> str:
+def node_benchmark_report(node: str = "", job_id: str = "", scope: str = "mine") -> str:
     """
     Retrieve benchmark report by job_id on one remote node.
 
     Use this for benchmark progress, result, score, completion state, or "how
     is this job going". The job_id belongs to the selected remote node.
+    scope: mine shows current user's report by default; all allows read-only
+    viewing of all users' benchmark reports.
     """
 
-    response = call_node_tool(node, "benchmark_report", {"job_id": job_id})
-    return build_node_tool_response(node, response)
+    return node_tool_structured(
+        node, "benchmark_report", {"job_id": job_id, "scope": scope}
+    )
 
 
 @tool
-def node_benchmark_jobs(node: str) -> str:
+def node_benchmark_jobs(
+    node: str = "",
+    instance_id: str = "",
+    limit: int = DEFAULT_LIST_LIMIT,
+    scope: str = "mine",
+) -> str:
     """
     List benchmark jobs on one remote node.
 
     Use this to find job_id values for node_benchmark_report or
     node_benchmark_stop when the user did not provide a job_id.
+
+    Args:
+        node: node key/name/host from nodes.yaml.
+        instance_id: optional service instance id. When provided, only jobs
+          associated with that instance are listed.
+        limit: maximum jobs to show, default 20, max 100.
+        scope: mine shows current user's jobs by default; all shows all users'
+          jobs read-only.
     """
 
-    response = call_node_tool(node, "benchmark_jobs")
-    return format_node_tool_response(node, response)
+    return node_tool_structured(
+        node,
+        "benchmark_jobs",
+        {"instance_id": instance_id, "limit": limit, "scope": scope},
+    )
 
 
 @tool
-def node_benchmark_stop(node: str, job_id: str) -> str:
+def node_benchmark_stop_preview(node: str = "", job_id: str = "") -> str:
+    """Preview stopping one running benchmark job on one remote node."""
+
+    return node_tool_structured(node, "benchmark_stop_preview", {"job_id": job_id})
+
+
+@tool
+def node_benchmark_stop(node: str = "", job_id: str = "", confirm_text: str = "") -> str:
     """
     Stop one running benchmark job on one remote node.
 
@@ -4893,32 +10107,14 @@ def node_benchmark_stop(node: str, job_id: str) -> str:
     incomplete. Use node_benchmark_jobs first if the job_id is unknown.
     Only call this when the user explicitly confirms stopping the benchmark.
     Do not call it automatically just because node_service_stop was blocked.
+    Cross-user stop is not allowed by ordinary tools.
     """
 
-    response = call_node_tool(node, "benchmark_stop", {"job_id": job_id})
-    return format_node_tool_response(node, response)
+    args = {"job_id": job_id}
+    if str(confirm_text or "").strip():
+        args["confirm_text"] = str(confirm_text).strip()
+    return node_tool_structured(node, "benchmark_stop", args)
 
 
-@tool
-def node_tool_call(node: str, tool_name: str, args_json: str = "{}") -> str:
-    """
-    Call one tool directly on a specific remote inference agent node.
 
-    This is a fallback/debug controller-side tool. Do not use it when a specific
-    node_* wrapper exists, such as node_service_status, node_config_update,
-    node_service_log_tail, node_service_test_run, or node_benchmark_run.
 
-    Use this only when all conditions are true:
-    - The user explicitly names a node.
-    - No specific node_* wrapper exists for the requested operation.
-    - The exact remote worker tool name and arguments are known.
-    - Direct tool execution is intended; this does not call the remote LLM.
-
-    Args:
-        node: node key/name/host from nodes.yaml.
-        tool_name: local worker tool name to execute on that node.
-        args_json: JSON object string for tool arguments, e.g. {"service":"all"}.
-    """
-
-    response = call_node_tool(node, tool_name, parse_json_args(args_json))
-    return format_node_tool_response(node, response)

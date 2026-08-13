@@ -11,6 +11,7 @@ import pickle
 import psutil
 import logging
 import re
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Optional, Set, Any, Union, Tuple
@@ -20,6 +21,21 @@ from dataclasses import dataclass, field
 from utils.config import get_current_config
 
 logger = logging.getLogger(__name__)
+
+
+class _AsyncThreadLock:
+    """Async context wrapper for state shared across request worker threads."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+
+    async def __aenter__(self):
+        await asyncio.to_thread(self._lock.acquire)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self._lock.release()
+        return False
 
 
 def _safe_path_part(value: str) -> str:
@@ -68,8 +84,10 @@ class MemoryManager:
         # 会话状态（所有会话的状态信息）
         self.session_states: Dict[str, SessionState] = {}
         
-        # 锁
-        self._lock = asyncio.Lock()
+        # 锁：请求现在会在多个 worker 线程的独立事件循环中执行，
+        # 这里使用线程级锁，避免 asyncio.Lock 跨 event loop 复用。
+        self._lock = _AsyncThreadLock()
+        self._lifecycle_lock = threading.Lock()
         
         # 序列化路径
         self.persistence_path = Path(self.persistence_config.serialization_path)
@@ -84,9 +102,12 @@ class MemoryManager:
     
     async def start(self):
         """启动内存管理后台任务"""
-        self._running = True
-        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
-        self._monitor_task = asyncio.create_task(self._monitor_loop())
+        with self._lifecycle_lock:
+            if self._running:
+                return
+            self._running = True
+            self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+            self._monitor_task = asyncio.create_task(self._monitor_loop())
         logger.info("MemoryManager background tasks started")
     
     async def stop(self):
@@ -396,12 +417,15 @@ class MemoryManager:
 
 # 全局内存管理器实例
 _memory_manager: Optional[MemoryManager] = None
+_memory_manager_init_lock = threading.Lock()
 
 
 async def get_memory_manager() -> MemoryManager:
     """获取内存管理器（单例）"""
     global _memory_manager
-    if _memory_manager is None:
-        _memory_manager = MemoryManager()
-        await _memory_manager.start()
-    return _memory_manager
+    with _memory_manager_init_lock:
+        if _memory_manager is None:
+            _memory_manager = MemoryManager()
+        manager = _memory_manager
+    await manager.start()
+    return manager

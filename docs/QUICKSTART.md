@@ -1,6 +1,6 @@
 # Quickstart
 
-This guide starts MedFlow Runtime MP on a single machine for local validation. Before starting, create the Agent, training, evaluation/inference, and GRPO/verl containers according to [Deployment Guide](DEPLOYMENT.md).
+This guide starts MedFlow ChatTune on a single machine for local validation. Before starting, create the Agent, training, evaluation/inference, and GRPO/verl containers according to [Deployment Guide](DEPLOYMENT.md).
 
 ## Prerequisites
 
@@ -46,7 +46,7 @@ This creates `runtime.env`, including local runtime tokens and the initial admin
 | `MEDFLOW_LOCAL_EVALUATE_CONTAINER` | Evaluation/inference container name that actually exists on this machine, used for evaluation and inference-related tasks. |
 | `MEDFLOW_LOCAL_GRPO_CONTAINER` | GRPO/verl container name that actually exists on this machine, used for GRPO/verl training tasks. |
 | `MODEL_NAME` / `MODEL_API_KEY` / `MODEL_BASE_URL` | OpenAI-compatible model name, API key, and service URL used by Agent. |
-| `INFERENCE_AGENT_URL` | Inference Agent controller `/inference_agent` URL started according to the deployment guide. |
+| `INFERENCE_AGENT_URL` | Inference Agent controller `/inference_agent` URL started according to the deployment guide. Studio administrator maintenance actions use the Studio login session; restrict Inference Agent `/admin/*` to trusted Studio Server access if enabled. |
 | `STUDIO_PUBLIC_URL` | Studio URL opened by users in a browser; do not keep `127.0.0.1` for cross-machine access. |
 | `STUDIO_URL` | Studio backend URL used by Runtime/Agent callbacks, with default backend port `3000`; use a host-reachable IP or domain for cross-machine access. |
 | `MEDFLOW_RESOURCE_NODES` | Studio resource-pool node list; single-machine mode usually includes the local node `id`, `name`, and `baseUrl`, and `baseUrl` must point to the local Agent API. |

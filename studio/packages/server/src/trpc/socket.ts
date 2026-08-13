@@ -952,10 +952,32 @@ export class SocketManager {
               });
               return;
             }
+            const medflowOwnerUserId = currentUser?.id
+
+              ? `auth:${currentUser.id}`
+
+              : currentUser?.username;
+
+            const medflowOwnerAliases = Array.from(
+
+              new Set([currentUser?.id, currentUser?.username].filter(Boolean) as string[]),
+
+            );
+
             const trustedStructuredInput = {
+
               ...(structuredInput || {}),
+
               __medflowUsername: currentUser?.username,
+
+              __medflowUserId: currentUser?.id,
+
+              __medflowOwnerUserId: medflowOwnerUserId,
+
+              __medflowOwnerAliases: medflowOwnerAliases,
+
               __medflowResourceGroupId: resourceUser?.group?.id,
+
             };
             console.debug(
               `[StudioInput] forwarding request=${requestId} run=${runId} target=${pythonRunRoom} sockets=${targetRoom.size}`,
@@ -1373,7 +1395,43 @@ export class SocketManager {
     const contextUsername =
       (structuredInput?.__medflowContextUsername as string) || username;
     const medflowUsername =
+
       (structuredInput?.__medflowUsername as string) || username;
+
+    const ownerUserId =
+
+      typeof structuredInput?.__medflowOwnerUserId === "string" &&
+
+      structuredInput.__medflowOwnerUserId.trim()
+
+        ? structuredInput.__medflowOwnerUserId.trim()
+
+        : userId
+
+          ? `auth:${userId}`
+
+          : medflowUsername;
+
+    const structuredOwnerAliases = Array.isArray(
+
+      structuredInput?.__medflowOwnerAliases,
+
+    )
+
+      ? (structuredInput.__medflowOwnerAliases as unknown[])
+
+          .map((value) => String(value || "").trim())
+
+          .filter(Boolean)
+
+      : [];
+
+    const ownerAliases = Array.from(
+
+      new Set([userId, medflowUsername, ...structuredOwnerAliases].filter(Boolean)),
+
+    );
+
     const now = new Date().toISOString();
     const assistantReplyId = createRuntimeId("runtime-assistant");
     const assistantMessageId = createRuntimeId("runtime-message");
@@ -1394,6 +1452,9 @@ export class SocketManager {
           metadata: {
             __medflowContextUsername: contextUsername,
             __medflowUsername: medflowUsername,
+            __medflowUserId: userId,
+            __medflowOwnerUserId: ownerUserId,
+            __medflowOwnerAliases: ownerAliases,
             __medflowResourceGroupId: runtimeContext.resourceGroupId,
             __medflowTrainingPoolId: trainingPoolId || undefined,
           },
@@ -1422,6 +1483,9 @@ export class SocketManager {
             ...metadata,
             __medflowContextUsername: contextUsername,
             __medflowUsername: medflowUsername,
+            __medflowUserId: userId,
+            __medflowOwnerUserId: ownerUserId,
+            __medflowOwnerAliases: ownerAliases,
             __medflowResourceGroupId: runtimeContext.resourceGroupId,
             __medflowTrainingPoolId: trainingPoolId || undefined,
           },
@@ -1467,6 +1531,7 @@ export class SocketManager {
 
     console.info("[RuntimeBridge] Forward user input with containers", {
       userId,
+      userRole: currentUser?.role,
       runId,
       resourceUserId: resourceUser?.id,
       resourceGroupId: runtimeContext.resourceGroupId,
@@ -1496,6 +1561,14 @@ export class SocketManager {
         signal: controller.signal,
         body: JSON.stringify({
           user_id: userId,
+
+          owner_user_id: ownerUserId,
+
+          owner_aliases: ownerAliases,
+
+          context_username: contextUsername,
+
+          user_role: currentUser?.role,
           session_id: sessionId,
           training_container: runtimeContext.trainingContainer,
           evaluation_container: runtimeContext.evaluationContainer,

@@ -9,12 +9,16 @@ from __future__ import annotations
 
 import json
 import hmac
+import logging
 import os
 import re
 import sys
+import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -55,10 +59,69 @@ from resource_api import (  # noqa: E402
 )
 
 
+logger = logging.getLogger(__name__)
 RUNTIME_CONTEXT_MARKER = "__medflow_runtime_context__"
 RUNTIME_CONTEXT_RE = re.compile(
-    r"\b(training_container|evaluation_container|grpo_container|resource_group_id|training_pool_id)=([^\s]*)"
+    r"\b(training_container|evaluation_container|grpo_container|resource_group_id|training_pool_id|user_role|owner_user_id|owner_aliases|context_username)=([^\s]*)"
 )
+DEFAULT_AGENT_REQUEST_THREADS = 8
+
+
+def _agent_request_threads_from_env() -> int:
+    raw_value = os.getenv("MEDFLOW_AGENT_REQUEST_THREADS", "").strip()
+    if not raw_value:
+        return DEFAULT_AGENT_REQUEST_THREADS
+    try:
+        return max(1, int(raw_value))
+    except ValueError:
+        return DEFAULT_AGENT_REQUEST_THREADS
+
+
+_AGENT_REQUEST_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_agent_request_threads_from_env(),
+    thread_name_prefix="agent-request",
+)
+_WORKER_THREAD_STATE = threading.local()
+_SESSION_LOCKS: dict[str, tuple[asyncio.Lock, int]] = {}
+_SESSION_LOCKS_GUARD = threading.Lock()
+
+
+def _session_lock_for_key(session_key: str) -> asyncio.Lock:
+    with _SESSION_LOCKS_GUARD:
+        entry = _SESSION_LOCKS.get(session_key)
+        if entry is None:
+            lock = asyncio.Lock()
+            _SESSION_LOCKS[session_key] = (lock, 1)
+            return lock
+        lock, ref_count = entry
+        _SESSION_LOCKS[session_key] = (lock, ref_count + 1)
+        return lock
+
+
+def _release_session_lock_for_key(session_key: str) -> None:
+    with _SESSION_LOCKS_GUARD:
+        entry = _SESSION_LOCKS.get(session_key)
+        if entry is None:
+            return
+        lock, ref_count = entry
+        if ref_count <= 1 and not lock.locked():
+            _SESSION_LOCKS.pop(session_key, None)
+        else:
+            _SESSION_LOCKS[session_key] = (lock, max(0, ref_count - 1))
+
+
+def _worker_thread_loop() -> asyncio.AbstractEventLoop:
+    loop = getattr(_WORKER_THREAD_STATE, "loop", None)
+    if loop is None or loop.is_closed():
+        loop = asyncio.new_event_loop()
+        _WORKER_THREAD_STATE.loop = loop
+    asyncio.set_event_loop(loop)
+    return loop
+
+
+def _run_coroutine_in_worker_thread(awaitable_factory: Callable[[], Awaitable[Any]]) -> Any:
+    loop = _worker_thread_loop()
+    return loop.run_until_complete(awaitable_factory())
 
 
 def _to_plain_dict(value: Any) -> Any:
@@ -70,26 +133,46 @@ def _to_plain_dict(value: Any) -> Any:
     return value
 
 
-def _request_extra_value(request: Any, key: str, kwargs: dict[str, Any]) -> str:
+def _request_extra_raw(request: Any, key: str, kwargs: dict[str, Any]) -> Any:
     """Read custom AgentRequest fields across pydantic/framework variants."""
     value = getattr(request, key, None)
     if value:
-        return str(value)
+        return value
 
     model_extra = getattr(request, "model_extra", None)
     if isinstance(model_extra, dict) and model_extra.get(key):
-        return str(model_extra[key])
+        return model_extra[key]
 
     dumped = _to_plain_dict(request)
     if isinstance(dumped, dict) and dumped.get(key):
-        return str(dumped[key])
+        return dumped[key]
 
     original = kwargs.get("request")
     if isinstance(original, dict) and original.get(key):
-        return str(original[key])
+        return original[key]
 
-    value = kwargs.get(key)
+    return kwargs.get(key)
+
+
+def _request_extra_value(request: Any, key: str, kwargs: dict[str, Any]) -> str:
+    value = _request_extra_raw(request, key, kwargs)
     return str(value or "")
+
+
+def _request_extra_list(request: Any, key: str, kwargs: dict[str, Any]) -> list[str]:
+    value = _request_extra_raw(request, key, kwargs)
+    if isinstance(value, (list, tuple, set)):
+        values = value
+    else:
+        values = str(value or "").split(",")
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        text = str(item or "").strip()
+        if text and text not in seen:
+            result.append(text)
+            seen.add(text)
+    return result
 
 
 def _runtime_context_from_input(request: Any) -> dict[str, str]:
@@ -206,6 +289,7 @@ async def lifespan(app: FastAPI):
         raise RuntimeError(f"Studio run registration failed: {exc}") from exc
 
     await start_workflow_background_tasks()
+    await get_memory_manager()
     start_gpu_background_refresh()
     try:
         yield
@@ -266,14 +350,31 @@ async def _handle_agent_request(
     evaluation_container = _request_extra_value(request, "evaluation_container", kwargs)
     resource_group_id = _request_extra_value(request, "resource_group_id", kwargs)
     training_pool_id = _request_extra_value(request, "training_pool_id", kwargs)
+    user_role = _request_extra_value(request, "user_role", kwargs)
     grpo_container = _request_extra_value(request, "grpo_container", kwargs)
+    owner_user_id = _request_extra_value(request, "owner_user_id", kwargs)
+    owner_aliases = _request_extra_list(request, "owner_aliases", kwargs)
+    context_username = _request_extra_value(request, "context_username", kwargs)
     training_container = training_container or runtime_context.get("training_container", "")
     evaluation_container = (
         evaluation_container or runtime_context.get("evaluation_container", "")
     )
     resource_group_id = resource_group_id or runtime_context.get("resource_group_id", "")
     training_pool_id = training_pool_id or runtime_context.get("training_pool_id", "")
+    user_role = user_role or runtime_context.get("user_role", "")
     grpo_container = grpo_container or runtime_context.get("grpo_container", "")
+    owner_user_id = owner_user_id or runtime_context.get("owner_user_id", "")
+    if not owner_aliases:
+        owner_aliases = [
+            item.strip()
+            for item in runtime_context.get("owner_aliases", "").split(",")
+            if item.strip()
+        ]
+    context_username = context_username or runtime_context.get("context_username", "")
+    if context_username:
+        context_base = context_username.split("#", 1)[0].strip()
+        if context_base and context_base not in owner_aliases:
+            owner_aliases.append(context_base)
     print(
         "[AgentAPI] received containers",
         {
@@ -282,6 +383,10 @@ async def _handle_agent_request(
             "grpo_container": grpo_container,
             "resource_group_id": resource_group_id,
             "training_pool_id": training_pool_id,
+            "user_role": user_role,
+            "owner_user_id": owner_user_id,
+            "owner_aliases": owner_aliases,
+            "context_username": context_username,
         },
         flush=True,
     )
@@ -295,6 +400,9 @@ async def _handle_agent_request(
         grpo_container=grpo_container,
         resource_group_id=resource_group_id,
         training_pool_id=training_pool_id,
+        user_role=user_role,
+        owner_user_id=owner_user_id,
+        owner_aliases=owner_aliases,
     )
 
     response_text = result.get("message", "")
@@ -307,6 +415,47 @@ async def _handle_agent_request(
         else json.dumps(response_text, ensure_ascii=False)
     )
     return text, metadata
+
+
+async def _run_agent_request(
+    request: AgentRequest,
+    msgs: Any = None,
+    kwargs: dict[str, Any] | None = None,
+    handler: Callable[
+        [AgentRequest, Any, dict[str, Any] | None],
+        Awaitable[tuple[str, dict[str, Any] | None]],
+    ] = _handle_agent_request,
+) -> tuple[str, dict[str, Any] | None]:
+    """Run one Agent request without blocking the FastAPI event loop.
+
+    Requests for the same conversation stay ordered because the Agent session
+    context lives in this process and is not safe to mutate concurrently.
+    """
+    if request is None:
+        raise ValueError("AgentRequest is required")
+    if isinstance(request, dict):
+        request = AgentRequest(**request)
+
+    session_key = _conversation_key(request)
+    lock = _session_lock_for_key(session_key)
+    logger.info("Agent request queued for session %s", session_key)
+    try:
+        async with lock:
+            logger.info("Agent request entered worker queue for session %s", session_key)
+            loop = asyncio.get_running_loop()
+            try:
+                result = await loop.run_in_executor(
+                    _AGENT_REQUEST_EXECUTOR,
+                    _run_coroutine_in_worker_thread,
+                    lambda: handler(request, msgs, kwargs),
+                )
+                logger.info("Agent request completed for session %s", session_key)
+                return result
+            except Exception:
+                logger.exception("Agent request failed for session %s", session_key)
+                raise
+    finally:
+        _release_session_lock_for_key(session_key)
 
 
 @agent_app.query(framework="agentscope")
@@ -324,7 +473,7 @@ async def query_func(
     if isinstance(request, dict):
         request = AgentRequest(**request)
 
-    text, metadata = await _handle_agent_request(request, msgs, kwargs)
+    text, metadata = await _run_agent_request(request, msgs, kwargs)
 
     yield Msg(
         name=_studio_reply_name(request),
@@ -346,7 +495,7 @@ async def runtime_process(request: Request):
 
     async def event_stream():
         try:
-            text, metadata = await _handle_agent_request(agent_request)
+            text, metadata = await _run_agent_request(agent_request)
             if text:
                 yield _runtime_sse_event({"object": "content", "text": text})
             yield _runtime_sse_event(

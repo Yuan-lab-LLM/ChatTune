@@ -34,7 +34,7 @@ export const trpcClient = trpc.createClient({
                 return fetch(url, {
                     ...options,
                     cache: 'no-store', // Disable HTTP caching
-                    credentials: 'same-origin',
+                    credentials: 'include',
                 });
             },
         }),

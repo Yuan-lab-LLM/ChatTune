@@ -4,3 +4,24 @@ PORT: 8899
 LLM_URL: http://127.0.0.1:6000/v1
 LLM_MODEL: example-model-name
 LLM_API_KEY: EMPTY
+
+RESOURCE_POOL:
+  # false keeps unrestricted multi-node routing; true enforces resource_context.
+  ENABLED: true
+
+ADMIN:
+  # Enables local Admin maintenance endpoints.
+  # Studio Server authorizes administrators before calling /admin/*; restrict these endpoints to trusted internal access.
+  ENABLED: true
+
+MEMORY:
+  # Available backends: memory, redis. Default to memory for local/single-process startup.
+  BACKEND: memory
+  # Redis mode requires explicit username/password and the optional LangGraph Redis checkpointer dependency.
+  # Password policy: >=12 chars, upper/lower/digit/special, no whitespace, no raw @:/?# chars.
+  # BACKEND: redis
+  # REDIS_URL: redis://127.0.0.1:6379/0
+  # REDIS_USERNAME: medflow
+  # REDIS_PASSWORD: ChangeMe_Strong1!
+  # 0 keeps checkpoints indefinitely; positive values expire after N minutes.
+  TTL_MINUTES: 0

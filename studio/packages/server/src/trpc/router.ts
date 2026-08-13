@@ -167,7 +167,7 @@ export const createContext = ({
     authToken,
     runtimeToken,
     setAuthCookie: (token: string) => {
-      res.setHeader("Set-Cookie", serializeAuthCookie(token, 7 * 24 * 60 * 60));
+      res.setHeader("Set-Cookie", serializeAuthCookie(token, AuthDao.sessionMaxAgeSeconds()));
     },
     clearAuthCookie: () => {
       res.setHeader("Set-Cookie", serializeAuthCookie("", 0));
@@ -280,6 +280,10 @@ const protectedProcedure = t.procedure.use(async ({ ctx, path, next }) => {
       code: "FORBIDDEN",
       message: "auth.error.passwordChangeRequired",
     });
+  }
+
+  if (ctx.authToken) {
+    ctx.setAuthCookie?.(ctx.authToken);
   }
 
   return next({
@@ -718,6 +722,43 @@ const adminProcedure = protectedProcedure.use(async ({ ctx, next }) => {
 
   return next({ ctx });
 });
+const getInferenceAgentBaseUrl = () => {
+  const raw = process.env.INFERENCE_AGENT_URL?.trim();
+  if (!raw) {
+    throw new TRPCError({
+      code: "BAD_REQUEST",
+      message: "INFERENCE_AGENT_URL is not configured",
+    });
+  }
+  return raw.replace(/\/inference_agent\/?$/, "").replace(/\/$/, "");
+};
+
+const inferenceAdminRequest = async <T = unknown>(
+  path: string,
+  options: { method?: "GET" | "POST"; query?: Record<string, string | number | undefined> } = {},
+): Promise<T> => {
+  const url = new URL(getInferenceAgentBaseUrl() + path);
+  for (const [key, value] of Object.entries(options.query || {})) {
+    if (value !== undefined && value !== "") {
+      url.searchParams.set(key, String(value));
+    }
+  }
+
+  const response = await fetch(url, {
+    method: options.method || "GET",
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    throw new TRPCError({
+      code: response.status === 401 ? "UNAUTHORIZED" : "BAD_REQUEST",
+      message:
+        (payload && typeof payload === "object" && "detail" in payload
+          ? String(payload.detail)
+          : "") || "Inference admin request failed: " + response.status,
+    });
+  }
+  return payload as T;
+};
 const assertResourceNodeAccess = async (user: SafeAuthUser, nodeId: string) => {
   if (nodeId === "all") {
     if (user.role === UserRole.ADMIN) return;
@@ -1326,7 +1367,7 @@ export const appRouter = t.router({
       poolId: z.string().min(1),
       nodeCount: z.number().int().min(1),
       gpusPerNode: z.number().int().min(1),
-      taskCategory: z.enum(["training", "assessment", "evaluation"]).optional(),
+      taskCategory: z.enum(["training", "assessment", "evaluation", "inference"]).optional(),
       taskType: z.string().trim().min(1).optional(),
       taskTypeText: z.string().trim().min(1).optional(),
     }))
@@ -1376,23 +1417,25 @@ export const appRouter = t.router({
           ctx.user as SafeAuthUser,
           input.reservationId,
         );
+        const stopResult = result.stopResult;
+        const isInferenceStop = !!stopResult && "inferenceResponse" in stopResult;
         await auditAdminAction(ctx.user as SafeAuthUser, "admin_training_resources_stop_and_released", {
           reservationId: input.reservationId,
           status: result.reservation.status,
-          mode: "stop_process_and_release_reservation",
-          container: result.stopResult?.container || null,
-          pid: result.stopResult?.pid || null,
-          alreadyExited: result.stopResult?.alreadyExited === true,
-          stopped: result.stopResult?.stopped === true,
+          mode: isInferenceStop ? "stop_inference_service_and_release_reservation" : "stop_process_and_release_reservation",
+          container: stopResult?.container || null,
+          pid: stopResult && "pid" in stopResult ? stopResult.pid || null : null,
+          alreadyExited: stopResult && "alreadyExited" in stopResult ? stopResult.alreadyExited === true : false,
+          stopped: stopResult?.stopped === true,
         });
         return {
           success: result.reservation.status === "released",
           message: result.reservation.status === "released"
-            ? "trainingResource.stopAndReleaseSuccess"
+            ? (isInferenceStop ? "trainingResource.stopInferenceAndReleaseSuccess" : "trainingResource.stopAndReleaseSuccess")
             : result.reservation.errorMessage || "trainingResource.releaseFailed",
           data: {
             reservation: result.reservation,
-            stopResult: result.stopResult,
+            stopResult,
           },
         };
       } catch (error) {
@@ -1420,7 +1463,7 @@ export const appRouter = t.router({
         ageSeconds: z.number().optional(),
         maxAgeSeconds: z.number().optional(),
       }).optional(),
-      taskCategory: z.enum(["training", "assessment", "evaluation"]).optional(),
+      taskCategory: z.enum(["training", "assessment", "evaluation", "inference"]).optional(),
       taskType: z.string().trim().min(1).optional(),
       taskTypeText: z.string().trim().min(1).optional(),
     }))
@@ -1449,7 +1492,7 @@ export const appRouter = t.router({
         ageSeconds: z.number().optional(),
         maxAgeSeconds: z.number().optional(),
       }).optional(),
-      taskCategory: z.enum(["training", "assessment", "evaluation"]).optional(),
+      taskCategory: z.enum(["training", "assessment", "evaluation", "inference"]).optional(),
       taskType: z.string().trim().min(1).optional(),
       taskTypeText: z.string().trim().min(1).optional(),
     }))
@@ -3807,6 +3850,88 @@ export const appRouter = t.router({
       }
     }),
 
+  inferenceAdminCleanupPreview: adminProcedure.query(async () => {
+    const data = await inferenceAdminRequest("/admin/cleanup/preview");
+    return { success: true, message: "Inference admin cleanup preview retrieved", data } as ResponseBody<unknown>;
+  }),
+
+  inferenceAdminCleanupApply: adminProcedure.mutation(async ({ ctx }) => {
+    const data = await inferenceAdminRequest("/admin/cleanup/apply", { method: "POST" });
+    await auditAdminAction(ctx.user as SafeAuthUser, "inference_admin_cleanup_applied", { data });
+    return { success: true, message: "Inference admin cleanup applied", data } as ResponseBody<unknown>;
+  }),
+
+  inferenceAdminListServices: adminProcedure
+    .input(z.object({ limit: z.number().int().positive().max(200).default(20), status: z.string().optional().default("") }).optional())
+    .query(async ({ input }) => {
+      const data = await inferenceAdminRequest("/admin/services", {
+        query: { limit: input?.limit || 20, status: input?.status || "" },
+      });
+      return { success: true, message: "Inference services retrieved", data } as ResponseBody<unknown>;
+    }),
+
+  inferenceAdminStopServicePreview: adminProcedure
+    .input(z.object({ instanceId: z.string().trim().min(1) }))
+    .query(async ({ input }) => {
+      const data = await inferenceAdminRequest(`/admin/services/${encodeURIComponent(input.instanceId)}/stop/preview`);
+      return { success: true, message: "Inference service stop preview retrieved", data } as ResponseBody<unknown>;
+    }),
+
+  inferenceAdminStopServiceApply: adminProcedure
+    .input(z.object({ instanceId: z.string().trim().min(1) }))
+    .mutation(async ({ ctx, input }) => {
+      const data = await inferenceAdminRequest(`/admin/services/${encodeURIComponent(input.instanceId)}/stop/apply`, { method: "POST" });
+      await auditAdminAction(ctx.user as SafeAuthUser, "inference_admin_service_stopped", { instanceId: input.instanceId, data });
+      return { success: true, message: "Inference service stop applied", data } as ResponseBody<unknown>;
+    }),
+
+  inferenceAdminListBenchmarks: adminProcedure
+    .input(z.object({ limit: z.number().int().positive().max(200).default(20), status: z.string().optional().default(""), instanceId: z.string().optional().default("") }).optional())
+    .query(async ({ input }) => {
+      const data = await inferenceAdminRequest("/admin/benchmarks", {
+        query: { limit: input?.limit || 20, status: input?.status || "", instance_id: input?.instanceId || "" },
+      });
+      return { success: true, message: "Inference benchmarks retrieved", data } as ResponseBody<unknown>;
+    }),
+
+  inferenceAdminStopBenchmarkPreview: adminProcedure
+    .input(z.object({ jobId: z.string().trim().min(1) }))
+    .query(async ({ input }) => {
+      const data = await inferenceAdminRequest(`/admin/benchmarks/${encodeURIComponent(input.jobId)}/stop/preview`);
+      return { success: true, message: "Inference benchmark stop preview retrieved", data } as ResponseBody<unknown>;
+    }),
+
+  inferenceAdminStopBenchmarkApply: adminProcedure
+    .input(z.object({ jobId: z.string().trim().min(1) }))
+    .mutation(async ({ ctx, input }) => {
+      const data = await inferenceAdminRequest(`/admin/benchmarks/${encodeURIComponent(input.jobId)}/stop/apply`, { method: "POST" });
+      await auditAdminAction(ctx.user as SafeAuthUser, "inference_admin_benchmark_stopped", { jobId: input.jobId, data });
+      return { success: true, message: "Inference benchmark stop applied", data } as ResponseBody<unknown>;
+    }),
+
+  inferenceAdminListTests: adminProcedure
+    .input(z.object({ limit: z.number().int().positive().max(200).default(20), status: z.string().optional().default(""), instanceId: z.string().optional().default("") }).optional())
+    .query(async ({ input }) => {
+      const data = await inferenceAdminRequest("/admin/tests", {
+        query: { limit: input?.limit || 20, status: input?.status || "", instance_id: input?.instanceId || "" },
+      });
+      return { success: true, message: "Inference tests retrieved", data } as ResponseBody<unknown>;
+    }),
+
+  inferenceAdminStopTestPreview: adminProcedure
+    .input(z.object({ testRunId: z.string().trim().min(1) }))
+    .query(async ({ input }) => {
+      const data = await inferenceAdminRequest(`/admin/tests/${encodeURIComponent(input.testRunId)}/stop/preview`);
+      return { success: true, message: "Inference test stop preview retrieved", data } as ResponseBody<unknown>;
+    }),
+
+  inferenceAdminStopTestApply: adminProcedure
+    .input(z.object({ testRunId: z.string().trim().min(1) }))
+    .mutation(async ({ ctx, input }) => {
+      const data = await inferenceAdminRequest(`/admin/tests/${encodeURIComponent(input.testRunId)}/stop/apply`, { method: "POST" });
+      await auditAdminAction(ctx.user as SafeAuthUser, "inference_admin_test_stopped", { testRunId: input.testRunId, data });
+      return { success: true, message: "Inference test stop applied", data } as ResponseBody<unknown>;
+    }),
   deleteEvaluationResult: adminProcedure
     .input(
       z.object({
@@ -3858,4 +3983,3 @@ export const appRouter = t.router({
 });
 
 export type AppRouter = typeof appRouter;
-

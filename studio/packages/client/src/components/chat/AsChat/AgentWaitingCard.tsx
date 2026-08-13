@@ -43,6 +43,9 @@ export interface AgentWaitingPrompt {
     resourceContainer?: string;
     options?: string[];
     knownParams?: Record<string, string>;
+    scriptName?: string;
+    detectedFormat?: string;
+    excludedInputFolders?: string[];
 }
 
 interface AgentUiProtocol {
@@ -69,6 +72,15 @@ interface AgentUiProtocol {
     launchMode?: string;
     isMultinode?: boolean;
     knownParams?: Record<string, string>;
+    script?: string;
+    scriptName?: string;
+    detectedFormat?: string;
+    errorReason?: string;
+    containerPath?: string;
+    input_folder?: string;
+    inputFolder?: string;
+    selectedInputFolder?: string;
+    currentArgs?: Record<string, unknown>;
 }
 
 export type AgentProtocol = AgentUiProtocol;
@@ -98,6 +110,69 @@ const STRATEGY_OPTIONS = [
     { value: 'diagnosis', label: '诊断' },
     { value: 'prescription', label: '处方' },
 ];
+
+const GENERAL_PREPROCESS_FORMATS = new Set(['openai', 'sharegpt', 'sft', 'dpo', 'text']);
+
+const normalizeScriptName = (value?: string): string => (value || '').trim().toLowerCase();
+
+const asRecord = (value: unknown): Record<string, unknown> =>
+    value && typeof value === 'object' && !Array.isArray(value)
+        ? value as Record<string, unknown>
+        : {};
+
+const stringValue = (value: unknown): string =>
+    typeof value === 'string' ? value.trim() : '';
+
+const normalizeDatasetPath = (path: string) =>
+    path.replaceAll(String.fromCharCode(92), '/').replace(/\/+$/, '');
+
+const firstString = (...values: unknown[]): string => {
+    for (const value of values) {
+        const text = stringValue(value);
+        if (text) {
+            return text;
+        }
+    }
+    return '';
+};
+
+const knownParamsFromProtocol = (protocol: AgentUiProtocol): Record<string, string> | undefined => {
+    const knownParams = { ...(protocol.knownParams || {}) };
+    const currentArgs = asRecord(protocol.currentArgs);
+    const cliParams = asRecord(currentArgs.cli_params_to_update);
+    const additionalArgs = asRecord(currentArgs.additional_args);
+    const inputFolder = firstString(
+        knownParams.input_folder,
+        protocol.inputFolder,
+        protocol.selectedInputFolder,
+        currentArgs.inputFolder,
+        currentArgs.selectedInputFolder,
+        cliParams.input_folder,
+        additionalArgs.input_folder,
+    );
+    if (inputFolder) {
+        knownParams.input_folder = inputFolder;
+    }
+    return Object.keys(knownParams).length > 0 ? knownParams : undefined;
+};
+
+const excludedInputFoldersFromProtocol = (protocol: AgentUiProtocol): string[] => {
+    if (protocol.errorReason !== 'unknown_data_format') {
+        return [];
+    }
+
+    const currentArgs = asRecord(protocol.currentArgs);
+    return unique([
+        protocol.containerPath,
+        protocol.input_folder,
+        protocol.inputFolder,
+        protocol.selectedInputFolder,
+        currentArgs.input_folder,
+        currentArgs.inputFolder,
+        currentArgs.selected_input_folder,
+        currentArgs.selectedInputFolder,
+    ].map((value) => normalizeDatasetPath(stringValue(value))));
+};
 
 const INTERACTIVE_AGENT_NAMES = [
     'evaluator',
@@ -322,6 +397,7 @@ export const cleanupAgentWaitingText = (text: string): string => {
     content = content.replace(/你可以直接回复，例如[:：][\s\S]*$/m, '');
     content = content.replace(/你可以直接回复[:：][\s\S]*$/m, '');
     content = content.replace(/请直接回复[:：][\s\S]*$/m, '');
+    content = content.replace(/当前参数[:：][\s\S]*$/m, '');
     if (content.includes('训练类型') || content.includes('训练方式')) {
         content = hideMultinodeTrainingChoices(content);
     }
@@ -447,6 +523,18 @@ export const parseAgentWaitingPrompt = (
 
         const protocolMessage = protocol.message || cleanupAgentWaitingText(rawText);
         const fields = fieldsFromProtocol(protocol, protocolMessage);
+        const scriptName = normalizeScriptName(protocol.scriptName || protocol.script);
+        const detectedFormat = (protocol.detectedFormat || '').trim().toLowerCase();
+        const knownParams = knownParamsFromProtocol(protocol);
+        const isGeneralPreprocessDataTypePrompt =
+            scriptName === 'data_preprocessing' &&
+            fields.length === 1 &&
+            fields.includes('data_type') &&
+            GENERAL_PREPROCESS_FORMATS.has(detectedFormat);
+        const isPreprocessDataTypeStrategyPrompt =
+            scriptName === 'data_preprocessing' &&
+            fields.includes('data_type') &&
+            fields.includes('strategy');
         const explicitOptions = filterHiddenMultinodeTrainingOptions(
             (protocol.options || []).filter(isDirectReplyOption),
         );
@@ -473,13 +561,20 @@ export const parseAgentWaitingPrompt = (
                     : kind === 'param'
                       ? '补充必要信息'
                       : '需要你回复'),
-            body: cleanupAgentWaitingText(protocolMessage),
+            body: isGeneralPreprocessDataTypePrompt
+                ? `已识别输入格式为 ${detectedFormat}，请选择预处理输出数据类型。`
+                : isPreprocessDataTypeStrategyPrompt
+                  ? '请选择预处理输出数据类型和医疗数据处理方向。'
+                  : cleanupAgentWaitingText(protocolMessage),
             kind,
             quickReplies,
             fields,
             resourceContainer: resourceContainerFromProtocol(protocol),
             options: filterHiddenMultinodeTrainingOptions(protocol.options || []),
-            knownParams: protocol.knownParams,
+            knownParams,
+            scriptName,
+            detectedFormat,
+            excludedInputFolders: excludedInputFoldersFromProtocol(protocol),
         };
     }
 
@@ -593,6 +688,35 @@ const fieldPlaceholder = (field: string): string => {
     return placeholders[field] || `${field}=...`;
 };
 
+const joinPathAndNameValue = (path: string, name: string) => {
+    const normalizedPath = path.replace(/\/+$/, '');
+    const normalizedName = name.replace(/^\/+/, '');
+    if (normalizedPath.endsWith(`/${normalizedName}`)) {
+        return normalizedPath;
+    }
+    return `${normalizedPath}/${normalizedName}`;
+};
+
+const datasetOptionPath = (dataset: AgentDatasetOption) => {
+    if (!dataset.path) {
+        return `/home/workspace/dataset/${dataset.name}`;
+    }
+    return joinPathAndNameValue(dataset.path, dataset.name);
+};
+
+const isPreprocessInputDataset = (dataset: AgentDatasetOption, excludedInputFolders: Set<string>): boolean => {
+    const type = (dataset.type || '').toLowerCase();
+    const path = normalizeDatasetPath(datasetOptionPath(dataset));
+    if (excludedInputFolders.has(path)) {
+        return false;
+    }
+    return (
+        type === 'raw' ||
+        (/^\/home\/workspace\/dataset(?:\/|$)/.test(path) &&
+            !/^\/home\/workspace\/dataset_(?:batch|daily)_train(?:\/|$)/.test(path))
+    );
+};
+
 export function AgentWaitingCard({
     prompt,
     onReply,
@@ -603,8 +727,11 @@ export function AgentWaitingCard({
     onRefreshModels,
     resourceGroupId,
 }: AgentWaitingCardProps) {
+    const promptScriptName = normalizeScriptName(prompt.scriptName);
+    const isDataPreprocessingPrompt = promptScriptName === 'data_preprocessing';
+    const hasDataTypePicker = isDataPreprocessingPrompt && prompt.fields.includes('data_type');
     const hasDataTypeStrategyPicker =
-        prompt.fields.includes('data_type') && prompt.fields.includes('strategy');
+        hasDataTypePicker && prompt.fields.includes('strategy');
     const hasDualModelPicker =
         prompt.fields.includes('model_fir') && prompt.fields.includes('model_sec');
     const hasEvaluationModelPicker =
@@ -645,7 +772,8 @@ export function AgentWaitingCard({
             prompt.fields.filter(
                 (field) =>
                     !(
-                        (hasDataTypeStrategyPicker && ['data_type', 'strategy'].includes(field)) ||
+                        (hasDataTypePicker && field === 'data_type') ||
+                        (hasDataTypeStrategyPicker && field === 'strategy') ||
                         (hasEvaluationModelPicker && ['model_fir', 'model_sec'].includes(field)) ||
                         (hasCheckpointPicker && field === 'CKPT_PATH') ||
                         (hasModelPicker && field === 'model_path') ||
@@ -653,7 +781,7 @@ export function AgentWaitingCard({
                         (hasDatasetPicker && ['dataset_dir', 'dataset_name', 'input_folder'].includes(field))
                     ),
             ),
-        [hasCheckpointPicker, hasDataTypeStrategyPicker, hasDatasetPicker, hasEvaluationModelPicker, hasGrpoFilePicker, hasModelPicker, prompt.fields],
+        [hasCheckpointPicker, hasDataTypePicker, hasDataTypeStrategyPicker, hasDatasetPicker, hasEvaluationModelPicker, hasGrpoFilePicker, hasModelPicker, prompt.fields],
     );
     const [values, setValues] = useState<Record<string, string>>({});
     const [dataType, setDataType] = useState('');
@@ -681,8 +809,11 @@ export function AgentWaitingCard({
     const usesProtocolResources = Boolean(prompt.resourceContainer && !isGrpoTrainingPrompt);
     const effectiveDatasets = resourceDatasets ?? (usesProtocolResources ? [] : datasets);
     const effectivePromptModels = resourceModels ?? (usesProtocolResources ? [] : models);
+    const excludedInputFolders = new Set((prompt.excludedInputFolders || []).map(normalizeDatasetPath));
     const inputFolderDatasets = prompt.fields.includes('input_folder')
-        ? effectiveDatasets.filter((dataset) => (dataset.type || '').toLowerCase() !== 'raw')
+        ? isDataPreprocessingPrompt
+          ? effectiveDatasets.filter((dataset) => isPreprocessInputDataset(dataset, excludedInputFolders))
+          : effectiveDatasets.filter((dataset) => (dataset.type || '').toLowerCase() !== 'raw')
         : effectiveDatasets;
     const selectableDatasets = datasetNameOptions.length > 0
         ? datasetNameOptions.map((name) => ({
@@ -816,10 +947,25 @@ export function AgentWaitingCard({
         onReply?.(trimmedText);
     };
 
+    const knownPreprocessInputFolder =
+        isDataPreprocessingPrompt ? (prompt.knownParams?.input_folder || '').trim() : '';
+
     const submitDataTypeStrategy = (nextDataType: string, nextStrategy: string) => {
-        if (nextDataType && nextStrategy) {
-            submitReply(`data_type=${nextDataType}，strategy=${nextStrategy}`);
+        if (!nextDataType) {
+            return;
         }
+        if (hasDataTypeStrategyPicker && !nextStrategy) {
+            return;
+        }
+        const parts: string[] = [];
+        if (knownPreprocessInputFolder) {
+            parts.push(`input_folder=${knownPreprocessInputFolder}`);
+        }
+        parts.push(`data_type=${nextDataType}`);
+        if (hasDataTypeStrategyPicker) {
+            parts.push(`strategy=${nextStrategy}`);
+        }
+        submitReply(parts.join('，'));
     };
 
     const chooseDataType = (value: string) => {
@@ -832,21 +978,9 @@ export function AgentWaitingCard({
         submitDataTypeStrategy(dataType, value);
     };
 
-    const joinPathAndName = (path: string, name: string) => {
-        const normalizedPath = path.replace(/[\\/]+$/, '');
-        const normalizedName = name.replace(/^[\\/]+/, '');
-        if (normalizedPath.endsWith(`/${normalizedName}`) || normalizedPath.endsWith(`\\${normalizedName}`)) {
-            return normalizedPath;
-        }
-        return `${normalizedPath}/${normalizedName}`;
-    };
+    const joinPathAndName = joinPathAndNameValue;
 
-    const datasetPath = (dataset: AgentDatasetOption) => {
-        if (!dataset.path) {
-            return `/home/workspace/dataset/${dataset.name}`;
-        }
-        return joinPathAndName(dataset.path, dataset.name);
-    };
+    const datasetPath = datasetOptionPath;
 
     const shouldSendDatasetName = (dataset: AgentDatasetOption) => {
         if (!prompt.fields.includes('dataset_name')) {
@@ -1145,7 +1279,7 @@ export function AgentWaitingCard({
                         </div>
                     )}
 
-                    {hasDataTypeStrategyPicker && (
+                    {hasDataTypePicker && (
                         <div className="mt-4 space-y-4 rounded-[20px] border border-slate-200/80 bg-slate-50/62 p-3.5 dark:border-white/10 dark:bg-slate-950/34">
                             <div>
                                 <div className="mb-2 text-xs font-semibold text-slate-500 dark:text-slate-400">
@@ -1176,34 +1310,36 @@ export function AgentWaitingCard({
                                 </div>
                             </div>
 
-                            <div>
-                                <div className="mb-2 text-xs font-semibold text-slate-500 dark:text-slate-400">
-                                    数据策略
+                            {hasDataTypeStrategyPicker && (
+                                <div>
+                                    <div className="mb-2 text-xs font-semibold text-slate-500 dark:text-slate-400">
+                                        数据策略
+                                    </div>
+                                    <div className="grid gap-2 sm:grid-cols-3">
+                                        {STRATEGY_OPTIONS.map((option) => {
+                                            const selected = strategy === option.value;
+                                            return (
+                                                <button
+                                                    key={option.value}
+                                                    type="button"
+                                                    disabled={hasSubmitted}
+                                                    className={`rounded-2xl border px-4 py-3 text-left transition-all ${
+                                                        selected
+                                                            ? 'border-sky-300 bg-white text-sky-800 shadow-[0_14px_28px_-22px_rgba(2,132,199,0.55)] ring-1 ring-sky-100 dark:border-sky-400/40 dark:bg-sky-500/12 dark:text-sky-100 dark:ring-sky-400/10'
+                                                            : 'border-slate-200/90 bg-white/78 text-slate-700 hover:border-sky-200 hover:bg-white dark:border-white/10 dark:bg-slate-950/38 dark:text-slate-200 dark:hover:border-sky-500/30 dark:hover:bg-sky-500/10'
+                                                    }`}
+                                                    onClick={(event) => {
+                                                        event.stopPropagation();
+                                                        chooseStrategy(option.value);
+                                                    }}
+                                                >
+                                                    <span className="block text-[13px] font-semibold">{option.label}</span>
+                                                </button>
+                                            );
+                                        })}
+                                    </div>
                                 </div>
-                                <div className="grid gap-2 sm:grid-cols-3">
-                                    {STRATEGY_OPTIONS.map((option) => {
-                                        const selected = strategy === option.value;
-                                        return (
-                                            <button
-                                                key={option.value}
-                                                type="button"
-                                                disabled={hasSubmitted}
-                                                className={`rounded-2xl border px-4 py-3 text-left transition-all ${
-                                                    selected
-                                                        ? 'border-sky-300 bg-white text-sky-800 shadow-[0_14px_28px_-22px_rgba(2,132,199,0.55)] ring-1 ring-sky-100 dark:border-sky-400/40 dark:bg-sky-500/12 dark:text-sky-100 dark:ring-sky-400/10'
-                                                        : 'border-slate-200/90 bg-white/78 text-slate-700 hover:border-sky-200 hover:bg-white dark:border-white/10 dark:bg-slate-950/38 dark:text-slate-200 dark:hover:border-sky-500/30 dark:hover:bg-sky-500/10'
-                                                }`}
-                                                onClick={(event) => {
-                                                    event.stopPropagation();
-                                                    chooseStrategy(option.value);
-                                                }}
-                                            >
-                                                <span className="block text-[13px] font-semibold">{option.label}</span>
-                                            </button>
-                                        );
-                                    })}
-                                </div>
-                            </div>
+                            )}
                         </div>
                     )}
 

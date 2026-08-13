@@ -4,3 +4,15 @@ PORT: 8899
 LLM_URL: http://127.0.0.1:6000/v1
 LLM_MODEL: example-model-name
 LLM_API_KEY: EMPTY
+
+RESOURCE_POOL:
+  # Must match the controller setting in a resource-pool-managed deployment.
+  ENABLED: true
+
+ADMIN:
+  # Enables local Admin maintenance endpoints.
+  # Studio Server authorizes administrators before calling /admin/*; restrict these endpoints to trusted internal access.
+  ENABLED: true
+
+MEMORY:
+  BACKEND: memory

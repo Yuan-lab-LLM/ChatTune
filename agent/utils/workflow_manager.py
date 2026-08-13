@@ -339,7 +339,9 @@ class WorkflowDependencies:
     monitor_evaluate: Callable[[Dict[str, Any]], Dict[str, Any]]
     start_publish: Callable[[Dict[str, Any]], Dict[str, Any]]
     monitor_publish: Callable[[Dict[str, Any]], Dict[str, Any]]
-    inference_command: Callable[[str], Dict[str, Any]]
+    ##deepseek
+    #inference_command: Callable[[str], Dict[str, Any]]
+    inference_command: Callable[..., Dict[str, Any]]
     stop_task: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None
     check_existing_stage_output: Optional[Callable[[Dict[str, Any], str], Optional[Dict[str, Any]]]] = None
     start_benchmark: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None
@@ -374,8 +376,10 @@ class WorkflowManager:
         self._terminal_updates_sent: set[str] = set()
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
         self._worker: Optional[threading.Thread] = None
         self._worker_workflow_ids: set[str] = set()
+        self._wake_workflow_ids: set[str] = set()
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._initialize_db()
         if auto_start_worker:
@@ -464,29 +468,39 @@ class WorkflowManager:
                 self.auto_start_worker,
             )
 
-    def activate_worker_for(self, workflow_id: str) -> None:
+    def activate_worker_for(self, workflow_id: str, wake: bool = True) -> None:
         """Poll one explicitly started/resumed workflow without recovering all old rows."""
         workflow_id = str(workflow_id or "").strip()
         if not workflow_id:
             return
         with self._lock:
             self._worker_workflow_ids.add(workflow_id)
+            if wake:
+                self._wake_workflow_ids.add(workflow_id)
             activated_count = len(self._worker_workflow_ids)
         logger.debug(
-            "[workflow-debug] activate worker workflow_id=%s auto_start_worker=%s activated_count=%s",
+            "[workflow-debug] activate worker workflow_id=%s auto_start_worker=%s activated_count=%s wake=%s",
             workflow_id,
             self.auto_start_worker,
             activated_count,
+            wake,
         )
         self.start_worker()
+        if wake:
+            self._wake_event.set()
 
     def shutdown(self) -> None:
         self._stop_event.set()
+        self._wake_event.set()
         if self._worker:
             self._worker.join(timeout=max(2, self.poll_interval + 1))
 
     def _worker_loop(self) -> None:
-        while not self._stop_event.wait(self.poll_interval):
+        while not self._stop_event.is_set():
+            self._wake_event.wait(self.poll_interval)
+            self._wake_event.clear()
+            if self._stop_event.is_set():
+                break
             try:
                 self.run_pending_once(only_activated=not self.auto_start_worker)
             except Exception:
@@ -546,6 +560,7 @@ class WorkflowManager:
             should_notify = False
             with self._lock:
                 self._worker_workflow_ids.discard(workflow_id)
+                self._wake_workflow_ids.discard(workflow_id)
                 if workflow_id not in self._terminal_updates_sent:
                     self._terminal_updates_sent.add(workflow_id)
                     should_notify = True
@@ -628,6 +643,21 @@ class WorkflowManager:
             return "", ()
         return " AND json_extract(context_json, '$.resource_group_id')=?", (normalized,)
 
+    def _workflow_scope_conditions(
+        self,
+        user_id: str,
+        resource_group_id: Optional[str],
+        include_group_users: bool = False,
+    ) -> tuple[str, tuple[Any, ...]]:
+        if include_group_users:
+            normalized_group_id = str(resource_group_id or "").strip()
+            if not normalized_group_id:
+                raise ValueError("管理员按用户组访问一键工作流时必须提供目标用户组")
+            return "json_extract(context_json, '$.resource_group_id')=?", (normalized_group_id,)
+        where_sql, params = self._user_family_conditions(user_id)
+        group_sql, group_params = self._resource_group_conditions(resource_group_id)
+        return f"{where_sql}{group_sql}", (*params, *group_params)
+
     def _assert_workflow_resource_group(
         self,
         workflow: Dict[str, Any],
@@ -653,8 +683,16 @@ class WorkflowManager:
         user_id: str,
         resource_group_id: Optional[str] = None,
         permission_message: str = "无权访问指定的一键工作流",
+        include_group_users: bool = False,
     ) -> Optional[Dict[str, Any]]:
-        where_sql, params = self._user_family_conditions(user_id)
+        if include_group_users:
+            where_sql, params = self._workflow_scope_conditions(
+                user_id,
+                resource_group_id,
+                include_group_users,
+            )
+        else:
+            where_sql, params = self._user_family_conditions(user_id)
         with self._connect() as connection:
             row = connection.execute(
                 f"""
@@ -689,18 +727,22 @@ class WorkflowManager:
         self,
         user_id: str,
         resource_group_id: Optional[str] = None,
+        include_group_users: bool = False,
     ) -> Optional[Dict[str, Any]]:
-        where_sql, params = self._user_family_conditions(user_id)
-        group_sql, group_params = self._resource_group_conditions(resource_group_id)
+        where_sql, params = self._workflow_scope_conditions(
+            user_id,
+            resource_group_id,
+            include_group_users,
+        )
         with self._connect() as connection:
             row = connection.execute(
                 f"""
                 SELECT * FROM workflows
-                WHERE {where_sql}{group_sql}
+                WHERE {where_sql}
                 ORDER BY updated_at DESC
                 LIMIT 1
                 """,
-                (*params, *group_params),
+                params,
             ).fetchone()
         workflow = self._decode(row) if row else None
         return self._repair_finished_benchmark_shutdown(workflow) if workflow else None
@@ -722,18 +764,22 @@ class WorkflowManager:
         self,
         user_id: str,
         resource_group_id: Optional[str] = None,
+        include_group_users: bool = False,
     ) -> Optional[Dict[str, Any]]:
-        where_sql, params = self._user_family_conditions(user_id)
-        group_sql, group_params = self._resource_group_conditions(resource_group_id)
+        where_sql, params = self._workflow_scope_conditions(
+            user_id,
+            resource_group_id,
+            include_group_users,
+        )
         with self._connect() as connection:
             row = connection.execute(
                 f"""
                 SELECT * FROM workflows
-                WHERE {where_sql}{group_sql} AND status IN ('running', 'stopping')
+                WHERE {where_sql} AND status IN ('running', 'stopping')
                 ORDER BY updated_at DESC
                 LIMIT 1
                 """,
-                (*params, *group_params),
+                params,
             ).fetchone()
         return self._decode(row) if row else None
 
@@ -741,26 +787,32 @@ class WorkflowManager:
         self,
         user_id: str,
         resource_group_id: Optional[str] = None,
+        include_group_users: bool = False,
     ) -> Optional[Dict[str, Any]]:
-        where_sql, params = self._user_family_conditions(user_id)
-        group_sql, group_params = self._resource_group_conditions(resource_group_id)
+        where_sql, params = self._workflow_scope_conditions(
+            user_id,
+            resource_group_id,
+            include_group_users,
+        )
         with self._connect() as connection:
             row = connection.execute(
                 f"""
                 SELECT * FROM workflows
-                WHERE {where_sql}{group_sql} AND status IN ('failed', 'stopped')
+                WHERE {where_sql} AND status IN ('failed', 'stopped')
                 ORDER BY updated_at DESC
                 LIMIT 1
                 """,
-                (*params, *group_params),
+                params,
             ).fetchone()
         return self._decode(row) if row else None
 
     def _resume_workflow(self, workflow: Dict[str, Any]) -> Dict[str, Any]:
-        if (
-            workflow.get("current_stage") == "benchmark"
-            and (workflow.get("context") or {}).get("inference_service_stopped_by_benchmark_stop")
-        ):
+        #deepseek
+        #if (
+        #    workflow.get("current_stage") == "benchmark"
+        #    and (workflow.get("context") or {}).get("inference_service_stopped_by_benchmark_stop")
+        #):
+        if workflow.get("current_stage") == "benchmark":
             workflow["current_stage"] = "deploy"
             deploy_stage = workflow["stages"]["deploy"]
             deploy_stage["status"] = "pending"
@@ -950,10 +1002,15 @@ class WorkflowManager:
         self,
         user_id: str,
         resource_group_id: Optional[str] = None,
+        include_group_users: bool = False,
     ) -> Dict[str, Any]:
         """Reserve an active workflow for stopping so workers stop advancing it."""
         with self._lock:
-            workflow = self.active_for_user_family(user_id, resource_group_id)
+            workflow = self.active_for_user_family(
+                user_id,
+                resource_group_id,
+                include_group_users,
+            )
             if not workflow:
                 raise ValueError("当前没有运行中的一键工作流")
             if workflow["status"] == "stopping":
@@ -967,6 +1024,7 @@ class WorkflowManager:
         workflow_id: str,
         request_user_id: Optional[str] = None,
         resource_group_id: Optional[str] = None,
+        include_group_users: bool = False,
     ) -> Dict[str, Any]:
         """Reserve a specific active workflow for stopping."""
         with self._lock:
@@ -977,6 +1035,7 @@ class WorkflowManager:
                     request_user_id,
                     resource_group_id,
                     permission_message="无权停止指定的一键工作流",
+                    include_group_users=include_group_users,
                 )
             else:
                 workflow = self._get(workflow_id)
@@ -1031,8 +1090,9 @@ class WorkflowManager:
         user_id: str,
         invoke_stop_task: bool = True,
         resource_group_id: Optional[str] = None,
+        include_group_users: bool = False,
     ) -> Dict[str, Any]:
-        workflow = self.begin_stop(user_id, resource_group_id)
+        workflow = self.begin_stop(user_id, resource_group_id, include_group_users)
         stop_fields: Dict[str, Any] = {}
         try:
             if invoke_stop_task and self.dependencies.stop_task:
@@ -1048,11 +1108,20 @@ class WorkflowManager:
         self,
         user_id: str,
         resource_group_id: Optional[str] = None,
+        include_group_users: bool = False,
     ) -> Dict[str, Any]:
         with self._lock:
-            workflow = self.resumable_for_user_family(user_id, resource_group_id)
+            workflow = self.resumable_for_user_family(
+                user_id,
+                resource_group_id,
+                include_group_users,
+            )
             if not workflow:
-                active = self.active_for_user_family(user_id, resource_group_id)
+                active = self.active_for_user_family(
+                    user_id,
+                    resource_group_id,
+                    include_group_users,
+                )
                 if active:
                     status_text = "正在停止" if active.get("status") == "stopping" else "仍在运行"
                     raise ValueError(
@@ -1068,6 +1137,7 @@ class WorkflowManager:
         workflow_id: str,
         request_user_id: Optional[str] = None,
         resource_group_id: Optional[str] = None,
+        include_group_users: bool = False,
     ) -> Dict[str, Any]:
         with self._lock:
             workflow = (
@@ -1076,6 +1146,7 @@ class WorkflowManager:
                     request_user_id,
                     resource_group_id,
                     permission_message="无权继续指定的一键工作流",
+                    include_group_users=include_group_users,
                 )
                 if request_user_id
                 else self._get(workflow_id)
@@ -1381,7 +1452,13 @@ class WorkflowManager:
             workflow["status"] = "finished"
             return
         workflow["current_stage"] = STAGES[current_index + 1]
-        self.activate_worker_for(str(workflow["workflow_id"]))
+        workflow_id = str(workflow["workflow_id"])
+        with self._lock:
+            should_wake = (
+                workflow_id in self._wake_workflow_ids
+                and workflow["current_stage"] == "evaluate"
+            )
+        self.activate_worker_for(workflow_id, wake=should_wake or self.auto_start_worker)
 
     def _fail(self, workflow: Dict[str, Any], exc: Exception | str) -> Dict[str, Any]:
         # A monitor call can be in flight while another worker/process handles
@@ -1422,7 +1499,10 @@ class WorkflowManager:
             elif self.agent_events:
                 return None
             else:
-                result = self.dependencies.inference_command(_benchmark_result_entry(workflow))
+                #deepseek
+                #result = self.dependencies.inference_command(_benchmark_result_entry(workflow))
+                result = self.dependencies.inference_command(_benchmark_result_entry(workflow), workflow)
+
         except Exception:
             return None
         enriched = _benchmark_enrich_runtime_result({
@@ -1488,7 +1568,7 @@ class WorkflowManager:
                     stop_result.get("success", True) if isinstance(stop_result, dict) else True
                 )
                 final_result["inference_service_stop_result"] = stop_result
-                final_result["inference_service_stop_command"] = "停止推理服务"
+                final_result["inference_service_stop_command"] = "停止推理服务 确认停止"
                 final_result["inference_service_log_command"] = "查看推理服务日志"
                 if isinstance(stop_result, dict):
                     for source_key, target_key in (
@@ -1508,7 +1588,7 @@ class WorkflowManager:
                 )
                 final_result["inference_service_stopped"] = False
                 final_result["inference_service_stop_error"] = str(exc)
-                final_result["inference_service_stop_command"] = "停止推理服务"
+                final_result["inference_service_stop_command"] = "停止推理服务 确认停止"
                 final_result["inference_service_log_command"] = "查看推理服务日志"
         self._stage_result(workflow, "finished", result=final_result)
         stage = workflow["stages"][workflow["current_stage"]]
@@ -1542,7 +1622,9 @@ class WorkflowManager:
             elif self.agent_events:
                 return workflow
             else:
-                result = self.dependencies.inference_command(_benchmark_runtime_status_command(workflow))
+                #deepseek
+                #result = self.dependencies.inference_command(_benchmark_runtime_status_command(workflow))
+                result = self.dependencies.inference_command(_benchmark_runtime_status_command(workflow), workflow)
         except Exception as exc:
             if not _exception_has_timeout_signal(exc):
                 return workflow
@@ -1698,17 +1780,10 @@ class WorkflowManager:
         self._move_next(workflow)
 
     def _advance_evaluate(self, workflow: Dict[str, Any], stage: Dict[str, Any]) -> None:
-        if stage["status"] in {"awaiting_agent", "starting_external"}:
+        if stage["status"] == "starting_external":
             return
-        if stage["status"] == "pending":
-            if self.agent_events:
-                self.enqueue_event(
-                    workflow,
-                    "start_evaluate",
-                    {"model_fir": workflow["context"]["trained_model_path"]},
-                )
-                self._stage_result(workflow, "awaiting_agent")
-                return
+        if stage["status"] in {"pending", "awaiting_agent"}:
+            # Evaluation already has a deterministic trained_model_path here; start it directly.
             result = self.dependencies.start_evaluate(workflow)
             self._stage_result(workflow, "running", **self._details(result))
             return
@@ -1781,7 +1856,9 @@ class WorkflowManager:
             return
         published_path = workflow["context"]["published_model_path"]
         model_name = Path(published_path).name
-        current = self.dependencies.inference_command("查看推理配置")
+        #deepseek
+        #current = self.dependencies.inference_command("查看推理配置")
+        current = self.dependencies.inference_command("查看推理配置", workflow)
         old_model_name = current.get("model_name")
         old_model_name_parsed = old_model_name is not None
         if not old_model_name_parsed:
@@ -1789,15 +1866,25 @@ class WorkflowManager:
             old_model_name_parsed = bool(old_model_name)
         workflow["context"]["old_model_name"] = old_model_name
         try:
-            self.dependencies.inference_command(f"修改推理配置 MODEL_NAME={model_name}")
-            restarted = self.dependencies.inference_command("重启推理服务")
-            checked = self.dependencies.inference_command("查看推理服务状态")
+            #deepseek
+            #self.dependencies.inference_command(f"修改推理配置 MODEL_NAME={model_name}")
+            self.dependencies.inference_command(f"修改推理配置 MODEL_NAME={model_name}", workflow)
+            #deepseek
+            #restarted = self.dependencies.inference_command("重启推理服务")
+            restarted = self.dependencies.inference_command("重启推理服务", workflow)
+            #deepseek
+            #checked = self.dependencies.inference_command("查看推理服务状态")
+            checked = self.dependencies.inference_command("查看推理服务状态", workflow)
             if not restarted.get("success", True) or not checked.get("all_running", False):
                 raise RuntimeError(restarted.get("error") or checked.get("error") or "推理服务重启后未全部运行")
         except Exception:
             if old_model_name_parsed:
-                self.dependencies.inference_command(f"修改推理配置 MODEL_NAME={old_model_name}")
-                self.dependencies.inference_command("重启推理服务")
+                #deepseek
+                #self.dependencies.inference_command(f"修改推理配置 MODEL_NAME={old_model_name}")
+                self.dependencies.inference_command(f"修改推理配置 MODEL_NAME={old_model_name}", workflow)
+                #deepseek
+                #self.dependencies.inference_command("重启推理服务")
+                self.dependencies.inference_command("重启推理服务", workflow)
             raise
         self._stage_result(
             workflow,
@@ -1837,7 +1924,9 @@ class WorkflowManager:
             if self.dependencies.start_benchmark:
                 result = self.dependencies.start_benchmark(workflow)
             else:
-                result = self.dependencies.inference_command(_benchmark_start_command(workflow))
+                #deepseek
+                #result = self.dependencies.inference_command(_benchmark_start_command(workflow))
+                result = self.dependencies.inference_command(_benchmark_start_command(workflow), workflow)
             if not result.get("success", True):
                 raise RuntimeError(result.get("error") or f"{_benchmark_name(workflow)}基准评测启动失败")
             result = _benchmark_enrich_runtime_result({**result, "result_entry": _benchmark_result_entry(workflow)})
@@ -1851,7 +1940,9 @@ class WorkflowManager:
                 stage["message"] = stage.get("message") or "等待结构化 benchmark 状态服务返回"
                 return
             else:
-                result = self.dependencies.inference_command(_benchmark_runtime_status_command(workflow))
+                #deepseek
+                #result = self.dependencies.inference_command(_benchmark_runtime_status_command(workflow))
+                result = self.dependencies.inference_command(_benchmark_runtime_status_command(workflow), workflow)
         except Exception as exc:
             if _exception_has_timeout_signal(exc):
                 self._record_transient_timeout(workflow, stage, exc)

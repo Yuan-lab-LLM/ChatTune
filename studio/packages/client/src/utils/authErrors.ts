@@ -64,6 +64,7 @@ const authErrorMessages: Record<string, string> = {
     '资源池内各用户组保底 GPU 数之和不能超过资源池总容量': 'trainingResource.guaranteedGpuTotalCannotExceedPool',
     '训练预约不存在': 'trainingResource.reservationNotFound',
     '训练资源租约已过期': 'trainingResource.reservationExpired',
+    '推理资源租约已过期': 'trainingResource.reservationExpired',
     '当前训练预约状态不允许续期': 'trainingResource.reservationRenewStatusInvalid',
     '用户名或密码错误': 'auth.loginFailed',
     'Username already exists': 'auth.usernameExists',

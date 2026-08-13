@@ -1,6 +1,6 @@
 # Deployment Guide
 
-This guide only covers container, image, and workspace mount preparation for the MedFlow Runtime MP release package. After completing this page, continue with [Quickstart](QUICKSTART.md) to initialize and start Runtime.
+This guide only covers container, image, and workspace mount preparation for the MedFlow ChatTune release package. After completing this page, continue with [Quickstart](QUICKSTART.md) to initialize and start Runtime.
 
 ## Components
 
@@ -20,6 +20,14 @@ This guide only covers container, image, and workspace mount preparation for the
 | GRPO/verl image | https://pan.quark.cn/s/c6ad41207360 | Extraction code: vJJx |
 | Base model resource | https://modelscope.cn/models/MedFlow/Qingnang-32B-0630/ | Qingnang-32B-0630 base model |
 | Evaluation benchmark data | https://pan.quark.cn/s/5ba6589d7933 | Extraction code: b8Pp |
+
+### Training Image Patch Packages
+
+Future training image updates will be released as patch packages. Download the corresponding `.run` package and install it with `bash xx.run`; recreating the full training image package is not required unless the release notes say otherwise.
+
+| Resource | Link | Notes |
+| --- | --- | --- |
+| Training image patch package-0813 | https://pan.quark.cn/s/db69395cbde7 | Extraction code: 6K2h |
 
 ## Container Types
 
@@ -41,7 +49,7 @@ Before running the container creation scripts, replace their default parameters.
 
 ## Agent Container Mounts
 
-When creating the container, `HOST_WORKSPACE` should point to this project code directory, that is, the MedFlow Runtime MP release package/project root.
+When creating the container, `HOST_WORKSPACE` should point to this project code directory, that is, the MedFlow ChatTune release package/project root.
 
 ## General Training Container Mounts
 
@@ -190,6 +198,12 @@ NODES:
 
 Each `TOOL_URL` must point to the corresponding worker's `/worker/tool` endpoint. Disable unused workers by setting `ENABLED: false` or deleting the entry.
 
+## Inference Agent Admin Permission
+
+The Inference Agent `/admin/*` endpoints are maintenance APIs for stale-resource cleanup and forced service, benchmark, or test stops. They should be triggered only through Studio administrator actions: the browser never sends an admin token, and Studio Server first verifies the logged-in user is an administrator before calling the Inference Agent.
+
+Enable these endpoints with `ADMIN.ENABLED: true` in `agent.yaml`. In production, restrict `/admin/*` to Studio Server through Docker networking, a reverse proxy, or firewall rules. If the Inference Agent admin maintenance APIs are not needed, set `ADMIN.ENABLED: false`. Ordinary `/inference_agent` and `/worker/tool` requests are unaffected.
+
 ## Start the Inference Agent
 
 ```bash
@@ -206,4 +220,3 @@ curl -X POST http://<worker-a-host>:8899/inference_agent \
 ```
 
 If the response reports model-call errors, check whether `AGENT_LLM_URL` or `LLM_URL` points to a reachable OpenAI-compatible model service, and whether `AGENT_LLM_MODEL` / `LLM_MODEL` and `AGENT_LLM_API_KEY` / `LLM_API_KEY` match that service. If tool execution fails, check worker nodes, `nodes.yaml`, inference-service configuration, and port connectivity.
-

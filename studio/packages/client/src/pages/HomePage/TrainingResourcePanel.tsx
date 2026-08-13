@@ -49,10 +49,26 @@ const normalizedReleaseResult = (value?: string | null) => {
   return raw;
 };
 
+const normalizedReservationReason = (value?: string | null) => {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (raw === "Runtime 主动释放预约" || raw.toLowerCase() === "runtime released reservation") return "runtime_released";
+  if (raw === "管理员强制释放" || raw.toLowerCase() === "admin force released") return "admin_force_released";
+  if (raw === "管理员停止进程并释放预约") return "admin_stopped_process_and_released";
+  if (raw === "管理员停止推理服务并释放预约") return "admin_stopped_inference_and_released";
+  if (raw === "训练资源租约已过期") return "training_lease_expired";
+  if (raw === "推理资源租约已过期") return "inference_lease_expired";
+  if (raw.includes("已分配 GPU 仍有占用")) return "lease_expired_gpu_busy";
+  return "";
+};
+
+const endedReservationStatuses = ["released", "failed"];
+
 const normalizedTaskCategory = (value?: string | null) => {
   const raw = String(value || "").trim().toLowerCase();
   if (["assessment", "evaluation", "eval", "evaluate"].includes(raw)) return "assessment";
   if (["training", "train"].includes(raw)) return "training";
+  if (["inference", "infer", "推理"].includes(raw)) return "inference";
   return raw;
 };
 
@@ -60,6 +76,7 @@ const normalizedTaskType = (value?: string | null) => {
   const raw = String(value || "").trim();
   const lower = raw.toLowerCase();
   if (!lower) return "";
+  if (raw === "推理服务" || lower === "inference" || lower === "inference_service") return "inference";
   if (["单模型评估", "单模型评测"].includes(raw) || lower.includes("single_model")) return "single_model_evaluation";
   if (raw.includes("双模型") || lower.includes("compare_between_models")) return "compare_between_models";
   if (raw.includes("checkpoint") || raw.includes("检查点") || lower.includes("ckpt_eval") || lower.includes("checkpoint")) return "ckpt_eval";
@@ -340,17 +357,19 @@ const TrainingResourcePanel = ({ embedded = false }: TrainingResourcePanelProps)
     }
   };
 
-  const stopAndReleaseReservationAction = async (reservationId: string) => {
-    if (!window.confirm(t("trainingResource.stopAndReleaseConfirm"))) return;
+  const stopAndReleaseReservationAction = async (reservationId: string, isInference: boolean) => {
+    if (!window.confirm(t(isInference ? "trainingResource.stopInferenceAndReleaseConfirm" : "trainingResource.stopAndReleaseConfirm"))) return;
     setStopReleasingReservationId(reservationId);
     setReservationStatus("");
     try {
       const response = await stopAndReleaseReservation.mutateAsync({ reservationId });
       const stopResult = response.data?.stopResult;
       setReservationStatus(t(
-        stopResult?.gpuIdle && stopResult?.remainingNonGpuPids?.length
-          ? "trainingResource.stopAndReleaseGpuIdleSuccess"
-          : "trainingResource.stopAndReleaseSuccess",
+        isInference
+          ? "trainingResource.stopInferenceAndReleaseSuccess"
+          : stopResult?.gpuIdle && stopResult?.remainingNonGpuPids?.length
+            ? "trainingResource.stopAndReleaseGpuIdleSuccess"
+            : "trainingResource.stopAndReleaseSuccess",
       ));
       await refresh();
     } catch (error) {
@@ -661,6 +680,12 @@ const TrainingResourcePanel = ({ embedded = false }: TrainingResourcePanelProps)
             const showMasterBadge = reservation.nodes.length > 1;
             const isExpanded = expandedReservationId === reservation.id;
             const reason = reservation.expiredReason || reservation.errorMessage;
+            const reasonLabel = (value?: string | null) => {
+              const normalized = normalizedReservationReason(value);
+              return normalized
+                ? t(`trainingResource.reason.${normalized}`, { defaultValue: value || "" })
+                : value || t("trainingResource.noDiagnosticValue");
+            };
             const taskCategory = normalizedTaskCategory(reservation.taskCategory);
             const taskCategoryLabel = taskCategory
               ? t(`trainingResource.taskCategory.${taskCategory}`, { defaultValue: reservation.taskCategory })
@@ -670,9 +695,25 @@ const TrainingResourcePanel = ({ embedded = false }: TrainingResourcePanelProps)
               ? t(`trainingResource.taskType.${taskType}`, { defaultValue: reservation.taskTypeText || reservation.taskType })
               : t("trainingResource.noDiagnosticValue");
             const releaseResult = normalizedReleaseResult(reservation.releaseResult);
+            const isInferenceReservation = taskCategory === "inference" || taskType === "inference";
             const releaseResultLabel = releaseResult
               ? t(`trainingResource.releaseResult.${releaseResult}`, { defaultValue: reservation.releaseResult })
               : t("trainingResource.noDiagnosticValue");
+            const isActiveReservation = activeReservationStatuses.includes(reservation.status);
+            const endedAt = reservation.endedAt || reservation.releasedAt || (endedReservationStatuses.includes(reservation.status) ? reservation.updatedAt : null);
+            const endedAtLabel = endedAt
+              ? formatDateTime(endedAt)
+              : isActiveReservation
+                ? t("trainingResource.notEnded")
+                : t("trainingResource.noDiagnosticValue");
+            const endReason = isActiveReservation
+              ? ""
+              : reservation.endReason || reservation.expiredReason || reservation.errorMessage || (releaseResult ? releaseResultLabel : "");
+            const endReasonLabel = endReason
+              ? reasonLabel(endReason)
+              : isActiveReservation
+                ? t("trainingResource.notEnded")
+                : t("trainingResource.noDiagnosticValue");
             return (
               <div key={reservation.id} className="rounded-lg border border-border/45 bg-background p-3 text-xs shadow-xs">
                 <div className="flex flex-wrap items-start justify-between gap-2">
@@ -707,10 +748,10 @@ const TrainingResourcePanel = ({ embedded = false }: TrainingResourcePanelProps)
                           variant="destructive"
                           className="h-8 rounded-full px-3 text-xs shadow-xs"
                           disabled={stopAndReleaseReservation.isPending && stopReleasingReservationId === reservation.id}
-                          onClick={() => stopAndReleaseReservationAction(reservation.id)}
+                          onClick={() => stopAndReleaseReservationAction(reservation.id, isInferenceReservation)}
                         >
                           <CircleStopIcon className="size-3.5" />
-                          {t("trainingResource.stopAndRelease")}
+                          {t(isInferenceReservation ? "trainingResource.stopInferenceAndRelease" : "trainingResource.stopAndRelease")}
                         </Button>
                         <Button
                           type="button"
@@ -744,10 +785,14 @@ const TrainingResourcePanel = ({ embedded = false }: TrainingResourcePanelProps)
                 )}
                 {isExpanded && (
                   <div className="mt-3 grid gap-3 rounded-xl border border-border/50 bg-slate-50/60 p-3">
-                    <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-5">
+                    <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-4">
                       <div className="rounded-lg bg-background px-3 py-2 shadow-xs">
                         <div className="text-muted-foreground">{t("trainingResource.statusLabel")}</div>
                         <div className="mt-1 font-semibold text-foreground">{reservation.status}</div>
+                      </div>
+                      <div className="rounded-lg bg-background px-3 py-2 shadow-xs">
+                        <div className="text-muted-foreground">{t("trainingResource.createdAtLabel")}</div>
+                        <div className="mt-1 font-semibold text-foreground">{formatDateTime(reservation.createdAt)}</div>
                       </div>
                       <div className="rounded-lg bg-background px-3 py-2 shadow-xs">
                         <div className="text-muted-foreground">{t("trainingResource.taskCategoryLabel")}</div>
@@ -765,23 +810,28 @@ const TrainingResourcePanel = ({ embedded = false }: TrainingResourcePanelProps)
                         <div className="text-muted-foreground">{t("trainingResource.lastRenewedAtLabel")}</div>
                         <div className="mt-1 font-semibold text-foreground">{formatDateTime(reservation.lastRenewedAt)}</div>
                       </div>
+                      <div className="rounded-lg bg-background px-3 py-2 shadow-xs">
+                        <div className="text-muted-foreground">{t("trainingResource.endedAtLabel")}</div>
+                        <div className="mt-1 font-semibold text-foreground">{endedAtLabel}</div>
+                      </div>
+                      <div className="rounded-lg bg-background px-3 py-2 shadow-xs xl:col-span-2">
+                        <div className="text-muted-foreground">{t("trainingResource.endReasonLabel")}</div>
+                        <div className="mt-1 font-semibold text-foreground">{endReasonLabel}</div>
+                      </div>
+                      <div className="rounded-lg bg-background px-3 py-2 shadow-xs">
+                        <div className="text-muted-foreground">{t("trainingResource.releaseResultLabel")}</div>
+                        <div className="mt-1 font-semibold text-foreground">{releaseResultLabel}</div>
+                      </div>
                     </div>
 
                     <div className="grid gap-2 md:grid-cols-3">
                       <div className="rounded-lg border border-border/40 bg-background p-3 shadow-xs">
                         <div className="font-medium text-foreground">{t("trainingResource.expiredReasonLabel")}</div>
-                        <div className="mt-1 text-muted-foreground">{reservation.expiredReason || t("trainingResource.noDiagnosticValue")}</div>
+                        <div className="mt-1 text-muted-foreground">{reasonLabel(reservation.expiredReason)}</div>
                       </div>
                       <div className="rounded-lg border border-border/40 bg-background p-3 shadow-xs">
                         <div className="font-medium text-foreground">{t("trainingResource.errorReasonLabel")}</div>
-                        <div className="mt-1 text-muted-foreground">{reason || t("trainingResource.noDiagnosticValue")}</div>
-                      </div>
-                      <div className="rounded-lg border border-border/40 bg-background p-3 shadow-xs">
-                        <div className="font-medium text-foreground">{t("trainingResource.releaseResultLabel")}</div>
-                        <div className="mt-1 text-muted-foreground">
-                          {releaseResultLabel}
-                          {reservation.releasedAt ? ` · ${formatDateTime(reservation.releasedAt)}` : ""}
-                        </div>
+                        <div className="mt-1 text-muted-foreground">{reasonLabel(reason)}</div>
                       </div>
                     </div>
 

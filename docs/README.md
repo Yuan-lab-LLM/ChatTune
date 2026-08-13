@@ -1,6 +1,6 @@
-# MedFlow Runtime MP Documentation
+# MedFlow ChatTune Documentation
 
-This directory contains the open-source documentation for MedFlow Runtime MP. Read and execute the guides in this order:
+This directory contains the open-source documentation for MedFlow ChatTune. Read and execute the guides in this order:
 
 1. [Deployment Guide](DEPLOYMENT.md): prepare containers, images, workspace mounts, training data, GRPO data, model directories, and inference-service configuration first.
 2. [Quickstart](QUICKSTART.md): after the containers are ready, initialize `runtime.env`, check the configuration, and start the single-machine Runtime.

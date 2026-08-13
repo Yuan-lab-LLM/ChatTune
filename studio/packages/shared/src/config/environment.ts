@@ -1,5 +1,5 @@
 export const DEFAULT_ENVIRONMENT_CONFIG = {
-    defaultContainerName: 'tianrui_zh',
-    defaultEvaluateContainerName: 'tianrui_zh',
-    defaultGrpoContainerName: '',
+    defaultContainerName: 'training_container',
+    defaultEvaluateContainerName: 'evaluation_container',
+    defaultGrpoContainerName: 'grpo_container',
 } as const;

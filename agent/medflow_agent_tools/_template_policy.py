@@ -65,6 +65,34 @@ SUPPORTED_TEMPLATES = {
     "yi",
     "yi_vl",
     "yuan",
+    "ernie_nothink",
+    "falcon_h1",
+    "gemma2",
+    "gemma3n",
+    "glm4_moe",
+    "glm4_5v",
+    "gpt_oss",
+    "granite4",
+    "hunyuan_small",
+    "intern_s1",
+    "bailing_v2",
+    "lfm2",
+    "lfm2_vl",
+    "mimo_v2",
+    "cpm4",
+    "minimax1",
+    "minimax2",
+    "ministral3",
+    "phi4_mini",
+    "qwen3_nothink",
+    "qwen3_5",
+    "qwen3_5_nothink",
+    "qwen3_6",
+    "qwen3_omni",
+    "qwen3_vl",
+    "seed_oss",
+    "seed_coder",
+
 }
 
 TEMPLATE_PARAM_KEYS = {
@@ -77,8 +105,15 @@ TEMPLATE_PARAM_KEYS = {
 MODEL_HINT_KEYS = {
     "模型",
     "基础模型",
+    "模型路径",
+    "模型位置",
+    "基础模型路径",
     "model",
     "model_name",
+    "model_path",
+    "model-path",
+    "MODEL_PATH",
+    "base_model_path",
     "模型名",
     "模型名称",
 }
@@ -128,6 +163,16 @@ _NON_QWEN3_MARKERS = (
     "yi-",
     "yi/",
     "yuan",
+    "bailing",
+    "ernie",
+    "gpt-oss",
+    "gpt_oss",
+    "lfm",
+    "minimax",
+    "seed",
+    "intern-s1",
+    "intern_s1",
+
 )
 
 

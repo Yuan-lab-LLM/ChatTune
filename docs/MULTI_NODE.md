@@ -49,7 +49,7 @@ bash runtime.sh init --profile center --nodes node-b=http://<worker-b-host>:8099
 | `MEDFLOW_LOCAL_EVALUATE_CONTAINER` | Evaluation/inference container name that exists on the center machine, used for center-local Agent evaluation and inference-related tasks. |
 | `MEDFLOW_LOCAL_GRPO_CONTAINER` | GRPO/verl container name that exists on the center machine, used for center-local Agent GRPO/verl training tasks. |
 | `MODEL_NAME` / `MODEL_API_KEY` / `MODEL_BASE_URL` | OpenAI-compatible model name, API key, and service URL used by the center-local Agent. |
-| `INFERENCE_AGENT_URL` | Inference Agent controller `/inference_agent` URL used by the center-local Agent. |
+| `INFERENCE_AGENT_URL` | Inference Agent controller `/inference_agent` URL used by the center-local Agent. Studio administrator maintenance actions use the Studio login session; restrict Inference Agent `/admin/*` to trusted Studio Server access if enabled. |
 | `STUDIO_PUBLIC_URL` | Center Studio URL opened by users in a browser. |
 | `STUDIO_URL` | Center Studio backend URL used by Runtime/Agent callbacks. |
 
@@ -73,7 +73,7 @@ bash runtime.sh init --profile node --node-id node-a --center-url http://<center
 | `MEDFLOW_RESOURCE_API_TOKEN` | Resource API token for this node from the center output; must match this node's `resourceApiToken` in center `MEDFLOW_RESOURCE_NODES`. |
 | `MEDFLOW_RUNTIME_NODE_TOKEN` | Runtime node token for this node from the center output; must match this node's value in center `MEDFLOW_STUDIO_RUNTIME_NODE_TOKENS`. |
 | `MODEL_NAME` / `MODEL_API_KEY` / `MODEL_BASE_URL` | OpenAI-compatible model name, API key, and service URL used by this node's Agent. |
-| `INFERENCE_AGENT_URL` | Inference Agent controller `/inference_agent` URL used by tasks on this node. |
+| `INFERENCE_AGENT_URL` | Inference Agent controller `/inference_agent` URL used by tasks on this node. Studio administrator maintenance actions use the Studio login session; restrict Inference Agent `/admin/*` to trusted Studio Server access if enabled. |
 
 ## Startup Order
 

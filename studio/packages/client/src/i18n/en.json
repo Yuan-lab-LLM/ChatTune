@@ -261,10 +261,13 @@
     "reservationIdLabel": "Reservation ID",
     "forceRelease": "Force Release Reservation",
     "stopAndRelease": "Stop Process and Release",
+    "stopInferenceAndRelease": "Stop Inference Service and Release",
     "forceReleaseConfirm": "Force release only clears the Studio resource reservation. It does not stop the training process. If training is still running, the GPU may be assigned again, causing memory contention or OOM. Continue only after confirming the process has stopped or the reservation is stale.",
     "forceReleaseSuccess": "GPU resource reservation force released",
     "stopAndReleaseConfirm": "Stop process and release reservation first asks Runtime to check and stop the PID for this reservation inside the container, then releases the Studio reservation only after the process exits. This interrupts the running task. Continue?",
+    "stopInferenceAndReleaseConfirm": "Stop inference service and release reservation first asks Runtime to stop the current inference service, then releases the Studio reservation after the service stops. This interrupts the service if it is still in use. Continue?",
     "stopAndReleaseSuccess": "Training process stopped and GPU resource reservation released",
+    "stopInferenceAndReleaseSuccess": "Inference service stopped and GPU resource reservation released",
     "expandDiagnostics": "Diagnostics",
     "collapseDiagnostics": "Hide details",
     "statusLabel": "Reservation status",
@@ -272,6 +275,8 @@
     "expiresAtLabel": "Runtime expires at",
     "lastRenewedAtLabel": "Runtime renewed at",
     "releasedAtLabel": "Released at",
+    "endedAtLabel": "Ended at",
+    "endReasonLabel": "End reason",
     "expiredReasonLabel": "Expiration reason",
     "errorReasonLabel": "Error reason",
     "releaseResultLabel": "Release result",
@@ -279,18 +284,29 @@
     "nodeLabel": "Node",
     "gpuIndexesLabel": "GPU indexes",
     "noDiagnosticValue": "No record",
+    "notEnded": "Not ended",
     "taskCategoryLabel": "Task category",
     "taskTypeLabel": "Task type",
     "taskCategory": {
       "training": "Training",
       "assessment": "Assessment",
-      "evaluation": "Assessment"
+      "evaluation": "Assessment",
+      "inference": "Inference"
     },
     "releaseResult": {
       "success": "GPU released successfully",
       "force_released": "Reservation force released by admin",
-      "stopped_and_released": "Process stopped and reservation released by admin",
+      "stopped_and_released": "Task stopped and reservation released by admin",
       "failed": "GPU release failed"
+    },
+    "reason": {
+      "runtime_released": "Runtime released the reservation",
+      "admin_force_released": "Admin force released the reservation",
+      "admin_stopped_process_and_released": "Admin stopped the process and released the reservation",
+      "admin_stopped_inference_and_released": "Admin stopped the inference service and released the reservation",
+      "training_lease_expired": "Training resource lease expired",
+      "inference_lease_expired": "Inference resource lease expired",
+      "lease_expired_gpu_busy": "Lease expired, but assigned GPUs are still busy"
     },
     "cancel": "Cancel",
     "activeReservationsBlockConfig": "Active resource reservations exist, so this configuration cannot be changed yet",
@@ -324,7 +340,8 @@
       "full": "Full-parameter SFT",
       "enhanced": "DPO training",
       "scheduled": "Scheduled training",
-      "grpo": "GRPO"
+      "grpo": "GRPO",
+      "inference": "Inference service"
     },
     "stopAndReleaseGpuIdleSuccess": "Training GPU usage cleared and GPU resource reservation released",
     "releaseSuccess": "GPU resource reservation released",
@@ -428,6 +445,37 @@
     "serviceStatus": "Service Status",
     "running": "Running",
     "stopped": "Stopped",
+    "statusLabels": {
+      "running": "Running",
+      "stopped": "Stopped",
+      "starting": "Starting",
+      "failed": "Failed",
+      "degraded": "Degraded"
+    },
+    "servicePortDescription": "{{description}} · Port {{port}}",
+    "forceStop": "Force Stop",
+    "forceStopConfirm": "Force stop inference instance {{instanceId}}?",
+    "stopFailed": "Stop failed",
+    "stopSubmitted": "Stop request submitted",
+    "stopInstanceFailed": "Failed to stop inference instance",
+    "services": {
+      "VLLM_OPENAI_PORT": {
+        "name": "VLLM OpenAI API",
+        "description": "vLLM OpenAI-compatible API service"
+      },
+      "INFERENCE_PORT": {
+        "name": "Inference Service",
+        "description": "Primary inference service"
+      },
+      "UI_PORT": {
+        "name": "UI Service",
+        "description": "Web UI service"
+      },
+      "DATA_ANNOTATION_PORT": {
+        "name": "Data Annotation Service",
+        "description": "Data annotation tool service"
+      }
+    },
     "noStatusData": "No service status data",
     "clickRefresh": "Click refresh button to get latest status",
     "quickActions": "Quick Actions",
@@ -1596,12 +1644,16 @@
       "crossContainerTitle": "Dataset is not in the current training container",
       "crossContainerDesc": "Dataset {{dataset}} comes from container {{datasetContainer}}, while the current run uses training container {{runContainer}}. Sync the dataset to the current training container before starting training."
     },
+    "preprocess": {
+      "button": "Preprocess with this",
+      "inputHint": "Preprocessing command filled in. Click the send button in the lower right to start"
+    },
     "expand": "View files",
     "collapse": "Collapse",
     "container-input-title": "Enter Container Name",
     "container-name": "Docker Container Name",
     "container-required": "Please enter container name",
-    "container-default-hint": "Default is tianrui_zh, confirm or modify. The system will remember your recently used container names.",
+    "container-default-hint": "Default is training_container, confirm or modify. The system will remember your recently used container names.",
     "name": "Dataset Name",
     "name-required": "Please enter dataset name",
     "name-invalid": "Only letters, numbers, underscores and hyphens allowed",
@@ -1690,7 +1742,7 @@
     "container-input-title": "Enter Container Name",
     "container-name": "Docker Container Name",
     "container-required": "Please enter container name",
-    "container-default-hint": "Default is tianrui_zh, confirm or modify. The system will remember your recently used container names.",
+    "container-default-hint": "Default is training_container, confirm or modify. The system will remember your recently used container names.",
     "merged": "Training Complete",
     "not-merged": "Training Incomplete",
     "delete": {
@@ -1862,7 +1914,7 @@
     "query-available": "Query Available Evaluations",
     "container-name": "Docker Container Name",
     "container-required": "Please enter container name",
-    "container-default-hint": "Default is tianrui_zh, confirm or modify. The system will remember your recently used container names."
+    "container-default-hint": "Default is training_container, confirm or modify. The system will remember your recently used container names."
   },
   "wizard": {
     "steps": {
@@ -1962,7 +2014,7 @@
       },
       "monitor": {
         "task": "\"Monitor training\": checks the backend training process and latest status.",
-        "container": "\"Container tianrui_zh\": tells the system which container to read training status from."
+        "container": "\"Container training_container\": tells the system which container to read training status from."
       }
     },
     "completion": {
@@ -1989,7 +2041,7 @@
         "step1": "Click 'Query Available Datasets' button on the left",
         "step1Desc": "Located in the data management panel",
         "step2": "Enter container name",
-        "step2Desc": "Default: tianrui_zh",
+        "step2Desc": "Default: training_container",
         "step3": "View dataset list",
         "step3Desc": "Find medical-example dataset"
       },

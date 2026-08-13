@@ -32,9 +32,11 @@ export class ResourceAccessService {
                 id: DEFAULT_GROUP_ID,
                 name: '默认用户组',
                 description: '迁移和新建普通用户的默认资源组',
-                defaultContainerName: process.env.AGENT3_DEFAULT_DOCKER_CONTAINER?.trim() || 'tianrui_zh',
+                defaultContainerName: process.env.AGENT3_DEFAULT_DOCKER_CONTAINER?.trim() || 'training_container',
                 defaultEvaluateContainerName:
-                    process.env.AGENT3_DEFAULT_EVALUATE_DOCKER_CONTAINER?.trim() || '',
+                    process.env.AGENT3_DEFAULT_EVALUATE_DOCKER_CONTAINER?.trim() || 'evaluation_container',
+                defaultGrpoContainerName:
+                    process.env.AGENT3_DEFAULT_GRPO_DOCKER_CONTAINER?.trim() || 'grpo_container',
             });
             await group.save();
         }

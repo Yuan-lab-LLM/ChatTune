@@ -1296,8 +1296,11 @@ class ScriptManager:
             "第二个模型": "model_sec", 
             "模型二": "model_sec",
             "第二个模型路径": "model_sec",
-            "模型位置": "model_path",
-            "模型路径": "model_path",
+            "模型位置": "MODEL_PATH",
+            "模型路径": "MODEL_PATH",
+            "基础模型路径": "MODEL_PATH",
+            "model_path": "MODEL_PATH",
+            "MODEL_PATH": "MODEL_PATH",
             "数据集": "DATASET_DIR",
             "数据集路径":"DATASET_DIR",
             "dataset_dir":"DATASET_DIR",
@@ -1339,6 +1342,7 @@ class ScriptManager:
             "model_fir": "第一个模型路径 (First Model Path)",
             "model_sec": "第二个模型路径 (Second Model Path)",
             "model_path": "模型路径 (Model Path)",
+            "MODEL_PATH": "批量训练基础模型路径 (Optional base model path)",
             "dataset_dir": "数据集路径 (Dataset Directory)",
             "dataset_name": "数据集名称 (Dataset Name)",
             "DATASET_DIR": "批量训练数据集路径 (Batch Training Dataset Directory)",
@@ -1369,7 +1373,7 @@ class ScriptManager:
                     "TEM": "qwen3",
                 "RESUME": ""
                 },
-                "supported_params": ["MBS", "ACC", "LR", "TEM", "RESUME", "LOCALHOST_ID", "container", "DATASET_DIR", "DATASET_DATE"],  # 支持修改的参数
+                "supported_params": ["MBS", "ACC", "LR", "TEM", "RESUME", "MODEL_PATH", "LOCALHOST_ID", "container", "DATASET_DIR", "DATASET_DATE"],  # 支持修改的参数
                 "default_args": {
                     "background": True,
                     "capture_output": False,
@@ -1401,7 +1405,7 @@ class ScriptManager:
                     "TEM": "qwen3",
                 "RESUME": ""
                 },
-                "supported_params": ["MBS", "ACC", "LR", "TEM", "RESUME", "LOCALHOST_ID", "container", "DATASET_DIR", "DATASET_DATE"],
+                "supported_params": ["MBS", "ACC", "LR", "TEM", "RESUME", "MODEL_PATH", "LOCALHOST_ID", "container", "DATASET_DIR", "DATASET_DATE"],
                 "default_args": {
                     "background": True,
                     "capture_output": False,
@@ -2176,6 +2180,15 @@ def _training_model_hint(
     env_vars = env_vars or {}
     cli_args = cli_args or {}
     values: List[Any] = []
+    if script_name in {"batch_train_lora", "batch_train_full"}:
+        values.extend(
+            [
+                env_vars.get("MODEL_PATH"),
+                env_vars.get("model_path"),
+                cli_args.get("MODEL_PATH"),
+                cli_args.get("model_path"),
+            ]
+        )
     if script_name in {MULTINODE_SFT_SCRIPT, "dpo_train_launcher", MULTINODE_DPO_SCRIPT}:
         values.extend(
             [
@@ -2876,6 +2889,15 @@ def run_script_by_name_train(
                 continue
             if template_managed_script and (pname in MODEL_HINT_KEYS or pname_lower in MODEL_HINT_KEYS):
                 hint = str(param_value).strip()
+                is_batch_model_path = script_name in {"batch_train_lora", "batch_train_full"} and (
+                    pname in {"模型路径", "模型位置", "基础模型路径", "MODEL_PATH"}
+                    or pname_lower in {"model_path", "model-path", "base_model_path"}
+                )
+                if is_batch_model_path:
+                    params_to_update["MODEL_PATH"] = hint
+                    if text_mentions_non_qwen3_model(hint):
+                        non_qwen3_model_hints.append(hint)
+                    continue
                 if text_mentions_non_qwen3_model(hint):
                     non_qwen3_model_hints.append(hint)
                     continue

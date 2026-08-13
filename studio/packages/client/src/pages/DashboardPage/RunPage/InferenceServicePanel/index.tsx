@@ -1,6 +1,7 @@
 import { memo, useMemo, useCallback, useState, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button.tsx";
+import { trpc } from "@/api/trpc";
 import {
   PanelLeftClose,
   RefreshCw,
@@ -86,32 +87,58 @@ const parsePercentageOrDecimal = (value: string): number | undefined => {
   return Number.isNaN(decimalValue) ? undefined : decimalValue;
 };
 
+type ProtocolServiceStatusItem = {
+  key?: string;
+  name?: string;
+  service?: string;
+  displayName?: string;
+  port?: number | string;
+  status?: string;
+  rawStatus?: string;
+  raw_status?: string;
+  node?: string;
+};
+
+type ProtocolServiceInstances = {
+  items?: Array<Record<string, unknown>>;
+  services?: ProtocolServiceStatusItem[];
+  template_services?: ProtocolServiceStatusItem[];
+  templateServices?: ProtocolServiceStatusItem[];
+  port_statuses?: ProtocolServiceStatusItem[];
+  portStatuses?: ProtocolServiceStatusItem[];
+  ports?: Record<string, number | string>;
+  summary?: Record<string, unknown>;
+};
+
 interface InferenceProtocol {
   type?: string;
+  jobType?: string;
   agent?: string;
   message?: string;
+  action?: string;
   config?: InferenceConfig;
+  service_start?: Record<string, unknown>;
+  serviceStart?: Record<string, unknown>;
   nodes?: Record<
     string,
     {
       config?: InferenceConfig;
-      services?: Array<{
-        name?: string;
-        port?: number | string;
-        status?: string;
-        rawStatus?: string;
-        node?: string;
-      }>;
+      services?: ProtocolServiceStatusItem[];
+      ports?: Record<string, number | string>;
+      service_instances?: ProtocolServiceInstances;
+      serviceInstances?: ProtocolServiceInstances;
+      serviceStart?: Record<string, unknown>;
+      service_start?: Record<string, unknown>;
       allStopped?: boolean;
       allRunning?: boolean;
     }
   >;
-  services?: Array<{
-    name?: string;
-    port?: number | string;
-    status?: string;
-    rawStatus?: string;
-  }>;
+  services?: ProtocolServiceStatusItem[];
+  ports?: Record<string, number | string>;
+  service_instances?: ProtocolServiceInstances;
+  serviceInstances?: ProtocolServiceInstances;
+  allStopped?: boolean;
+  allRunning?: boolean;
 }
 
 const extractInferenceProtocolFromText = (
@@ -190,6 +217,13 @@ const extractInferenceProtocolFromMetadata = (
   return protocol as InferenceProtocol;
 };
 
+const isInferenceServiceStartProtocol = (
+  protocol: InferenceProtocol | null,
+): boolean =>
+  protocol?.type === "job_started" &&
+  protocol.jobType === "inference_service" &&
+  protocol.action === "service_start";
+
 const serviceDisplayName = (name: string) => {
   const labels: Record<string, string> = {
     VLLM_OPENAI_PORT: "VLLM OpenAI API",
@@ -210,41 +244,102 @@ const serviceDescription = (name: string) => {
   return labels[name];
 };
 
+const STANDARD_SERVICE_KEYS = [
+  "VLLM_OPENAI_PORT",
+  "INFERENCE_PORT",
+  "UI_PORT",
+  "DATA_ANNOTATION_PORT",
+] as const;
+
+type StandardServiceKey = (typeof STANDARD_SERVICE_KEYS)[number];
+
+const isStandardServiceKey = (name: string): name is StandardServiceKey =>
+  (STANDARD_SERVICE_KEYS as readonly string[]).includes(name);
+
 const normalizeServiceName = (name: string): string => {
   const normalized = name.replace(/[*`]/g, "").replace(/\s+/g, "");
+  const upper = normalized.toUpperCase();
+  if (isStandardServiceKey(upper)) {
+    return upper;
+  }
+
   const aliases: Record<string, string> = {
+    vllm: "VLLM_OPENAI_PORT",
     VLLM服务: "VLLM_OPENAI_PORT",
     vLLM服务: "VLLM_OPENAI_PORT",
     VLLMOPENAI服务: "VLLM_OPENAI_PORT",
+    VLLMOPENAI端口: "VLLM_OPENAI_PORT",
     VLLMOpenAI服务: "VLLM_OPENAI_PORT",
+    VLLMOpenAI端口: "VLLM_OPENAI_PORT",
     VLLMOpenAIAPI: "VLLM_OPENAI_PORT",
+    VLLMAPI: "VLLM_OPENAI_PORT",
+    VLLMOpenAI接口: "VLLM_OPENAI_PORT",
+    vLLMAPI服务: "VLLM_OPENAI_PORT",
+    vLLMOpenAIAPI: "VLLM_OPENAI_PORT",
+    vLLMAPI: "VLLM_OPENAI_PORT",
+    vLLMOpenAI兼容API服务: "VLLM_OPENAI_PORT",
     VLLM开放API端口: "VLLM_OPENAI_PORT",
+    InferenceServer: "INFERENCE_PORT",
+    INFERENCE服务端口: "INFERENCE_PORT",
+    inference: "INFERENCE_PORT",
     推理服务: "INFERENCE_PORT",
+    推理服务端口: "INFERENCE_PORT",
+    推理接口: "INFERENCE_PORT",
+    推理接口端口: "INFERENCE_PORT",
     推理引擎: "INFERENCE_PORT",
     主推理服务: "INFERENCE_PORT",
     Web界面: "UI_PORT",
+    UI界面: "UI_PORT",
     UI界面服务: "UI_PORT",
+    UI端口: "UI_PORT",
     UI服务端口: "UI_PORT",
     WebUI: "UI_PORT",
+    ui: "UI_PORT",
     UI服务: "UI_PORT",
+    DataAnnotation: "DATA_ANNOTATION_PORT",
+    DATAANNOTATION端口: "DATA_ANNOTATION_PORT",
+    Case2Chat: "DATA_ANNOTATION_PORT",
+    case2chat: "DATA_ANNOTATION_PORT",
+    数据标注: "DATA_ANNOTATION_PORT",
+    数据标注端口: "DATA_ANNOTATION_PORT",
+    数据标注接口: "DATA_ANNOTATION_PORT",
+    数据标注接口端口: "DATA_ANNOTATION_PORT",
     数据标注服务: "DATA_ANNOTATION_PORT",
     数据标注服务端口: "DATA_ANNOTATION_PORT",
   };
   return aliases[normalized] || name;
 };
-
 const parseServiceStatusesFromText = (text: string): ServiceStatus[] | null => {
   const statuses: ServiceStatus[] = [];
   const seen = new Set<string>();
-  const linePattern =
-    /^\s*-?\s*(?:[^\w\s(（:：-]+\s*)?(.+?)\s*[（(]\s*(?:端口\s*)?(\d+)\s*(?:端口)?\s*[）)]\s*[：:]\s*(.+?)\s*$/gm;
-  for (const match of text.matchAll(linePattern)) {
-    const rawName = match[1].trim();
-    const normalizedName = normalizeServiceName(rawName);
-    const port = Number(match[2]);
-    if (!Number.isFinite(port)) {
+  const tablePattern = /^\s*\|(.+?)\|\s*$/gm;
+  for (const match of text.matchAll(tablePattern)) {
+    const cells = match[1]
+      .split("|")
+      .map((cell) => cell.trim().replace(/^[*`\s]+|[*`\s]+$/g, ""));
+    if (cells.length < 3) {
       continue;
     }
+    if (cells.every((cell) => /^:?-{2,}:?$/.test(cell.replace(/\s+/g, "")))) {
+      continue;
+    }
+    const [rawName, rawPort, rawStatus] = cells;
+    const headerText = cells.join("").toLowerCase();
+    if (
+      headerText.includes("服务组件端口状态") ||
+      headerText.includes("servicecomponentportstatus")
+    ) {
+      continue;
+    }
+    const portMatch = rawPort.match(/\d{2,5}/);
+    if (!rawName || !portMatch) {
+      continue;
+    }
+    const normalizedName = normalizeServiceName(rawName);
+    if (!isStandardServiceKey(normalizedName)) {
+      continue;
+    }
+    const port = Number(portMatch[0]);
     const key = `${normalizedName}:${port}`;
     if (seen.has(key)) {
       continue;
@@ -253,47 +348,255 @@ const parseServiceStatusesFromText = (text: string): ServiceStatus[] | null => {
     statuses.push({
       name: serviceDisplayName(normalizedName),
       port,
-      status: parseStatus(match[3]),
-      rawStatus: match[3].trim(),
+      status: parseStatus(rawStatus),
+      rawStatus: rawStatus.trim(),
       description: serviceDescription(normalizedName),
+      serviceKey: normalizedName,
     });
+  }
+
+  const linePatterns = [
+    /^\s*-?\s*(?:[^\w\s(（:：-]+\s*)?(.+?)\s*[（(]\s*(?:端口\s*)?(\d+)\s*(?:端口)?\s*[）)]\s*[：:]\s*(.+?)\s*$/gm,
+    /^\s*-?\s*(?:[^\w\s(（:：-]+\s*)?(.+?)\s*[：:]\s*(\d+)\s*[（(]\s*(.+?)\s*[）)]\s*$/gm,
+    /^\s*-?\s*(?:[^\w\s(（:：-]+\s*)?(.+?)\s*[：:]\s*(\d+)\s+(.+?)\s*$/gm,
+  ];
+
+  for (const linePattern of linePatterns) {
+    for (const match of text.matchAll(linePattern)) {
+      const rawName = match[1].trim();
+      const normalizedName = normalizeServiceName(rawName);
+      if (!isStandardServiceKey(normalizedName)) {
+        continue;
+      }
+      const port = Number(match[2]);
+      if (!Number.isFinite(port)) {
+        continue;
+      }
+      const key = `${normalizedName}:${port}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      statuses.push({
+        name: serviceDisplayName(normalizedName),
+        port,
+        status: parseStatus(match[3]),
+        rawStatus: match[3].trim(),
+        description: serviceDescription(normalizedName),
+        serviceKey: normalizedName,
+      });
+    }
   }
   return statuses.length > 0 ? statuses : null;
 };
 
+const cleanProtocolStatusText = (value: unknown): string =>
+  String(value || "")
+    .replace(/[*`]/g, "")
+    .trim();
+
+const serviceInstanceStatus = (
+  value: unknown,
+): ServiceStatus["status"] => {
+  const normalized = cleanProtocolStatusText(value).toUpperCase();
+  if (normalized.includes("STARTING") || normalized.includes("启动中")) {
+    return "starting";
+  }
+  if (
+    normalized.includes("FAILED") ||
+    normalized.includes("失败") ||
+    normalized.includes("异常")
+  ) {
+    return "failed";
+  }
+  if (normalized.includes("DEGRADED") || normalized.includes("降级")) {
+    return "degraded";
+  }
+  if (
+    normalized.includes("RUNNING") ||
+    normalized.includes("正在运行") ||
+    normalized.includes("运行中")
+  ) {
+    return "running";
+  }
+  return "stopped";
+};
+
+const protocolServiceKey = (item: ProtocolServiceStatusItem): StandardServiceKey | null => {
+  const candidates = [item.key, item.name, item.service, item.displayName];
+  for (const candidate of candidates) {
+    if (!candidate) {
+      continue;
+    }
+    const normalized = normalizeServiceName(String(candidate).trim());
+    if (isStandardServiceKey(normalized)) {
+      return normalized;
+    }
+  }
+  return null;
+};
+
+const orderedProtocolStatuses = (
+  statusesByKey: Partial<Record<StandardServiceKey, ServiceStatus>>,
+): ServiceStatus[] =>
+  STANDARD_SERVICE_KEYS.flatMap((key) => {
+    const status = statusesByKey[key];
+    return status ? [status] : [];
+  });
+
+const serviceStatusesFromProtocolItems = (
+  items: ProtocolServiceStatusItem[],
+  nodeName = "",
+): ServiceStatus[] | null => {
+  const statusesByKey: Partial<Record<StandardServiceKey, ServiceStatus>> = {};
+
+  items.forEach((item) => {
+    const serviceKey = protocolServiceKey(item);
+    const port = Number(item.port);
+    if (!serviceKey || !Number.isFinite(port) || statusesByKey[serviceKey]) {
+      return;
+    }
+
+    const rawStatus = cleanProtocolStatusText(
+      item.rawStatus || item.raw_status || item.status,
+    );
+    statusesByKey[serviceKey] = {
+      name: serviceDisplayName(serviceKey),
+      port,
+      status: serviceInstanceStatus(item.status || rawStatus),
+      rawStatus,
+      description: serviceDescription(serviceKey),
+      serviceKey,
+      node: nodeName || item.node || "",
+      isPortStatus: true,
+    };
+  });
+
+  const ordered = orderedProtocolStatuses(statusesByKey);
+  return ordered.length > 0 ? ordered : null;
+};
+
+const inferredProtocolPortStatus = (
+  serviceInstances: ProtocolServiceInstances | undefined,
+  protocol: InferenceProtocol,
+): ServiceStatus["status"] => {
+  if (protocol.allRunning) {
+    return "running";
+  }
+  if (protocol.allStopped) {
+    return "stopped";
+  }
+
+  const summary = serviceInstances?.summary || {};
+  const running = Number(summary.running || 0);
+  const starting = Number(summary.starting || 0);
+  const failed = Number(summary.failed || 0);
+  const stopped = Number(summary.stopped || 0);
+  if (starting > 0 && running === 0) {
+    return "starting";
+  }
+  if (running > 0 && stopped === 0 && failed === 0) {
+    return "running";
+  }
+  if (failed > 0 && running === 0) {
+    return "failed";
+  }
+  return "stopped";
+};
+
+const serviceStatusesFromProtocolPorts = (
+  ports: Record<string, number | string> | undefined,
+  defaultStatus: ServiceStatus["status"],
+  nodeName = "",
+): ServiceStatus[] | null => {
+  const statusesByKey: Partial<Record<StandardServiceKey, ServiceStatus>> = {};
+
+  Object.entries(ports || {}).forEach(([name, portValue]) => {
+    if (name.toLowerCase() === "master") {
+      return;
+    }
+    const serviceKey = normalizeServiceName(name);
+    const port = Number(portValue);
+    if (!isStandardServiceKey(serviceKey) || !Number.isFinite(port)) {
+      return;
+    }
+    statusesByKey[serviceKey] = {
+      name: serviceDisplayName(serviceKey),
+      port,
+      status: defaultStatus,
+      rawStatus: defaultStatus.toUpperCase(),
+      description: serviceDescription(serviceKey),
+      serviceKey,
+      node: nodeName,
+      isPortStatus: true,
+    };
+  });
+
+  const ordered = orderedProtocolStatuses(statusesByKey);
+  return ordered.length > 0 ? ordered : null;
+};
+
+const protocolArray = (
+  value: ProtocolServiceStatusItem[] | undefined,
+): ProtocolServiceStatusItem[] => (Array.isArray(value) ? value : []);
+
 const serviceStatusesFromProtocol = (
   protocol: InferenceProtocol | null,
+  nodeName = "",
 ): ServiceStatus[] | null => {
   if (protocol?.type !== "inference_status") {
     return null;
   }
-  if (!protocol.services?.length) {
-    return protocol.message
-      ? parseServiceStatusesFromText(protocol.message)
-      : null;
+
+  const serviceInstances = protocol.service_instances || protocol.serviceInstances;
+  let sawStructuredSource = false;
+  const structuredSources = [
+    protocolArray(serviceInstances?.port_statuses),
+    protocolArray(serviceInstances?.portStatuses),
+    protocolArray(serviceInstances?.template_services),
+    protocolArray(serviceInstances?.templateServices),
+    protocolArray(serviceInstances?.services),
+  ];
+
+  for (const source of structuredSources) {
+    if (source.length === 0) {
+      continue;
+    }
+    sawStructuredSource = true;
+    const statuses = serviceStatusesFromProtocolItems(source, nodeName);
+    if (statuses) {
+      return statuses;
+    }
   }
 
-  const statuses = protocol.services
-    .map((service) => {
-      const rawName = normalizeServiceName(service.name || "");
-      const port = Number(service.port);
-      if (!rawName || Number.isNaN(port)) {
-        return null;
-      }
+  const ports = serviceInstances?.ports || protocol.ports;
+  if (ports && Object.keys(ports).length > 0) {
+    sawStructuredSource = true;
+    const statuses = serviceStatusesFromProtocolPorts(
+      ports,
+      inferredProtocolPortStatus(serviceInstances, protocol),
+      nodeName,
+    );
+    if (statuses) {
+      return statuses;
+    }
+  }
 
-      return {
-        name: serviceDisplayName(rawName),
-        port,
-        status: service.status === "running" ? "running" : "stopped",
-        rawStatus: service.rawStatus,
-        description: serviceDescription(rawName),
-      } satisfies ServiceStatus;
-    })
-    .filter((service): service is ServiceStatus => service !== null);
+  if (protocol.services?.length) {
+    sawStructuredSource = true;
+    const statuses = serviceStatusesFromProtocolItems(protocol.services, nodeName);
+    if (statuses) {
+      return statuses;
+    }
+    return null;
+  }
 
-  return statuses.length > 0 ? statuses : null;
+  if (sawStructuredSource) {
+    return null;
+  }
+
+  return protocol.message ? parseServiceStatusesFromText(protocol.message) : null;
 };
-
 type InferenceNodeStatuses = Record<string, ServiceStatus[]>;
 
 const nodeStatusesFromProtocol = (
@@ -305,11 +608,17 @@ const nodeStatusesFromProtocol = (
 
   const statuses: InferenceNodeStatuses = {};
   Object.entries(protocol.nodes || {}).forEach(([nodeName, node]) => {
-    const normalized = serviceStatusesFromProtocol({
-      type: "inference_status",
-      services: node?.services,
-      message: protocol.message,
-    });
+    const normalized = serviceStatusesFromProtocol(
+      {
+        type: "inference_status",
+        services: node?.services,
+        ports: node?.ports,
+        service_instances: node?.service_instances || node?.serviceInstances,
+        allRunning: node?.allRunning,
+        allStopped: node?.allStopped,
+      },
+      nodeName,
+    );
     if (normalized) {
       statuses[nodeName] = normalized;
     }
@@ -346,12 +655,12 @@ const numberFromProtocolValue = (
 };
 
 const cleanConfigStringValue = (
-  value: string | undefined,
+  value: unknown,
 ): string | undefined => {
-  if (value === undefined) {
+  if (value == null) {
     return undefined;
   }
-  return value
+  return String(value)
     .trim()
     .replace(/^["'`]+|["'`,]+$/g, "")
     .replace(/\s*[（(][^）)]*[）)]\s*$/g, "")
@@ -403,6 +712,7 @@ const configFromProtocol = (
     source.env?.CUDA_VISIBLE_DEVICES,
   );
   config.env.MODEL_NAME = cleanConfigStringValue(source.env?.MODEL_NAME);
+  config.env.MODEL_PARAM_B = cleanConfigStringValue(source.env?.MODEL_PARAM_B);
   config.env.MODEL_PATH = cleanConfigStringValue(source.env?.MODEL_PATH);
   config.env.START_SCRIPT = cleanConfigStringValue(source.env?.START_SCRIPT);
   config.env.LOG_DIR = cleanConfigStringValue(source.env?.LOG_DIR);
@@ -411,12 +721,16 @@ const configFromProtocol = (
   config.env.GENERAL_BENCHMARK_DIR = cleanConfigStringValue(
     source.env?.GENERAL_BENCHMARK_DIR,
   );
+  config.env.MASTER_PORT = numberFromProtocolValue(source.env?.MASTER_PORT);
 
   config.runtime.TENSOR_PARALLEL_SIZE = numberFromProtocolValue(
     source.runtime?.TENSOR_PARALLEL_SIZE,
   );
   config.runtime.GPU_MEMORY_UTILIZATION = numberFromProtocolValue(
     source.runtime?.GPU_MEMORY_UTILIZATION,
+  );
+  config.runtime.GPU_UTILIZATION_THRESHOLD = numberFromProtocolValue(
+    source.runtime?.GPU_UTILIZATION_THRESHOLD,
   );
   config.runtime.MAX_TOKENS = numberFromProtocolValue(
     source.runtime?.MAX_TOKENS,
@@ -522,6 +836,7 @@ const configFromJsonPayload = (payload: unknown): InferenceConfig | null => {
     env.CUDA_VISIBLE_DEVICES,
   );
   config.env.MODEL_NAME = stringFromJsonValue(env.MODEL_NAME);
+  config.env.MODEL_PARAM_B = stringFromJsonValue(env.MODEL_PARAM_B);
   config.env.MODEL_PATH = stringFromJsonValue(env.MODEL_PATH);
   config.env.START_SCRIPT = stringFromJsonValue(env.START_SCRIPT);
   config.env.LOG_DIR = stringFromJsonValue(env.LOG_DIR);
@@ -530,12 +845,16 @@ const configFromJsonPayload = (payload: unknown): InferenceConfig | null => {
   config.env.GENERAL_BENCHMARK_DIR = stringFromJsonValue(
     env.GENERAL_BENCHMARK_DIR,
   );
+  config.env.MASTER_PORT = numberFromProtocolValue(env.MASTER_PORT as any);
 
   config.runtime.TENSOR_PARALLEL_SIZE = numberFromProtocolValue(
     runtime.TENSOR_PARALLEL_SIZE as number | string | undefined,
   );
   config.runtime.GPU_MEMORY_UTILIZATION = numberFromProtocolValue(
-    runtime.GPU_MEMORY_UTILIZATION as number | string | undefined,
+    runtime.GPU_MEMORY_UTILIZATION as any,
+  );
+  config.runtime.GPU_UTILIZATION_THRESHOLD = numberFromProtocolValue(
+    runtime.GPU_UTILIZATION_THRESHOLD as any,
   );
   config.runtime.MAX_TOKENS = numberFromProtocolValue(
     runtime.MAX_TOKENS as number | string | undefined,
@@ -625,6 +944,7 @@ const configFromJsonBlocks = (text: string): InferenceConfig | null => {
         hasAnyKey(record, [
           "TENSOR_PARALLEL_SIZE",
           "GPU_MEMORY_UTILIZATION",
+          "GPU_UTILIZATION_THRESHOLD",
           "MAX_TOKENS",
         ])
       ) {
@@ -634,8 +954,12 @@ const configFromJsonBlocks = (text: string): InferenceConfig | null => {
           ) ?? merged.runtime.TENSOR_PARALLEL_SIZE;
         merged.runtime.GPU_MEMORY_UTILIZATION =
           numberFromProtocolValue(
-            record.GPU_MEMORY_UTILIZATION as number | string | undefined,
+            record.GPU_MEMORY_UTILIZATION as any,
           ) ?? merged.runtime.GPU_MEMORY_UTILIZATION;
+        merged.runtime.GPU_UTILIZATION_THRESHOLD =
+          numberFromProtocolValue(
+            record.GPU_UTILIZATION_THRESHOLD as any,
+          ) ?? merged.runtime.GPU_UTILIZATION_THRESHOLD;
         merged.runtime.MAX_TOKENS =
           numberFromProtocolValue(
             record.MAX_TOKENS as number | string | undefined,
@@ -648,6 +972,8 @@ const configFromJsonBlocks = (text: string): InferenceConfig | null => {
           merged.env.CUDA_VISIBLE_DEVICES;
         merged.env.MODEL_NAME =
           stringFromJsonValue(record.MODEL_NAME) ?? merged.env.MODEL_NAME;
+        merged.env.MODEL_PARAM_B =
+          stringFromJsonValue(record.MODEL_PARAM_B) ?? merged.env.MODEL_PARAM_B;
         merged.env.MODEL_PATH =
           stringFromJsonValue(record.MODEL_PATH) ?? merged.env.MODEL_PATH;
         merged.env.START_SCRIPT =
@@ -661,6 +987,8 @@ const configFromJsonBlocks = (text: string): InferenceConfig | null => {
         merged.env.GENERAL_BENCHMARK_DIR =
           stringFromJsonValue(record.GENERAL_BENCHMARK_DIR) ??
           merged.env.GENERAL_BENCHMARK_DIR;
+        merged.env.MASTER_PORT =
+          numberFromProtocolValue(record.MASTER_PORT as any) ?? merged.env.MASTER_PORT;
       }
     } catch {
       // Ignore malformed JSON snippets and keep trying other parsers.
@@ -805,6 +1133,12 @@ const parseInferenceConfigFromReplies = (
         if (modelNameMatch)
           config.env.MODEL_NAME = cleanConfigStringValue(modelNameMatch[1]);
 
+        const modelParamMatch = normalizedText.match(
+          /[`"]?MODEL_PARAM_B[`"]?\s*[:：]\s*["']?([^"',\n\r]+)["']?,?/,
+        );
+        if (modelParamMatch)
+          config.env.MODEL_PARAM_B = cleanConfigStringValue(modelParamMatch[1]);
+
         const modelPathMatch = normalizedText.match(
           /[`"]?MODEL_PATH[`"]?\s*[:：]\s*["']?([^"',\n\r]+)["']?,?/,
         );
@@ -845,7 +1179,12 @@ const parseInferenceConfigFromReplies = (
             generalBenchmarkDirMatch[1],
           );
 
-        const hostIpLabelMatch = text.match(/主机IP(?:地址)?[:：]\s*([^\s]+)/);
+        const masterPortMatch = normalizedText.match(
+          /[`"]?MASTER_PORT[`"]?\s*[:：]\s*(\d+)/,
+        );
+        if (masterPortMatch) config.env.MASTER_PORT = parseInt(masterPortMatch[1], 10);
+
+        const hostIpLabelMatch = text.match(/主机\s*IP(?:地址)?[:：]\s*([^\s]+)/);
         if (hostIpLabelMatch) config.env.HOST_IP = hostIpLabelMatch[1];
 
         const gpuDevicesLabelMatch = text.match(
@@ -857,7 +1196,7 @@ const parseInferenceConfigFromReplies = (
           );
 
         const visibleGpuDevicesLabelMatch = text.match(
-          /可见GPU设备[:：]\s*([^\n\r]+)/,
+          /可见\s*GPU\s*设备[:：]\s*([^\n\r]+)/,
         );
         if (visibleGpuDevicesLabelMatch)
           config.env.CUDA_VISIBLE_DEVICES = cleanConfigStringValue(
@@ -868,6 +1207,12 @@ const parseInferenceConfigFromReplies = (
         if (modelNameLabelMatch)
           config.env.MODEL_NAME = cleanConfigStringValue(
             modelNameLabelMatch[1],
+          );
+
+        const modelParamLabelMatch = text.match(/模型参数量[:：]\s*([^\n\r]+)/);
+        if (modelParamLabelMatch)
+          config.env.MODEL_PARAM_B = cleanConfigStringValue(
+            modelParamLabelMatch[1],
           );
 
         const modelPathLabelMatch = text.match(/模型路径[:：]\s*([^\n\r]+)/);
@@ -908,6 +1253,10 @@ const parseInferenceConfigFromReplies = (
             generalBenchmarkDirLabelMatch[1],
           );
 
+        const masterPortLabelMatch = text.match(/主端口[:：]\s*(\d+)/);
+        if (masterPortLabelMatch)
+          config.env.MASTER_PORT = parseInt(masterPortLabelMatch[1], 10);
+
         // 解析运行时配置
         const tensorMatch = normalizedText.match(
           /[`"]?TENSOR_PARALLEL_SIZE[`"]?[:：]\s*(\d+)/,
@@ -925,6 +1274,16 @@ const parseInferenceConfigFromReplies = (
           }
         }
 
+        const gpuThresholdMatch = normalizedText.match(
+          /[`"]?GPU_UTILIZATION_THRESHOLD[`"]?\s*[:：]\s*([0-9.]+%?)/,
+        );
+        if (gpuThresholdMatch) {
+          const parsedThreshold = parsePercentageOrDecimal(gpuThresholdMatch[1]);
+          if (parsedThreshold !== undefined) {
+            config.runtime.GPU_UTILIZATION_THRESHOLD = parsedThreshold;
+          }
+        }
+
         const maxTokensMatch = normalizedText.match(
           /[`"]?MAX_TOKENS[`"]?[:：]\s*(\d+)/,
         );
@@ -932,7 +1291,7 @@ const parseInferenceConfigFromReplies = (
           config.runtime.MAX_TOKENS = parseInt(maxTokensMatch[1]);
 
         const tensorLabelMatch = text.match(
-          /张量并行(?:度|数|规模|尺寸)[:：]\s*(\d+)/,
+          /张量并行(?:度|数|规模|尺寸|大小)(?:\s*[（(][^）)]*[）)])?[:：]\s*(\d+)/,
         );
         if (tensorLabelMatch)
           config.runtime.TENSOR_PARALLEL_SIZE = parseInt(
@@ -940,7 +1299,7 @@ const parseInferenceConfigFromReplies = (
             10,
           );
 
-        const gpuMemLabelMatch = text.match(/GPU内存利用率[:：]\s*([0-9.]+%?)/);
+        const gpuMemLabelMatch = text.match(/GPU\s*(?:内存|显存)利用率[:：]\s*([0-9.]+%?)/);
         if (gpuMemLabelMatch) {
           const parsedGpuMem = parsePercentageOrDecimal(gpuMemLabelMatch[1]);
           if (parsedGpuMem !== undefined) {
@@ -948,8 +1307,16 @@ const parseInferenceConfigFromReplies = (
           }
         }
 
+        const gpuThresholdLabelMatch = text.match(/GPU\s*利用率阈值[:：]\s*([0-9.]+%?)/);
+        if (gpuThresholdLabelMatch) {
+          const parsedThreshold = parsePercentageOrDecimal(gpuThresholdLabelMatch[1]);
+          if (parsedThreshold !== undefined) {
+            config.runtime.GPU_UTILIZATION_THRESHOLD = parsedThreshold;
+          }
+        }
+
         const maxTokensLabelMatch = text.match(
-          /最大(?:上下文令牌数|令牌数|token长度|Token长度|tokens?(?:限制)?|Tokens?(?:限制)?)[:：]\s*(\d+)/,
+          /最大\s*(?:上下文令牌数|令牌数|token长度|Token长度|Token数|tokens?(?:限制)?|Tokens?(?:限制)?)[:：]\s*(\d+)/,
         );
         if (maxTokensLabelMatch)
           config.runtime.MAX_TOKENS = parseInt(maxTokensLabelMatch[1], 10);
@@ -1038,8 +1405,20 @@ const selectConfigForNode = (
 };
 
 // 状态映射：将中英文状态统一转换为 running/stopped
-const parseStatus = (statusText: string): "running" | "stopped" => {
+const parseStatus = (statusText: string): ServiceStatus["status"] => {
   const normalized = statusText.trim().toUpperCase();
+
+  if (normalized.includes("STARTING") || normalized.includes("启动中")) {
+    return "starting";
+  }
+
+  if (normalized.includes("FAILED") || normalized.includes("失败") || normalized.includes("异常")) {
+    return "failed";
+  }
+
+  if (normalized.includes("DEGRADED") || normalized.includes("降级")) {
+    return "degraded";
+  }
 
   if (
     normalized.includes("RUNNING") ||
@@ -1049,26 +1428,16 @@ const parseStatus = (statusText: string): "running" | "stopped" => {
     return "running";
   }
 
-  if (
-    normalized.includes("STOPPED") ||
-    normalized.includes("已停止") ||
-    normalized.includes("停止") ||
-    normalized.includes("未运行") ||
-    normalized.includes("未启动")
-  ) {
-    return "stopped";
-  }
-
   return "stopped";
 };
 
 const statusTokenPattern =
-  "(正在运行|运行中|已停止|停止|未运行|未启动|RUNNING|STOPPED)";
+  "(正在运行|运行中|启动中|已停止|停止|未运行|未启动|失败|异常|降级|RUNNING|STARTING|STOPPED|FAILED|DEGRADED)";
 
 const parsePortStatusLine = (
   line: string,
   portName: string,
-): { port: number; status: "running" | "stopped" } | null => {
+): { port: number; status: ServiceStatus["status"] } | null => {
   const normalizedLine = line
     .replace(/[*`]/g, "")
     .replace(/^[\s-]+/, "")
@@ -1163,19 +1532,28 @@ const parseServiceStatusFromReplies = (replies: Reply[]): ServiceStatus[] => {
     const reply = replies[i];
     // 遍历 reply 中的所有 messages
     for (const msg of reply.messages) {
-      const metadataStatuses = serviceStatusesFromProtocol(
-        extractInferenceProtocolFromMetadata(msg.metadata),
-      );
+      const metadataProtocol = extractInferenceProtocolFromMetadata(msg.metadata);
+      if (isInferenceServiceStartProtocol(metadataProtocol)) {
+        continue;
+      }
+      const metadataStatuses = serviceStatusesFromProtocol(metadataProtocol);
       if (metadataStatuses) {
         return metadataStatuses;
       }
 
       const text = extractTextFromContent(msg.content);
-      const protocolStatuses = serviceStatusesFromProtocol(
-        extractInferenceProtocolFromText(text),
-      );
+      const textProtocol = extractInferenceProtocolFromText(text);
+      if (isInferenceServiceStartProtocol(textProtocol)) {
+        continue;
+      }
+      const protocolStatuses = serviceStatusesFromProtocol(textProtocol);
       if (protocolStatuses) {
         return protocolStatuses;
+      }
+
+      const textStatuses = parseServiceStatusesFromText(text);
+      if (textStatuses) {
+        return textStatuses;
       }
 
       // 检查是否包含服务状态信息（支持中英文）
@@ -1263,6 +1641,7 @@ const parseServiceStatusFromReplies = (replies: Reply[]): ServiceStatus[] => {
                 port,
                 status: aggregateStatus,
                 description: service.description,
+                serviceKey: service.portName,
               } satisfies ServiceStatus;
             })
             .filter((service): service is ServiceStatus => service !== null);
@@ -1303,8 +1682,18 @@ const parseNodeServiceStatusesFromReplies = (
     }
   }
 
-  const legacyStatuses = parseServiceStatusFromReplies(replies);
-  return legacyStatuses.length > 0 ? { main: legacyStatuses } : null;
+  return null;
+};
+
+const inferenceStatusLabelKey = (status: ServiceStatus["status"]): string => {
+  const labels: Record<ServiceStatus["status"], string> = {
+    running: "inference.statusLabels.running",
+    stopped: "inference.statusLabels.stopped",
+    starting: "inference.statusLabels.starting",
+    failed: "inference.statusLabels.failed",
+    degraded: "inference.statusLabels.degraded",
+  };
+  return labels[status];
 };
 
 const InferenceServicePanel = memo<Props>(function InferenceServicePanel({
@@ -1323,6 +1712,9 @@ const InferenceServicePanel = memo<Props>(function InferenceServicePanel({
   const [statusRefreshReplyCount, setStatusRefreshReplyCount] = useState(0);
   const [selectedNode, setSelectedNode] = useState("main");
   const [selectedStatusNode, setSelectedStatusNode] = useState("main");
+  const inferenceAdminStopServiceMutation =
+    trpc.inferenceAdminStopServiceApply.useMutation();
+
 
   // 编辑状态
   const [editingConfig, setEditingConfig] = useState<Partial<InferenceConfig>>(
@@ -1577,6 +1969,29 @@ const InferenceServicePanel = memo<Props>(function InferenceServicePanel({
     ]);
   }, [onAskAI, isInputDisabled, messageApi, replyCount, t]);
 
+
+  const handleAdminStopServiceInstance = useCallback(
+    async (service: ServiceStatus) => {
+      if (!service.instanceId) return;
+      const confirmed = window.confirm(
+        t("inference.forceStopConfirm", { instanceId: service.instanceId }),
+      );
+      if (!confirmed) return;
+      try {
+        const response = await inferenceAdminStopServiceMutation.mutateAsync({
+          instanceId: service.instanceId,
+        });
+        if (!response.success) {
+          throw new Error(response.message || t("inference.stopFailed"));
+        }
+        messageApi.success(response.message || t("inference.stopSubmitted"));
+        handleRefreshStatus();
+      } catch (error: any) {
+        messageApi.error(error?.message || t("inference.stopInstanceFailed"));
+      }
+    },
+    [handleRefreshStatus, inferenceAdminStopServiceMutation, messageApi, t],
+  );
   // 刷新配置（单独）
   const handleRefreshConfig = useCallback(() => {
     if (isInputDisabled || !onAskAI) {
@@ -1866,6 +2281,12 @@ const InferenceServicePanel = memo<Props>(function InferenceServicePanel({
                               className={`h-9 font-mono text-xs ${modifiedFields.has("env.MODEL_NAME") ? "border-yellow-500 bg-yellow-50" : ""}`}
                             />
                           </div>
+                        {config.env.MODEL_PARAM_B !== undefined && (
+                          <div className="space-y-1.5">
+                            <Label className="text-xs text-muted-foreground">MODEL_PARAM_B</Label>
+                            <Input value={editingConfig.env?.MODEL_PARAM_B || ""} onChange={(e) => handleConfigChange("env", "MODEL_PARAM_B", e.target.value)} readOnly={!isAdmin} className="h-9 font-mono text-xs" />
+                          </div>
+                        )}
                           <div className="space-y-1.5">
                             <Label className="text-xs text-muted-foreground">
                               MODEL_PATH
@@ -1980,6 +2401,12 @@ const InferenceServicePanel = memo<Props>(function InferenceServicePanel({
                               />
                             </div>
                           )}
+                        {config.env.MASTER_PORT !== undefined && (
+                          <div className="space-y-1.5">
+                            <Label className="text-xs text-muted-foreground">MASTER_PORT</Label>
+                            <Input type="number" value={editingConfig.env?.MASTER_PORT || ""} onChange={(e) => handleConfigChange("env", "MASTER_PORT", parseInt(e.target.value) || 0)} readOnly={!isAdmin} className="h-9 font-mono text-xs" />
+                          </div>
+                        )}
                         </div>
                       </div>
 
@@ -1989,7 +2416,7 @@ const InferenceServicePanel = memo<Props>(function InferenceServicePanel({
                           <Gauge className="h-4 w-4" />
                           {t("inference.runtime") || "运行时配置"}
                         </h4>
-                        <div className="grid grid-cols-3 gap-3">
+                        <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
                           <div className="space-y-1.5">
                             <Label className="text-xs text-muted-foreground">
                               Tensor Parallel
@@ -2036,6 +2463,12 @@ const InferenceServicePanel = memo<Props>(function InferenceServicePanel({
                               placeholder="0.9"
                             />
                           </div>
+                            {config.runtime.GPU_UTILIZATION_THRESHOLD !== undefined && (
+                              <div className="space-y-1.5">
+                                <Label className="text-xs text-muted-foreground">GPU Threshold</Label>
+                                <Input type="number" step="1" value={editingConfig.runtime?.GPU_UTILIZATION_THRESHOLD || ""} onChange={(e) => handleConfigChange("runtime", "GPU_UTILIZATION_THRESHOLD", parseFloat(e.target.value) || 0)} readOnly={!isAdmin} className="h-9 font-mono text-xs text-center" />
+                              </div>
+                            )}
                           <div className="space-y-1.5">
                             <Label className="text-xs text-muted-foreground">
                               Max Tokens
@@ -2258,37 +2691,65 @@ const InferenceServicePanel = memo<Props>(function InferenceServicePanel({
                     {serviceStatuses.length > 0 ? (
                       serviceStatuses.map((service, index) => (
                         <div
-                          key={index}
-                          className="flex items-center justify-between p-3 rounded-lg border bg-muted/50"
+                          key={`${service.instanceId || "service"}:${service.serviceKey || service.name}:${service.port || index}`}
+                          className="flex flex-col gap-3 rounded-lg border bg-muted/50 p-3 sm:flex-row sm:items-center sm:justify-between"
                         >
-                          <div className="flex items-center gap-3">
+                          <div className="flex min-w-0 items-start gap-3">
                             <div
-                              className={`w-2 h-2 rounded-full ${
+                              className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${
                                 service.status === "running"
                                   ? "bg-green-500"
-                                  : "bg-red-500"
+                                  : service.status === "starting"
+                                    ? "bg-yellow-500"
+                                    : service.status === "failed"
+                                      ? "bg-red-500"
+                                      : "bg-muted-foreground"
                               }`}
                             />
-                            <div>
-                              <div className="text-sm font-medium">
-                                {service.name}
+                            <div className="min-w-0 space-y-1">
+                              <div className="truncate text-sm font-medium">
+                                {t(`inference.services.${service.serviceKey || service.name}.name`, { defaultValue: service.name })}
                               </div>
                               <div className="text-xs text-muted-foreground">
-                                {service.description} · 端口 {service.port}
+                                {service.port
+                                  ? t("inference.servicePortDescription", {
+                                      description: t(`inference.services.${service.serviceKey || service.name}.description`, {
+                                        defaultValue: service.description || "",
+                                      }),
+                                      port: service.port,
+                                    })
+                                  : t(`inference.services.${service.serviceKey || service.name}.description`, {
+                                      defaultValue: service.description || "",
+                                    })}
                               </div>
                             </div>
                           </div>
-                          <Badge
-                            variant={
-                              service.status === "running"
-                                ? "default"
-                                : "secondary"
-                            }
-                          >
-                            {service.status === "running"
-                              ? t("inference.running") || "运行中"
-                              : t("inference.stopped") || "已停止"}
-                          </Badge>
+                          <div className="flex shrink-0 items-center gap-2 self-end sm:self-auto">
+                            <Badge
+                              variant={
+                                service.status === "running"
+                                  ? "default"
+                                  : "secondary"
+                              }
+                            >
+                              {t(inferenceStatusLabelKey(service.status))}
+                            </Badge>
+                            {isAdmin && service.instanceId && (
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                className="h-7 px-2 text-xs"
+                                disabled={
+                                  service.status === "stopped" ||
+                                  inferenceAdminStopServiceMutation.isPending
+                                }
+                                onClick={() => handleAdminStopServiceInstance(service)}
+                              >
+                                {t("inference.forceStop")}
+                              </Button>
+                            )}
+                          </div>
                         </div>
                       ))
                     ) : (
