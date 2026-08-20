@@ -49,6 +49,7 @@ bash runtime.sh init --profile single --iphost <本机IP>
 | 字段 | 填写内容 |
 | --- | --- |
 | `MEDFLOW_LOCAL_TRAINING_CONTAINER` | 本机实际存在的训练容器名，用于常规训练任务。 |
+| `MULTINODE_DOCKER_CONTAINER` | 本机实际存在的多机训练 LLaMAFactory 容器名，用于多机 LoRA SFT 和 DPO 增强训练。 |
 | `MEDFLOW_LOCAL_EVALUATE_CONTAINER` | 本机实际存在的评测/推理容器名，用于模型评测和推理相关任务。 |
 | `MEDFLOW_LOCAL_GRPO_CONTAINER` | 本机实际存在的 GRPO/verl 容器名，用于 GRPO/verl 训练任务。 |
 | `MODEL_NAME` / `MODEL_API_KEY` / `MODEL_BASE_URL` | Agent 调用的 OpenAI-compatible 模型名、API key 和服务地址。 |

@@ -7,6 +7,8 @@ This guide covers Runtime configuration for center nodes, compute nodes, and mul
 
 The center node must be able to reach each compute node's `AGENT_API_PORT`. Each compute node must be able to reach the center node's Studio backend URL.
 
+Every machine that participates in multi-node training must be initialized as a Runtime node with Agent API/resource probing enabled, and must have the dedicated multi-node training container configured through `MULTINODE_DOCKER_CONTAINER`. Deploying Agent only on the master node is not enough because Studio must query GPU snapshots, reserve GPU indexes, and manage the allocation for every participating node.
+
 ## Prerequisites
 
 - Linux runtime environment for `runtime.sh`.
@@ -46,6 +48,7 @@ bash runtime.sh init --profile center --nodes node-b=http://<worker-b-host>:8099
 | Field | Value |
 | --- | --- |
 | `MEDFLOW_LOCAL_TRAINING_CONTAINER` | Training container name that exists on the center machine, used for center-local Agent standard training tasks. |
+| `MULTINODE_DOCKER_CONTAINER` | Dedicated LLaMAFactory container name that exists on the center machine, used for multi-node LoRA SFT and DPO enhanced training. |
 | `MEDFLOW_LOCAL_EVALUATE_CONTAINER` | Evaluation/inference container name that exists on the center machine, used for center-local Agent evaluation and inference-related tasks. |
 | `MEDFLOW_LOCAL_GRPO_CONTAINER` | GRPO/verl container name that exists on the center machine, used for center-local Agent GRPO/verl training tasks. |
 | `MODEL_NAME` / `MODEL_API_KEY` / `MODEL_BASE_URL` | OpenAI-compatible model name, API key, and service URL used by the center-local Agent. |
@@ -66,6 +69,7 @@ bash runtime.sh init --profile node --node-id node-a --center-url http://<center
 | Field | Value |
 | --- | --- |
 | `MEDFLOW_LOCAL_TRAINING_CONTAINER` | Training container name that exists on this node, used for standard training tasks. |
+| `MULTINODE_DOCKER_CONTAINER` | Dedicated LLaMAFactory container name that exists on this node, used for multi-node LoRA SFT and DPO enhanced training. |
 | `MEDFLOW_LOCAL_EVALUATE_CONTAINER` | Evaluation/inference container name that exists on this node, used for evaluation and inference-related tasks. |
 | `MEDFLOW_LOCAL_GRPO_CONTAINER` | GRPO/verl container name that exists on this node, used for GRPO/verl training tasks. |
 | `MEDFLOW_STUDIO_RUNTIME_TOKEN` | Shared Studio Runtime token copied from the center node. |
@@ -120,4 +124,3 @@ Key files:
 - `.runtime/*.pid`: service process IDs recorded by `runtime.sh`.
 
 If `check` fails, fix the reported dependency, port, token, container, or placeholder issue before running `start` again.
-

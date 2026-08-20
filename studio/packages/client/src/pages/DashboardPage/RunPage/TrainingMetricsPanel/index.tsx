@@ -510,6 +510,9 @@ const TrainingMetricsPanel = ({
     }, [processDataMap, selectedPid, smoothingFactor]);
 
     const lastMonitorQueryTime = monitorStatus?.lastResultAt || monitorStatus?.lastQueryAt;
+    const isWaitingForMetricWrite =
+        !monitorStatus?.hasMetrics &&
+        monitorStatus?.message === '训练已启动，等待指标写入';
     const monitorStatusText = (() => {
         if (monitorStatus?.isQuerying) {
             return t('training.monitor-querying', { defaultValue: '查询中...' }) as string;
@@ -518,6 +521,9 @@ const TrainingMetricsPanel = ({
             return t('training.monitor-waiting', { defaultValue: '等待查询' }) as string;
         }
         if (!monitorStatus.hasMetrics) {
+            if (isWaitingForMetricWrite) {
+                return t('training.monitor-waiting-for-metrics', { defaultValue: '等待指标写入' }) as string;
+            }
             return t('training.monitor-no-metrics', { defaultValue: '尚未获取到指标' }) as string;
         }
         return monitorStatus.hasNewData
@@ -2140,10 +2146,14 @@ const TrainingMetricsPanel = ({
                                             <Activity className="h-6 w-6" />
                                         </div>
                                         <div className="text-sm font-semibold text-foreground">
-                                            {t('training.empty-title', { defaultValue: '还没有训练指标' })}
+                                            {isWaitingForMetricWrite
+                                                ? t('training.empty-waiting-title', { defaultValue: '训练已启动，等待指标写入' })
+                                                : t('training.empty-title', { defaultValue: '还没有训练指标' })}
                                         </div>
                                         <p className="mt-2 text-xs leading-5 text-muted-foreground">
-                                            {t('training.empty-desc', { defaultValue: '请在对话中使用“监控训练”，系统获取到训练进程、loss、lr 等信息后，会在这里展示曲线和指标。' })}
+                                            {isWaitingForMetricWrite
+                                                ? t('training.empty-waiting-desc', { defaultValue: '已检测到训练进程，loss、lr 等指标写入后会自动刷新到这里。' })
+                                                : t('training.empty-desc', { defaultValue: '请在对话中使用“监控训练”，系统获取到训练进程、loss、lr 等信息后，会在这里展示曲线和指标。' })}
                                         </p>
                                         <Button
                                             type="button"

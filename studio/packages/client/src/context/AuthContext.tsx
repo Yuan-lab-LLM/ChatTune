@@ -26,6 +26,7 @@ export interface AuthUser {
         defaultContainerName: string;
         defaultEvaluateContainerName: string;
         defaultGrpoContainerName: string;
+        defaultMultinodeContainerName: string;
     } | null;
 }
 

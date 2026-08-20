@@ -49,7 +49,7 @@ In the GPU resources tab:
 
 1. Create a pool.
 2. Add pool nodes.
-3. Configure each node's `sshAlias`, `trainAddress`, allowed GPU indexes, and optional `ncclSocketIfname`.
+3. Configure each node's `sshAlias`, `trainAddress`, allowed GPU indexes, and optional `ncclSocketIfname`. When using multi-node training, `ncclSocketIfname` is required.
 4. Configure user-group quota: owning node, guaranteed GPU count, maximum GPU count, maximum concurrent jobs, and maximum nodes per job.
 5. Review active reservations and handle expired or abnormal reservations.
 

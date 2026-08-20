@@ -9,6 +9,7 @@ interface CachedEnvironmentConfig {
     defaultContainerName?: string;
     defaultEvaluateContainerName?: string;
     defaultGrpoContainerName?: string;
+    defaultMultinodeContainerName?: string;
 }
 
 const readCachedEnvironmentConfig = (): CachedEnvironmentConfig | null => {
@@ -43,6 +44,13 @@ export const getCachedDefaultGrpoContainerName = (): string => {
     return (
         readCachedEnvironmentConfig()?.defaultGrpoContainerName?.trim() ||
         DEFAULT_ENVIRONMENT_CONFIG.defaultGrpoContainerName
+    );
+};
+
+export const getCachedDefaultMultinodeContainerName = (): string => {
+    return (
+        readCachedEnvironmentConfig()?.defaultMultinodeContainerName?.trim() ||
+        DEFAULT_ENVIRONMENT_CONFIG.defaultMultinodeContainerName
     );
 };
 
@@ -81,6 +89,13 @@ export const useEnvironmentConfig = () => {
         [query.data?.data?.defaultGrpoContainerName],
     );
 
+    const defaultMultinodeContainerName = useMemo(
+        () =>
+            query.data?.data?.defaultMultinodeContainerName?.trim() ||
+            getCachedDefaultMultinodeContainerName(),
+        [query.data?.data?.defaultMultinodeContainerName],
+    );
+
     useEffect(() => {
         if (!query.data?.data?.defaultContainerName) {
             return;
@@ -94,18 +109,22 @@ export const useEnvironmentConfig = () => {
                     query.data.data.defaultEvaluateContainerName,
                 defaultGrpoContainerName:
                     query.data.data.defaultGrpoContainerName,
+                defaultMultinodeContainerName:
+                    query.data.data.defaultMultinodeContainerName,
             }),
         );
     }, [
         query.data?.data?.defaultContainerName,
         query.data?.data?.defaultEvaluateContainerName,
         query.data?.data?.defaultGrpoContainerName,
+        query.data?.data?.defaultMultinodeContainerName,
     ]);
 
     return {
         defaultContainerName,
         defaultEvaluateContainerName,
         defaultGrpoContainerName,
+        defaultMultinodeContainerName,
         isLoading: query.isLoading,
         error: query.error,
     };

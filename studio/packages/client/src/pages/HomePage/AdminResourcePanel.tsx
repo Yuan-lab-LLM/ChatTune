@@ -16,9 +16,11 @@ const AdminResourcePanel = () => {
   const [containerName, setContainerName] = useState("");
   const [evaluateContainerName, setEvaluateContainerName] = useState("");
   const [grpoContainerName, setGrpoContainerName] = useState("");
+  const [multinodeContainerName, setMultinodeContainerName] = useState("");
   const [containerDrafts, setContainerDrafts] = useState<Record<string, string>>({});
   const [evaluateContainerDrafts, setEvaluateContainerDrafts] = useState<Record<string, string>>({});
   const [grpoContainerDrafts, setGrpoContainerDrafts] = useState<Record<string, string>>({});
+  const [multinodeContainerDrafts, setMultinodeContainerDrafts] = useState<Record<string, string>>({});
   const [validatingGroupId, setValidatingGroupId] = useState<string | null>(null);
   const [savingContainerKey, setSavingContainerKey] = useState<string | null>(null);
   const [resourceActionKey, setResourceActionKey] = useState<string | null>(null);
@@ -30,6 +32,7 @@ const AdminResourcePanel = () => {
   const setGroupContainer = trpc.setResourceGroupContainer.useMutation();
   const setGroupEvaluateContainer = trpc.setResourceGroupEvaluateContainer.useMutation();
   const setGroupGrpoContainer = trpc.setResourceGroupGrpoContainer.useMutation();
+  const setGroupMultinodeContainer = trpc.setResourceGroupMultinodeContainer.useMutation();
   const setNode = trpc.setResourceGroupNode.useMutation();
   const validateContainers = trpc.validateResourceGroupContainers.useMutation();
 
@@ -45,7 +48,13 @@ const AdminResourcePanel = () => {
       : group.name;
 
   const createNewGroup = async () => {
-    if (!groupName.trim() || !containerName.trim() || !evaluateContainerName.trim() || !grpoContainerName.trim()) return;
+    if (
+      !groupName.trim() ||
+      !containerName.trim() ||
+      !evaluateContainerName.trim() ||
+      !grpoContainerName.trim() ||
+      !multinodeContainerName.trim()
+    ) return;
     setStatusMessage("");
     try {
       await createGroup.mutateAsync({
@@ -53,11 +62,13 @@ const AdminResourcePanel = () => {
         containerName: containerName.trim(),
         evaluateContainerName: evaluateContainerName.trim(),
         grpoContainerName: grpoContainerName.trim(),
+        multinodeContainerName: multinodeContainerName.trim(),
       });
       setGroupName("");
       setContainerName("");
       setEvaluateContainerName("");
       setGrpoContainerName("");
+      setMultinodeContainerName("");
       setStatusMessage(t("resourceAccess.groupCreated"));
       await refresh();
     } catch (error) {
@@ -137,6 +148,30 @@ const AdminResourcePanel = () => {
     }
   };
 
+  const saveMultinodeContainer = async (groupId: string, currentContainerName: string) => {
+    const nextContainer = (multinodeContainerDrafts[groupId] ?? currentContainerName).trim();
+    if (!nextContainer || nextContainer === currentContainerName) return;
+    setSavingContainerKey(`${groupId}:multinode`);
+    setStatusMessage("");
+    try {
+      await setGroupMultinodeContainer.mutateAsync({
+        groupId,
+        containerName: nextContainer,
+      });
+      setMultinodeContainerDrafts((current) => {
+        const next = { ...current };
+        delete next[groupId];
+        return next;
+      });
+      setStatusMessage(t("resourceAccess.groupMultinodeDockerUpdated"));
+      await refresh();
+    } catch (error) {
+      setStatusMessage(translateAuthError(error, t, "auth.adminActionFailed"));
+    } finally {
+      setSavingContainerKey(null);
+    }
+  };
+
   const deleteEmptyGroup = async (
     group: { id: string; name: string },
   ) => {
@@ -185,12 +220,14 @@ const AdminResourcePanel = () => {
       const failed =
         result?.trainingContainerStatus === "failed" ||
         result?.evaluationContainerStatus === "failed" ||
-        result?.grpoContainerStatus === "failed";
+        result?.grpoContainerStatus === "failed" ||
+        result?.multinodeContainerStatus === "failed";
       if (failed) {
         const reason = [
           result?.trainingContainerError,
           result?.evaluationContainerError,
           result?.grpoContainerError,
+          result?.multinodeContainerError,
         ].filter(Boolean).join("; ");
         setStatusMessage(
           reason
@@ -228,7 +265,7 @@ const AdminResourcePanel = () => {
         </div>
 
         <div className="rounded-xl border border-border/40 bg-muted/20 p-3">
-          <div className="grid gap-2 md:grid-cols-[1fr_1fr_1fr_1fr_auto]">
+          <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-[1fr_1fr_1fr_1fr_1fr_auto]">
             <label className="grid gap-1 text-xs font-medium text-muted-foreground">
               {t("resourceAccess.groupNameLabel")}
               <Input
@@ -262,6 +299,15 @@ const AdminResourcePanel = () => {
                 value={grpoContainerName}
                 onChange={(event) => setGrpoContainerName(event.target.value)}
                 placeholder={t("resourceAccess.grpoContainerPlaceholder")}
+                className="placeholder:text-muted-foreground/50"
+              />
+            </label>
+            <label className="grid gap-1 text-xs font-medium text-muted-foreground">
+              {t("resourceAccess.multinodeDockerLabel")}
+              <Input
+                value={multinodeContainerName}
+                onChange={(event) => setMultinodeContainerName(event.target.value)}
+                placeholder={t("resourceAccess.multinodeContainerPlaceholder")}
                 className="placeholder:text-muted-foreground/50"
               />
             </label>
@@ -301,9 +347,12 @@ const AdminResourcePanel = () => {
           const evaluationDraft =
             evaluateContainerDrafts[group.id] ?? group.defaultEvaluateContainerName;
           const grpoDraft = grpoContainerDrafts[group.id] ?? group.defaultGrpoContainerName;
+          const multinodeDraft =
+            multinodeContainerDrafts[group.id] ?? group.defaultMultinodeContainerName;
           const isSavingTraining = savingContainerKey === `${group.id}:training`;
           const isSavingEvaluation = savingContainerKey === `${group.id}:evaluation`;
           const isSavingGrpo = savingContainerKey === `${group.id}:grpo`;
+          const isSavingMultinode = savingContainerKey === `${group.id}:multinode`;
           const isDeletingGroup = resourceActionKey === `${group.id}:delete`;
           const isUpdatingNode = resourceActionKey === `${group.id}:node`;
           const deleteBlockedReason = group.members.length
@@ -320,6 +369,9 @@ const AdminResourcePanel = () => {
           const grpoChanged =
             grpoDraft.trim() !== "" &&
             grpoDraft.trim() !== group.defaultGrpoContainerName;
+          const multinodeChanged =
+            multinodeDraft.trim() !== "" &&
+            multinodeDraft.trim() !== group.defaultMultinodeContainerName;
 
           return (
             <div key={group.id} className="rounded-xl border border-border/45 bg-background p-4 shadow-xs">
@@ -357,7 +409,7 @@ const AdminResourcePanel = () => {
                 )}
               </div>
 
-              <div className="mt-3 grid gap-3 lg:grid-cols-4">
+              <div className="mt-3 grid gap-3 lg:grid-cols-2 xl:grid-cols-5">
                 <div className="flex min-h-[172px] flex-col rounded-lg border border-border/35 bg-muted/15 p-3">
                   <div className="mb-2 flex items-center gap-2 text-sm font-medium">
                     <ServerIcon className="size-4 text-primary" />
@@ -506,6 +558,45 @@ const AdminResourcePanel = () => {
                       {isSavingGrpo
                         ? t("resourceAccess.savingDocker")
                         : t("resourceAccess.saveGrpoDocker")}
+                    </Button>
+                  </div>
+                </div>
+
+                <div className="flex min-h-[172px] flex-col rounded-lg border border-border/35 bg-muted/15 p-3">
+                  <div className="mb-2 text-sm font-medium">
+                    {t("resourceAccess.multinodeDockerLabel")}
+                  </div>
+                  <div className="mb-2 truncate text-xs text-muted-foreground">
+                    {group.defaultMultinodeContainerName}
+                  </div>
+                  <div className="mt-auto grid gap-2">
+                    <Input
+                      value={multinodeDraft}
+                      onChange={(event) =>
+                        setMultinodeContainerDrafts((current) => ({
+                          ...current,
+                          [group.id]: event.target.value,
+                        }))
+                      }
+                      placeholder={group.defaultMultinodeContainerName}
+                      className="placeholder:text-muted-foreground/50"
+                    />
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={!multinodeChanged || isSavingMultinode}
+                      className={`w-full ${secondaryActionClassName}`}
+                      onClick={() =>
+                        saveMultinodeContainer(
+                          group.id,
+                          group.defaultMultinodeContainerName,
+                        )
+                      }
+                    >
+                      {isSavingMultinode
+                        ? t("resourceAccess.savingDocker")
+                        : t("resourceAccess.saveMultinodeDocker")}
                     </Button>
                   </div>
                 </div>

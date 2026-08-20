@@ -202,6 +202,39 @@ class TrainingAllocationWriteRequest(BaseModel):
 
 
 
+def _multinode_ssh_aliases() -> list[str]:
+    raw = os.getenv("MEDFLOW_MULTINODE_SSH_ALIASES", "ds35,ds36")
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _rewrite_training_allocation_ssh_aliases(allocation: dict[str, Any]) -> dict[str, Any]:
+    aliases = _multinode_ssh_aliases()
+    nodes = allocation.get("nodes")
+    if not aliases or not isinstance(nodes, list) or len(nodes) > len(aliases):
+        return allocation
+
+    rewritten = dict(allocation)
+    ordered_nodes = sorted(
+        [node for node in nodes if isinstance(node, dict)],
+        key=lambda node: 0 if node.get("isMaster") else 1,
+    )
+    alias_by_node_id = {
+        str(node.get("nodeId") or "").strip(): aliases[index]
+        for index, node in enumerate(ordered_nodes)
+        if str(node.get("nodeId") or "").strip()
+    }
+    rewritten["nodes"] = [
+        {
+            **node,
+            "sshAlias": alias_by_node_id.get(str(node.get("nodeId") or "").strip(), node.get("sshAlias")),
+        }
+        if isinstance(node, dict)
+        else node
+        for node in nodes
+    ]
+    return rewritten
+
+
 class TrainingReservationStopProcessRequest(BaseModel):
     reservationId: str
 
@@ -219,6 +252,9 @@ class EvaluationResultRequest(ContainerRequest):
 class TrainingMetricsRequest(ContainerRequest):
     pid: str | None = None
     trainType: str | None = None
+    launchMode: str | None = None
+    isMultinode: bool | None = None
+    scriptName: str | None = None
     historyLimit: int = 200
     timeWindowMinutes: int = 120
 
@@ -230,6 +266,9 @@ def _training_metrics(request: TrainingMetricsRequest) -> dict[str, Any]:
         container_name=request.container,
         pid=request.pid,
         train_type=request.trainType,
+        launch_mode=request.launchMode,
+        is_multinode=request.isMultinode,
+        script_name=request.scriptName,
         history_limit=request.historyLimit,
         time_window_minutes=request.timeWindowMinutes,
         allow_llm=False,
@@ -722,6 +761,12 @@ def _workflow_status(workflow_id: str) -> dict[str, Any]:
         "train_type",
         "train_type_public",
         "train_type_text",
+        "launch_mode",
+        "launchMode",
+        "is_multinode",
+        "isMultinode",
+        "script_name",
+        "scriptName",
         "output_dir",
         "latest_loss",
         "latest_learning_rate",
@@ -775,6 +820,8 @@ def _workflow_status(workflow_id: str) -> dict[str, Any]:
         "enhanced": "增强训练",
         "grpo": "grpo训练",
     }.get(train_type, train_type)
+    launch_mode = context.get("launch_mode")
+    script_name = context.get("script_name")
     benchmark_entry = context.get("benchmark") or "2024"
     return {
         "version": "1.0",
@@ -786,6 +833,9 @@ def _workflow_status(workflow_id: str) -> dict[str, Any]:
         "datasetRef": workflow["dataset_ref"],
         "trainType": train_type,
         "trainTypeText": train_type_text,
+        "launchMode": launch_mode,
+        "isMultinode": launch_mode == "multinode",
+        "scriptName": script_name,
         "stages": public_stages,
         "benchmark": context.get("benchmark"),
         "evaluationDatasetName": context.get("evaluation_dataset_name"),
@@ -1694,6 +1744,305 @@ def _reservation_gpus_idle(record: dict[str, Any]) -> bool:
     return all(int(gpu.get("memoryUsed") or 0) < GPU_BUSY_MEMORY_THRESHOLD_MB for gpu in matched)
 
 
+_MULTINODE_TRAIN_PROCESS_REGEX = (
+    r"(/usr/local/insinfersystem/train|train_multinode_[^[:space:]]*|"
+    r"deepspeed|llamafactory)"
+)
+
+##deepseek
+#def _multinode_gpu_stop_script() -> str:
+def _multinode_gpu_stop_script(train_regex_b64: str) -> str:
+    return r'''
+train_regex="$(printf "%s" "''' + train_regex_b64 + r'''" | base64 -d 2>/dev/null || true)"
+if [ -z "$train_regex" ]; then
+    printf "missing train process regex\n" >&2
+    exit 2
+fi
+printf "DEBUG-train_regex=[%s]\n" "$train_regex"
+raw_pids="$(pgrep -f "$train_regex" 2>/dev/null)"
+printf "DEBUG-pgrep-count=[%s]\n" "$(printf "%s\n" "$raw_pids" | grep -c . || true)"
+matching_pids() {
+    pgrep -f "$train_regex" 2>/dev/null \
+        | sort -n | uniq \
+        | while read -r pid; do
+            [ -n "$pid" ] || continue
+            command="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+            if [ -n "$command" ] && printf "%s\n" "$command" | grep -Eq "$train_regex"; then
+                printf "%s\t%s\n" "$pid" "$command"
+            fi
+        done
+}
+
+collect_descendants() {
+    parent="$1"
+    children=$(ps -eo pid=,ppid= | awk -v p="$parent" '$2 == p {print $1}')
+    for child in $children; do
+        collect_descendants "$child"
+        printf "%s\n" "$child"
+    done
+}
+collect_targets() {
+    pid="$1"
+    pgid=$(ps -p "$pid" -o pgid= 2>/dev/null | tr -d ' ')
+    if [ -n "$pgid" ]; then
+        ps -eo pid=,pgid= | awk -v g="$pgid" '$2 == g {print $1}'
+    fi
+    collect_descendants "$pid"
+    printf "%s\n" "$pid"
+}
+
+before="$(matching_pids)"
+printf "DEBUG-before-lines=[%s]\n" "$(printf "%s\n" "$before" | grep -c '\S' || true)"
+
+printf "%s\n" "$before" | awk -F '\t' 'NF {print "BEFORE\t" $1 "\t" $2}'
+
+targets="$(printf "%s\n" "$before" | awk -F '\t' 'NF {print $1}' | while read -r pid; do
+    [ -n "$pid" ] || continue
+    collect_targets "$pid"
+done | awk 'NF && !seen[$1]++ {print $1}')"
+
+for target in $targets; do
+    [ "$target" = "$$" ] && continue
+    if ps -p "$target" >/dev/null 2>&1; then
+        stat=$(ps -p "$target" -o stat= 2>/dev/null || true)
+        case "$stat" in *Z*) continue ;; esac
+        kill -TERM "$target" 2>/dev/null || true
+    fi
+done
+sleep 3
+
+for target in $targets; do
+    [ "$target" = "$$" ] && continue
+    if ps -p "$target" >/dev/null 2>&1; then
+        stat=$(ps -p "$target" -o stat= 2>/dev/null || true)
+        case "$stat" in *Z*) continue ;; esac
+        kill -KILL "$target" 2>/dev/null || true
+    fi
+done
+sleep 1
+
+remaining="$(matching_pids)"
+printf "%s\n" "$remaining" | awk -F '\t' 'NF {print "REMAINING\t" $1 "\t" $2}'
+'''
+
+
+def _parse_multinode_stop_output(
+    stdout: str,
+    gpu_indexes: list[int],
+    execution_mode: str,
+) -> dict[str, Any]:
+    before: list[dict[str, str]] = []
+    remaining: list[dict[str, str]] = []
+    for line in stdout.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) < 3:
+            continue
+        item = {"pid": parts[1], "command": parts[2]}
+        if parts[0] == "BEFORE":
+            before.append(item)
+        elif parts[0] == "REMAINING":
+            remaining.append(item)
+    return {
+        "gpuIndexes": gpu_indexes,
+        "executionMode": execution_mode,
+        "before": before,
+        "remaining": remaining,
+        "stopped": not remaining,
+    }
+
+
+def _training_allocation_file_from_record(record: dict[str, Any]) -> str:
+    script_args = record.get("script_args") if isinstance(record.get("script_args"), dict) else {}
+    for key in ("allocation-file", "allocation_file"):
+        value = str(script_args.get(key) or "").strip()
+        if value:
+            return value
+    command = str(record.get("command") or "")
+    match = re.search(r"--allocation-file(?:=|\s+)(\S+)", command)
+    return match.group(1).strip("'\"") if match else ""
+
+
+def _read_training_allocation(container: str, allocation_file: str) -> dict[str, Any]:
+    normalized = str(allocation_file or "").strip()
+    if not normalized:
+        return {}
+    if not normalized.startswith("/") or ".." in normalized.split("/"):
+        raise HTTPException(409, "Invalid multi-node allocation file path")
+    try:
+        output = _docker(container, ["cat", normalized], timeout=15).stdout
+    except HTTPException as exc:
+        raise HTTPException(
+            409,
+            f"Failed to read multi-node allocation file {normalized}: {exc.detail}",
+        ) from exc
+    try:
+        allocation = json.loads(output or "{}")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(409, "Invalid multi-node allocation JSON") from exc
+    if not isinstance(allocation, dict):
+        raise HTTPException(409, "Invalid multi-node allocation payload")
+    return allocation
+
+
+def _multinode_allocation_nodes(allocation: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_nodes = allocation.get("nodes")
+    if not isinstance(raw_nodes, list):
+        return []
+    nodes: list[dict[str, Any]] = []
+    for raw_node in raw_nodes:
+        if not isinstance(raw_node, dict):
+            continue
+        alias = str(raw_node.get("sshAlias") or "").strip()
+        gpu_indexes = []
+        for value in raw_node.get("gpuIndexes") or []:
+            try:
+                gpu_indexes.append(int(value))
+            except (TypeError, ValueError):
+                continue
+        if alias and gpu_indexes:
+            nodes.append(
+                {
+                    "nodeId": str(raw_node.get("nodeId") or "").strip(),
+                    "sshAlias": alias,
+                    "gpuIndexes": sorted(set(gpu_indexes)),
+                    "isMaster": bool(raw_node.get("isMaster")),
+                }
+            )
+    return nodes
+
+
+def _run_multinode_remote_stop(
+    container: str,
+    ssh_alias: str,
+    gpu_indexes: list[int],
+) -> dict[str, Any]:
+    ##deepseek
+    #gpu_csv = ",".join(str(index) for index in gpu_indexes)
+    train_regex_b64 = base64.b64encode(_MULTINODE_TRAIN_PROCESS_REGEX.encode("utf-8")).decode("ascii")
+    try:
+        process = subprocess.run(
+            [
+                "docker",
+                "exec",
+                "-i",
+                container,
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                ssh_alias,
+                "sh",
+                "-s",
+                #"--",
+                #gpu_csv,
+                #train_regex_b64,
+            ],
+            #input=_multinode_gpu_stop_script(),
+            input=_multinode_gpu_stop_script(train_regex_b64),
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise HTTPException(409, f"Failed to stop multi-node training on {ssh_alias}: {exc}") from exc
+    logger.info(f"[多机debug][remote:{ssh_alias}] returncode={process.returncode} stdout={process.stdout!r} stderr={process.stderr!r}")
+
+    if process.returncode not in (0, 1):
+        detail = (process.stderr or process.stdout or "").strip()
+        raise HTTPException(
+            409,
+            f"Failed to stop multi-node training on {ssh_alias}: {detail or process.returncode}",
+        )
+
+    result = _parse_multinode_stop_output(process.stdout, gpu_indexes, "ssh")
+    result["sshAlias"] = ssh_alias
+    return result
+
+
+def _run_multinode_local_stop(
+    container: str,
+    gpu_indexes: list[int],
+) -> dict[str, Any]:
+    ##deepseek
+    #gpu_csv = ",".join(str(index) for index in gpu_indexes)
+    train_regex_b64 = base64.b64encode(_MULTINODE_TRAIN_PROCESS_REGEX.encode("utf-8")).decode("ascii")
+    try:
+        process = subprocess.run(
+            [
+                "docker",
+                "exec",
+                "-i",
+                container,
+                "sh",
+                "-s",
+                #"--",
+                #gpu_csv,
+                #train_regex_b64,
+            ],
+            #input=_multinode_gpu_stop_script(),
+            input=_multinode_gpu_stop_script(train_regex_b64),
+
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise HTTPException(409, f"Failed to stop local multi-node training workers: {exc}") from exc
+    logger.info(f"[多机debug][local] returncode={process.returncode} stdout={process.stdout!r} stderr={process.stderr!r}")
+
+    if process.returncode not in (0, 1):
+        detail = (process.stderr or process.stdout or "").strip()
+        raise HTTPException(
+            409,
+            f"Failed to stop local multi-node training workers: {detail or process.returncode}",
+        )
+
+    return _parse_multinode_stop_output(process.stdout, gpu_indexes, "local")
+
+
+def _stop_multinode_allocation_processes(
+    container: str,
+    allocation: dict[str, Any],
+) -> dict[str, Any]:
+    nodes = _multinode_allocation_nodes(allocation)
+    if not nodes:
+        raise HTTPException(409, "Multi-node allocation has no stoppable nodes")
+    node_results = []
+    remaining_gpu_pids: list[dict[str, Any]] = []
+    for node in nodes:
+        if node.get("isMaster"):
+            result = _run_multinode_local_stop(container, list(node["gpuIndexes"]))
+            result["sshAlias"] = str(node["sshAlias"])
+        else:
+            result = _run_multinode_remote_stop(
+                container,
+                str(node["sshAlias"]),
+                list(node["gpuIndexes"]),
+            )
+        result.update(
+            {
+                "nodeId": node.get("nodeId"),
+                "isMaster": bool(node.get("isMaster")),
+            }
+        )
+        node_results.append(result)
+        for item in result.get("remaining") or []:
+            remaining_gpu_pids.append(
+                {
+                    "nodeId": node.get("nodeId"),
+                    "sshAlias": node.get("sshAlias"),
+                    "gpuIndexes": node.get("gpuIndexes"),
+                    **item,
+                }
+            )
+    return {
+        "nodeStopResults": node_results,
+        "remainingGpuPids": remaining_gpu_pids,
+        "stopped": not remaining_gpu_pids,
+    }
+
+
 def _docker_pid_snapshot(container: str, pid: str) -> list[str]:
     script = r'''
 root="$1"
@@ -1830,6 +2179,18 @@ def stop_training_reservation_process(request: TrainingReservationStopProcessReq
     if not pid or not pid.isdigit():
         raise HTTPException(409, "Runtime process record has no valid pid")
     result = _stop_docker_pid(_container(container), pid)
+    allocation_file = _training_allocation_file_from_record(record)
+    multinode_result: dict[str, Any] = {}
+    if allocation_file:
+        allocation = _read_training_allocation(_container(container), allocation_file)
+        multinode_result = _stop_multinode_allocation_processes(_container(container), allocation)
+        result.update(
+            {
+                "allocationFile": allocation_file,
+                "nodeStopResults": multinode_result.get("nodeStopResults") or [],
+                "remainingGpuPids": multinode_result.get("remainingGpuPids") or [],
+            }
+        )
     if result.get("remainingPids"):
         if _reservation_gpus_idle(record):
             result["remainingNonGpuPids"] = result.get("remainingPids") or []
@@ -1839,6 +2200,14 @@ def stop_training_reservation_process(request: TrainingReservationStopProcessReq
             result["message"] = "训练进程 GPU 占用已释放；仅剩非 GPU 残留进程"
         else:
             raise HTTPException(409, result.get("message") or "Process still running")
+    if result.get("remainingGpuPids"):
+        result["stopped"] = False
+        raise HTTPException(409, result)
+    if allocation_file:
+        result["stopped"] = bool(result.get("stopped") or result.get("alreadyExited")) and bool(
+            multinode_result.get("stopped")
+        )
+        result["message"] = "多机训练进程已停止" if result["stopped"] else result.get("message")
     return _response(
         {
             "reservationId": reservation_id,
@@ -1975,7 +2344,8 @@ def write_training_allocation(request: TrainingAllocationWriteRequest):
         raise HTTPException(400, "Missing MULTINODE_DOCKER_CONTAINER")
     target = _container(container)
     container_path = f"/tmp/medflow_training_allocation_{reservation_id}.json"
-    payload = json.dumps(request.allocation, ensure_ascii=False).encode("utf-8")
+    allocation = _rewrite_training_allocation_ssh_aliases(request.allocation)
+    payload = json.dumps(allocation, ensure_ascii=False).encode("utf-8")
     with tempfile.TemporaryDirectory() as temp_dir:
         local_path = Path(temp_dir) / f"{reservation_id}.json"
         local_path.write_bytes(payload)

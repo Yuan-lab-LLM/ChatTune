@@ -16,6 +16,7 @@
 
 ## 最新更新
 
+- [2026-08-20] 支持多机训练。
 - [2026-08-13] 将推理纳入资源池管理中，同时更新底层训练镜像版本，LLaMA-Factory 升级到 0.9.5。
 - [2026-07-29] 首次发布。
 
@@ -131,6 +132,7 @@ bash runtime.sh init --profile single --iphost <本机可达IP>
 | 配置 | 用途 |
 | --- | --- |
 | `MEDFLOW_LOCAL_TRAINING_CONTAINER` | LoRA、全参和 DPO 等常规训练任务容器。 |
+| `MULTINODE_DOCKER_CONTAINER` | 多机 LoRA SFT 与 DPO 增强训练使用的独立 LLaMAFactory 容器。 |
 | `MEDFLOW_LOCAL_EVALUATE_CONTAINER` | 模型评估与推理相关任务容器。 |
 | `MEDFLOW_LOCAL_GRPO_CONTAINER` | GRPO/verl 任务容器。 |
 | `MODEL_NAME` / `MODEL_API_KEY` / `MODEL_BASE_URL` | Agent 使用的 OpenAI-compatible 模型服务。 |
@@ -183,7 +185,7 @@ bash runtime.sh stop
 | 中心节点 | 运行 Studio、Bridge，并可选运行本机 Agent API | `bash runtime.sh init --profile center --nodes ...` |
 | 计算节点 | 运行 Agent API、资源探测和任务容器 | `bash runtime.sh init --profile node ...` |
 
-中心节点与计算节点的 token、地址和启动顺序见 [多机部署配置](docs/MULTI_NODE_ZH.md)。当前用户文档将多机训练标记为后续阶段能力；多节点 Runtime 与多节点推理不等同于多机训练。
+中心节点与计算节点的 token、地址、启动顺序以及多机训练所需的资源池配置见 [多机部署配置](docs/MULTI_NODE_ZH.md)。多机训练使用独立的 `MULTINODE_DOCKER_CONTAINER` 和 Studio 下发的 GPU 预约；多节点 Runtime 与多节点推理是相关部署模式，但配置入口不同。
 
 ## 用于通用领域
 

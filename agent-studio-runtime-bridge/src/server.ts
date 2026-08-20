@@ -22,6 +22,7 @@ type BridgeChatRequest = {
   training_container?: string;
   evaluation_container?: string;
   grpo_container?: string;
+  multinode_training_container?: string;
   resource_group_id?: string;
   training_pool_id?: string;
   user_role?: string;
@@ -155,14 +156,14 @@ function toRuntimeRequest(body: BridgeChatRequest) {
           },
         ];
   const runtimeContextMessage: RuntimeMessage | null =
-    body.training_container || body.evaluation_container || body.grpo_container || body.resource_group_id || body.training_pool_id || body.user_role || ownerUserId || ownerAliasesText || contextUsername
+    body.training_container || body.evaluation_container || body.grpo_container || body.multinode_training_container || body.resource_group_id || body.training_pool_id || body.user_role || ownerUserId || ownerAliasesText || contextUsername
       ? {
           role: "system",
           type: "message",
           content: [
             {
               type: "text",
-              text: `${RUNTIME_CONTEXT_MARKER} training_container=${body.training_container || ""} evaluation_container=${body.evaluation_container || ""} grpo_container=${body.grpo_container || ""} resource_group_id=${body.resource_group_id || ""} training_pool_id=${body.training_pool_id || ""} user_role=${body.user_role || ""} owner_user_id=${ownerUserId} owner_aliases=${ownerAliasesText} context_username=${contextUsername}`,
+              text: `${RUNTIME_CONTEXT_MARKER} training_container=${body.training_container || ""} evaluation_container=${body.evaluation_container || ""} grpo_container=${body.grpo_container || ""} multinode_training_container=${body.multinode_training_container || ""} resource_group_id=${body.resource_group_id || ""} training_pool_id=${body.training_pool_id || ""} user_role=${body.user_role || ""} owner_user_id=${ownerUserId} owner_aliases=${ownerAliasesText} context_username=${contextUsername}`,
             },
           ],
         }
@@ -178,6 +179,7 @@ function toRuntimeRequest(body: BridgeChatRequest) {
     training_container: body.training_container,
     evaluation_container: body.evaluation_container,
     grpo_container: body.grpo_container,
+    multinode_training_container: body.multinode_training_container,
     resource_group_id: body.resource_group_id,
     training_pool_id: body.training_pool_id,
     user_role: body.user_role,

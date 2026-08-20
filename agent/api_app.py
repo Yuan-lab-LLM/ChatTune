@@ -62,7 +62,7 @@ from resource_api import (  # noqa: E402
 logger = logging.getLogger(__name__)
 RUNTIME_CONTEXT_MARKER = "__medflow_runtime_context__"
 RUNTIME_CONTEXT_RE = re.compile(
-    r"\b(training_container|evaluation_container|grpo_container|resource_group_id|training_pool_id|user_role|owner_user_id|owner_aliases|context_username)=([^\s]*)"
+    r"\b(training_container|evaluation_container|grpo_container|multinode_training_container|resource_group_id|training_pool_id|user_role|owner_user_id|owner_aliases|context_username)=([^\s]*)"
 )
 DEFAULT_AGENT_REQUEST_THREADS = 8
 
@@ -352,6 +352,7 @@ async def _handle_agent_request(
     training_pool_id = _request_extra_value(request, "training_pool_id", kwargs)
     user_role = _request_extra_value(request, "user_role", kwargs)
     grpo_container = _request_extra_value(request, "grpo_container", kwargs)
+    multinode_training_container = _request_extra_value(request, "multinode_training_container", kwargs)
     owner_user_id = _request_extra_value(request, "owner_user_id", kwargs)
     owner_aliases = _request_extra_list(request, "owner_aliases", kwargs)
     context_username = _request_extra_value(request, "context_username", kwargs)
@@ -363,6 +364,9 @@ async def _handle_agent_request(
     training_pool_id = training_pool_id or runtime_context.get("training_pool_id", "")
     user_role = user_role or runtime_context.get("user_role", "")
     grpo_container = grpo_container or runtime_context.get("grpo_container", "")
+    multinode_training_container = (
+        multinode_training_container or runtime_context.get("multinode_training_container", "")
+    )
     owner_user_id = owner_user_id or runtime_context.get("owner_user_id", "")
     if not owner_aliases:
         owner_aliases = [
@@ -381,6 +385,7 @@ async def _handle_agent_request(
             "training_container": training_container,
             "evaluation_container": evaluation_container,
             "grpo_container": grpo_container,
+            "multinode_training_container": multinode_training_container,
             "resource_group_id": resource_group_id,
             "training_pool_id": training_pool_id,
             "user_role": user_role,
@@ -398,6 +403,7 @@ async def _handle_agent_request(
         training_container=training_container,
         evaluation_container=evaluation_container,
         grpo_container=grpo_container,
+        multinode_training_container=multinode_training_container,
         resource_group_id=resource_group_id,
         training_pool_id=training_pool_id,
         user_role=user_role,

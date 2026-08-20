@@ -29,6 +29,7 @@ export interface SafeAuthUser {
         defaultContainerName: string;
         defaultEvaluateContainerName: string;
         defaultGrpoContainerName: string;
+        defaultMultinodeContainerName: string;
     } | null;
 }
 
@@ -145,6 +146,7 @@ export class AuthDao {
                 defaultContainerName: group.defaultContainerName,
                 defaultEvaluateContainerName: group.defaultEvaluateContainerName,
                 defaultGrpoContainerName: group.defaultGrpoContainerName,
+                defaultMultinodeContainerName: group.defaultMultinodeContainerName,
             } : null,
         };
     }
@@ -506,6 +508,7 @@ export class AuthDao {
                 defaultContainerName: string;
                 defaultEvaluateContainerName: string;
                 defaultGrpoContainerName: string;
+                defaultMultinodeContainerName: string;
                 nodeId?: string | null;
             }
         >();
@@ -519,6 +522,7 @@ export class AuthDao {
                 defaultEvaluateContainerName:
                     group.defaultEvaluateContainerName,
                 defaultGrpoContainerName: group.defaultGrpoContainerName,
+                defaultMultinodeContainerName: group.defaultMultinodeContainerName,
                 nodeId: nodeByGroupId.get(group.id) ?? null,
             });
         });

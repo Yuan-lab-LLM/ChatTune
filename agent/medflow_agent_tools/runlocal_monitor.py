@@ -156,11 +156,19 @@ def _payload_for_monitor_display(payload: Dict[str, Any]) -> Dict[str, Any]:
         "wandb_run_not_found",
         "wandb_no_metrics",
     }
+    unconfirmed_startup_train_types = {
+        "lora",
+        "lora_sft",
+        "enhanced",
+        "multinode_lora_sft",
+        "multinode_enhanced",
+    }
     if (
-        status == "starting"
-        and train_type == "enhanced"
+        status in {"starting", "running"}
+        and train_type in unconfirmed_startup_train_types
         and metrics.get("training_process_exists") is True
         and not has_metric_anchor
+        and not progress_realtime_confirmed
         and startup_error_reason in startup_error_reasons
     ):
         sanitized_metrics = dict(metrics)
@@ -222,6 +230,13 @@ def _monitor_protocol_hint(payload: Dict[str, Any]) -> Dict[str, Any]:
         "trainType": metrics.get("train_type"),
         "trainTypeEn": metrics.get("train_type_public"),
         "trainTypeText": metrics.get("train_type_text"),
+        "launchMode": metrics.get("launchMode") or metrics.get("launch_mode"),
+        "isMultinode": (
+            metrics.get("isMultinode")
+            if metrics.get("isMultinode") is not None
+            else metrics.get("is_multinode")
+        ),
+        "scriptName": metrics.get("scriptName") or metrics.get("script_name"),
         "latestLoss": latest_loss,
         "latestStep": latest_step,
         "latestEpoch": latest_epoch,
@@ -1467,6 +1482,12 @@ def _build_payload_from_status_record(
             "train_type": record_train_type or "unknown",
             "train_type_public": public_train_type(record_train_type, record_launch_mode, record_script),
             "train_type_text": public_train_type_text(record_train_type, record_launch_mode, record_script),
+            "launch_mode": record_launch_mode,
+            "launchMode": record_launch_mode,
+            "is_multinode": record_launch_mode == "multinode",
+            "isMultinode": record_launch_mode == "multinode",
+            "script_name": record_script,
+            "scriptName": record_script,
             "training_process_exists": False,
             "latest_loss": latest_loss,
             "latest_epoch": latest_epoch,
@@ -1665,10 +1686,27 @@ def _parse_output_log_progress(lines: List[str]) -> Dict[str, Any]:
             return value
         return None
 
+    def _is_non_training_tqdm(line: str) -> bool:
+        lower = line.lower()
+        return any(
+            marker in lower
+            for marker in (
+                "converting format of dataset",
+                "running tokenizer on dataset",
+                "loading checkpoint shards",
+                "generating train split",
+                "generating validation split",
+                "map (num_proc",
+                "filter (num_proc",
+            )
+        )
+
     candidates: List[Dict[str, Any]] = []
     for line_index, line in enumerate(lines):
         cleaned = _strip_ansi(line).strip()
         if not cleaned or "%" not in cleaned or "/" not in cleaned or "[" not in cleaned:
+            continue
+        if _is_non_training_tqdm(cleaned):
             continue
         pct_match = re.search(r"(\d+(?:\.\d+)?)%", cleaned)
         step_match = re.search(r"(\d+)\s*/\s*(\d+)", cleaned)
@@ -1735,6 +1773,29 @@ def _parse_output_log_progress(lines: List[str]) -> Dict[str, Any]:
         "progress_unique_step_count": len(unique_steps),
     }
 
+
+def _lines_have_training_start_signal(lines: List[str]) -> bool:
+    for line in lines or []:
+        lower = str(line or "").lower()
+        if any(
+            marker in lower
+            for marker in (
+                "***** running training *****",
+                "training started.",
+                "start training",
+                "process rank:",
+                "distributed training: true",
+                "initializing torchbackend",
+                "world info dict:",
+                "multinode_train_entry",
+                "running on the following workers",
+                "loading weights file",
+                "detected deepspeed zero-3",
+            )
+        ):
+            return True
+    return False
+
 def _dpo_sub_stage_text(sub_stage: Optional[str]) -> Optional[str]:
     return {
         "training": "训练中",
@@ -1757,18 +1818,37 @@ def _extract_export_dir_from_text(text: str) -> Optional[str]:
 
 
 def _parse_dpo_launch_log_state(log_text: str) -> Dict[str, Any]:
-    """Extract DPO launcher merge/export state from the outer launch log."""
+    """Extract launcher stage from the outer launch log.
+
+    The historical name is kept because tests and callers use it, but the
+    parser covers DPO, batch LoRA/full, and multinode launcher markers.
+    """
     text = str(log_text or "")
     lower = text.lower()
     export_dir = _extract_export_dir_from_text(text)
-    merge_started = "merging lora weights" in lower
-    merge_succeeded = "merge weights operation completed successfully" in lower
+    training_started = (
+        "training started." in lower
+        or "start training" in lower
+        or "***** running training *****" in lower
+    )
+    merge_started = (
+        "merging lora weights" in lower
+        or "merge started." in lower
+    )
+    merge_succeeded = (
+        "merge weights operation completed successfully" in lower
+        or "merge command executed successfully" in lower
+    )
     merge_failed = (
         "merge weights operation failed" in lower
         or "merge command failed" in lower
         or "export failed" in lower
     )
-    launcher_finished = "train launcher successfully" in lower
+    launcher_finished = (
+        "train launcher successfully" in lower
+        or "dpo multi-node train launcher completed successfully" in lower
+        or "training finished. duration" in lower
+    )
 
     sub_stage = None
     merge_status = None
@@ -1781,12 +1861,19 @@ def _parse_dpo_launch_log_state(log_text: str) -> Dict[str, Any]:
     elif merge_started:
         sub_stage = "merge"
         merge_status = "running"
+    elif training_started:
+        sub_stage = "training"
 
     return {
         "sub_stage": sub_stage,
         "sub_stage_text": _dpo_sub_stage_text(sub_stage),
         "export_dir": export_dir,
         "merge_status": merge_status,
+        "training_started": training_started,
+        "merge_started": merge_started,
+        "merge_succeeded": merge_succeeded,
+        "merge_failed": merge_failed,
+        "launcher_finished": launcher_finished,
     }
 
 
@@ -2170,9 +2257,11 @@ def _read_output_log(container: str, path: str, history_limit: int) -> Dict[str,
     progress_line = None
     progress_candidate_count = 0
     progress_unique_step_count = 0
+    training_start_signal = False
     completion_info: Dict[str, Any] = {"completed": False, "succeeded": False}
     if code == 0 and out:
         lines = out.splitlines()
+        training_start_signal = _lines_have_training_start_signal(lines)
         history = parse_output_log_history(lines)
         progress_info = _parse_output_log_progress(lines)
         completion_info = _parse_training_completion_from_output_log(lines)
@@ -2274,7 +2363,18 @@ def _read_output_log(container: str, path: str, history_limit: int) -> Dict[str,
     if mtime:
         last_update_time = datetime.fromtimestamp(mtime).isoformat()
 
-    require_realtime_gate = ("grpo" in (path or "").lower()) or ("verl" in (path or "").lower())
+    path_lower = (path or "").lower()
+    require_realtime_gate = any(
+        marker in path_lower
+        for marker in (
+            "grpo",
+            "verl",
+            "multinode",
+            "train_multi",
+            "batch_train",
+            "-train-log",
+        )
+    )
     if require_realtime_gate:
         progress_realtime_confirmed, progress_realtime_reason = _confirm_realtime_tqdm_progress(
             log_key=f"{container}:{path}",
@@ -2319,6 +2419,7 @@ def _read_output_log(container: str, path: str, history_limit: int) -> Dict[str,
         "progress_realtime_reason": progress_realtime_reason,
         "progress_candidate_count": progress_candidate_count,
         "progress_unique_step_count": progress_unique_step_count,
+        "training_start_signal": training_start_signal,
         "sub_stage": completion_info.get("sub_stage"),
         "sub_stage_text": completion_info.get("sub_stage_text"),
         "train_progress_percent": completion_info.get("train_progress_percent"),
@@ -2728,9 +2829,15 @@ def _build_finished_payload_from_grpo_launch_log(
 
 def _launch_log_has_dpo_success(log_text: str) -> bool:
     lower = str(log_text or "").lower()
+    state = _parse_dpo_launch_log_state(log_text)
     return bool(
-        "merge weights operation completed successfully" in lower
-        and "train launcher successfully" in lower
+        state.get("merge_status") == "finished"
+        and state.get("launcher_finished")
+        and (
+            "train launcher successfully" in lower
+            or "dpo multi-node train launcher completed successfully" in lower
+            or "training finished. duration" in lower
+        )
     )
 
 
@@ -2738,7 +2845,12 @@ def _launch_log_has_error_after_dpo_success(log_text: str) -> bool:
     lines = str(log_text or "").splitlines()
     success_index = None
     for idx, line in enumerate(lines):
-        if "train launcher successfully" in line.lower():
+        lower = line.lower()
+        if (
+            "train launcher successfully" in lower
+            or "dpo multi-node train launcher completed successfully" in lower
+            or "training finished. duration" in lower
+        ):
             success_index = idx
     if success_index is None:
         return False
@@ -2785,7 +2897,25 @@ def _build_finished_payload_from_dpo_launch_log(
         if save_name:
             export_dir = f"/home/workspace/models/dpo_train/internal/export/model_medical_{save_name}"
 
-    analysis_text = "增强训练已完成，已从启动日志确认 DPO merge/export 成功。"
+    record_train_type = normalize_train_type(
+        (pid_record or {}).get("train_type") or (pid_record or {}).get("trainType")
+        if isinstance(pid_record, dict)
+        else None
+    )
+    record_launch_mode = (
+        (pid_record or {}).get("launch_mode") or (pid_record or {}).get("launchMode")
+        if isinstance(pid_record, dict)
+        else None
+    )
+    record_script = (
+        (pid_record or {}).get("script_name") or (pid_record or {}).get("scriptName")
+        if isinstance(pid_record, dict)
+        else None
+    )
+    train_type_value = record_train_type or "unknown"
+    train_type_text = public_train_type_text(record_train_type, record_launch_mode, record_script)
+    display_name = train_type_text or "训练"
+    analysis_text = f"{display_name}已完成，已从启动日志确认 merge/export 成功。"
     if export_dir:
         analysis_text += f"\n导出模型：{export_dir}"
 
@@ -2796,7 +2926,9 @@ def _build_finished_payload_from_dpo_launch_log(
             "pid": str(pid) if pid else None,
             "pid_alive": False,
             "training_process_exists": False,
-            "train_type": "enhanced",
+            "train_type": train_type_value,
+            "train_type_public": public_train_type(record_train_type, record_launch_mode, record_script),
+            "train_type_text": train_type_text,
             "output_dir": output_dir,
             "export_dir": export_dir,
             "sub_stage": "finished",
@@ -2808,7 +2940,7 @@ def _build_finished_payload_from_dpo_launch_log(
             "completion_reason": "dpo_launcher_merge_success",
             "completion_source": "launch_log",
             "output_log_success": True,
-            "output_log_success_hint": "train launcher successfully.",
+            "output_log_success_hint": "launcher merge/export successfully.",
             "loss_source": "launch_log",
             "error_reason": None,
             "launch_log_path": (pid_record or {}).get("launch_log_file") if isinstance(pid_record, dict) else None,
@@ -3579,6 +3711,9 @@ def monitor_training(
     train_type: Optional[str] = None,
     session_id: Optional[str] = None,
     pid: Optional[str] = None,
+    launch_mode: Optional[str] = None,
+    is_multinode: Optional[bool] = None,
+    script_name: Optional[str] = None,
     history_limit: int = DEFAULT_HISTORY_LIMIT,
     time_window_minutes: int = DEFAULT_TIME_WINDOW_MINUTES,
     model_name: str = DEFAULT_MODEL_NAME,
@@ -3592,6 +3727,8 @@ def monitor_training(
         user_supplied_wandb_root = bool(wandb_root)
         wandb_root = (wandb_root or DEFAULT_WANDB_ROOT).strip()
         wandb_root_source = "user_input" if user_supplied_wandb_root else "default"
+        request_launch_mode = str(launch_mode or "").strip() or ("multinode" if is_multinode else None)
+        request_script_name = str(script_name or "").strip() or None
 
         container_name, container_err = _get_container_name(container_name)
         if container_err:
@@ -3666,8 +3803,16 @@ def monitor_training(
                 if progress_detail:
                     analysis_text += f"\n最新准备日志：{progress_detail}"
                 preparing_train_type = normalize_train_type(pid_record.get("train_type") or pid_record.get("trainType"))
-                preparing_launch_mode = pid_record.get("launch_mode") or pid_record.get("launchMode")
-                preparing_script = pid_record.get("script_name") or pid_record.get("scriptName")
+                preparing_launch_mode = (
+                    pid_record.get("launch_mode")
+                    or pid_record.get("launchMode")
+                    or request_launch_mode
+                )
+                preparing_script = (
+                    pid_record.get("script_name")
+                    or pid_record.get("scriptName")
+                    or request_script_name
+                )
                 payload = {
                     "status": "preparing",
                     "metrics": {
@@ -3678,6 +3823,12 @@ def monitor_training(
                         "train_type": preparing_train_type or "unknown",
                         "train_type_public": public_train_type(preparing_train_type, preparing_launch_mode, preparing_script),
                         "train_type_text": public_train_type_text(preparing_train_type, preparing_launch_mode, preparing_script),
+                        "launch_mode": preparing_launch_mode,
+                        "launchMode": preparing_launch_mode,
+                        "is_multinode": preparing_launch_mode == "multinode",
+                        "isMultinode": preparing_launch_mode == "multinode",
+                        "script_name": preparing_script,
+                        "scriptName": preparing_script,
                         "launch_log_path": pid_record.get("launch_log_file"),
                         "preparing_elapsed_seconds": elapsed_seconds,
                         "preparation_detail": progress_detail,
@@ -3737,6 +3888,10 @@ def monitor_training(
         if pid_record:
             launch_mode = pid_record.get("launch_mode") or pid_record.get("launchMode")
             script_name_for_type = pid_record.get("script_name") or pid_record.get("scriptName")
+        if not launch_mode:
+            launch_mode = request_launch_mode
+        if not script_name_for_type:
+            script_name_for_type = request_script_name
         if not script_name_for_type and selected_proc:
             script_name_for_type = selected_proc.get("cmd")
         train_type_value = train_type or "unknown"
@@ -3744,7 +3899,7 @@ def monitor_training(
         train_type_text = public_train_type_text(train_type, launch_mode, script_name_for_type)
         launch_log_tail_for_state = (
             _read_launch_log_tail(container_name, pid_record)
-            if train_type_value == "enhanced" and isinstance(pid_record, dict)
+            if isinstance(pid_record, dict)
             else ""
         )
         dpo_launch_state = _parse_dpo_launch_log_state(launch_log_tail_for_state)
@@ -4351,17 +4506,17 @@ def monitor_training(
         dpo_sub_stage_text = output_log_payload.get("sub_stage_text") if output_log_payload else None
         export_dir = dpo_launch_state.get("export_dir")
         merge_status = dpo_launch_state.get("merge_status")
-        if train_type_value == "enhanced" and dpo_launch_state.get("sub_stage"):
+        if dpo_launch_state.get("sub_stage"):
             dpo_sub_stage = dpo_launch_state.get("sub_stage")
             dpo_sub_stage_text = dpo_launch_state.get("sub_stage_text")
-        if train_type_value == "enhanced" and dpo_sub_stage == "merge" and merge_status == "running":
+        if dpo_sub_stage == "merge" and merge_status == "running":
             progress_percent = None
             current_step = None
             total_steps = None
             elapsed_time = None
             remaining_time = None
             progress_realtime_confirmed = False
-            progress_realtime_reason = "dpo_merge_in_progress"
+            progress_realtime_reason = "launcher_merge_in_progress"
         history, resume_history_info = _apply_resume_history_offset(history, pid_record)
         latest_step, resume_step_info = _apply_resume_step_offset(
             latest_step,
@@ -4409,7 +4564,10 @@ def monitor_training(
                 error_reason = error_reason or "training_process_not_found"
         else:
             if not wandb_run_dir:
-                status = "starting"
+                if output_log_payload and output_log_payload.get("training_start_signal"):
+                    status = "running"
+                else:
+                    status = "starting"
                 error_reason = error_reason or "wandb_run_not_found"
             elif not history and latest_loss is None:
                 status = "starting"
@@ -4421,6 +4579,30 @@ def monitor_training(
         elif output_dir and output_dir_exists is False and not training_process_exists and status == "running":
             status = "failed"
             error_reason = error_reason or "output_dir_missing"
+
+        launcher_finished_success = bool(
+            merge_status == "finished"
+            and dpo_launch_state.get("launcher_finished")
+            and not dpo_launch_state.get("merge_failed")
+        )
+        if merge_status == "failed":
+            status = "failed"
+            error_reason = "merge_failed"
+            completion_reason = None
+            completion_source = None
+        elif merge_status == "running" and training_process_exists:
+            status = "running"
+            if error_reason in {
+                "wandb_run_not_found",
+                "wandb_no_metrics",
+                "output_dir_missing_but_process_running",
+            }:
+                error_reason = None
+        elif launcher_finished_success:
+            status = "finished"
+            error_reason = None
+            completion_reason = completion_reason or "launcher_merge_success"
+            completion_source = completion_source or "launch_log"
 
         if history_count == 0 and latest_loss is not None:
             history_count = 1
@@ -4460,7 +4642,7 @@ def monitor_training(
                     latest_loss = last_finite
                     loss_is_finite = True
 
-        if stale:
+        if stale and merge_status != "running" and status != "finished":
             status = "failed"
             error_reason = error_reason or "metrics_stale"
         status = _apply_finished_wandb_status(
@@ -4468,9 +4650,28 @@ def monitor_training(
             iteration_finished,
             training_process_exists,
         )
+        if merge_status == "failed":
+            status = "failed"
+            error_reason = "merge_failed"
+        elif merge_status == "running" and training_process_exists:
+            status = "running"
+            error_reason = None
+        elif launcher_finished_success:
+            status = "finished"
+            error_reason = None
+            completion_reason = completion_reason or "launcher_merge_success"
+            completion_source = completion_source or "launch_log"
         if loss_available and not loss_is_finite:
             status = "failed"
             error_reason = error_reason or "loss_not_finite"
+        waiting_for_metrics = bool(
+            training_process_exists
+            and latest_loss is None
+            and effective_history_count == 0
+        )
+        if waiting_for_metrics and status not in {"finished", "failed", "interrupted"}:
+            if status not in {"running", "starting"}:
+                status = "starting"
         if status == "failed" and not error_reason:
             error_reason = "unknown"
 
@@ -4530,7 +4731,9 @@ def monitor_training(
         # ===== LLM 评价输出规则（按你的要求） =====
         llm_called = False
         llm_err = None
-        if iteration_finished and training_process_exists:
+        if merge_status == "running" and dpo_sub_stage == "merge":
+            analysis_text = "训练迭代已结束，正在进行 Merge/Export。"
+        elif iteration_finished and training_process_exists:
             analysis_text = "迭代结束，在保存模型。"
         elif allow_llm and llm_ready:
             analysis_input = {
@@ -4574,9 +4777,11 @@ def monitor_training(
                     f"未检测到正常完成标记（原因：{error_reason}），请检查日志或确认是否手动终止。"
                 )
             elif status == "starting":
-                analysis_text = f"{STARTING_TEXT}（wandb 数据尚未就绪）"
+                analysis_text = f"{STARTING_TEXT}（指标数据尚未写入）"
+            elif merge_status == "running" and dpo_sub_stage == "merge":
+                analysis_text = "训练迭代已结束，正在进行 Merge/Export。"
             elif latest_loss is None and training_process_exists:
-                analysis_text = "已检测到训练进程，但当前无法从 wandb 解析到 loss（可能尚未写入），请稍后重试。"
+                analysis_text = "已检测到训练进程，正在等待 loss、lr 等指标写入。"
 
         # ===== 新增：无论是否调用 LLM，都把“指标”放在最前面 =====
         analysis_text = f"{indicator_text}\n{analysis_text}"
@@ -4588,6 +4793,12 @@ def monitor_training(
                 "train_type": train_type_value,
                 "train_type_public": train_type_public,
                 "train_type_text": train_type_text,
+                "launch_mode": launch_mode,
+                "launchMode": launch_mode,
+                "is_multinode": launch_mode == "multinode",
+                "isMultinode": launch_mode == "multinode",
+                "script_name": script_name_for_type,
+                "scriptName": script_name_for_type,
                 "output_dir": output_dir,
                 "output_dir_source": output_dir_source,
                 "output_dir_exists": output_dir_exists,
@@ -4660,12 +4871,14 @@ def monitor_training(
                 "merge_status": merge_status,
                 "progress_realtime_confirmed": progress_realtime_confirmed,
                 "progress_realtime_reason": progress_realtime_reason,
+                "training_start_signal": output_log_payload.get("training_start_signal") if output_log_payload else False,
                 "latest_step_or_epoch": latest_epoch if latest_epoch is not None else latest_step,
                 "axis": axis,
                 "axis_note": axis_note,
                 "history_count": history_count,
                 "history_limit": history_limit,
                 "history": history,
+                "metrics_waiting": waiting_for_metrics,
                 "last_update_time": last_update_time,
                 "stale": stale,
                 "stale_minutes": stale_minutes,

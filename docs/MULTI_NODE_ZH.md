@@ -7,6 +7,8 @@
 
 中心节点必须能访问每台计算节点的 `AGENT_API_PORT`，每台计算节点必须能访问中心节点的 Studio 后端地址。
 
+每台参与多机训练的机器都必须初始化为 Runtime 节点，并启用 Agent API/资源探测服务，同时通过 `MULTINODE_DOCKER_CONTAINER` 配置独立的多机训练容器。只在 master 节点部署 Agent 不够；Studio 需要向每个参与节点查询 GPU 快照、预约 GPU 卡号并管理 allocation。
+
 ## 前置条件
 
 - Linux 运行环境，`runtime.sh` 依赖 Bash。
@@ -27,7 +29,7 @@ cd studio
 apt update
 curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
 apt install -y nodejs
-npm ci
+npm ci 
 
 cd ../agent-studio-runtime-bridge
 npm ci
@@ -46,6 +48,7 @@ bash runtime.sh init --profile center --nodes node-b=http://<worker-b-host>:8099
 | 字段 | 填写内容 |
 | --- | --- |
 | `MEDFLOW_LOCAL_TRAINING_CONTAINER` | 中心本机实际存在的训练容器名，用于中心本机 Agent 的常规训练任务。 |
+| `MULTINODE_DOCKER_CONTAINER` | 中心本机实际存在的多机训练 LLaMAFactory 容器名，用于多机 LoRA SFT 和 DPO 增强训练。 |
 | `MEDFLOW_LOCAL_EVALUATE_CONTAINER` | 中心本机实际存在的评测/推理容器名，用于中心本机 Agent 的模型评测和推理相关任务。 |
 | `MEDFLOW_LOCAL_GRPO_CONTAINER` | 中心本机实际存在的 GRPO/verl 容器名，用于中心本机 Agent 的 GRPO/verl 训练任务。 |
 | `MODEL_NAME` / `MODEL_API_KEY` / `MODEL_BASE_URL` | 中心本机 Agent 调用的 OpenAI-compatible 模型名、API key 和服务地址。 |
@@ -66,6 +69,7 @@ bash runtime.sh init --profile node --node-id node-b --center-url http://<center
 | 字段 | 填写内容 |
 | --- | --- |
 | `MEDFLOW_LOCAL_TRAINING_CONTAINER` | 该节点实际存在的训练容器名，用于常规训练任务。 |
+| `MULTINODE_DOCKER_CONTAINER` | 该节点实际存在的多机训练 LLaMAFactory 容器名，用于多机 LoRA SFT 和 DPO 增强训练。 |
 | `MEDFLOW_LOCAL_EVALUATE_CONTAINER` | 该节点实际存在的评测/推理容器名，用于模型评测和推理相关任务。 |
 | `MEDFLOW_LOCAL_GRPO_CONTAINER` | 该节点实际存在的 GRPO/verl 容器名，用于 GRPO/verl 训练任务。 |
 | `MEDFLOW_STUDIO_RUNTIME_TOKEN` | 从中心节点复制的共享 Studio Runtime token。 |
@@ -120,4 +124,3 @@ bash runtime.sh status
 - `.runtime/*.pid`：`runtime.sh` 记录的服务进程 PID。
 
 如果 `check` 失败，先按提示修复依赖、端口、token、容器或 placeholder 问题，再重新启动。
-

@@ -143,7 +143,13 @@ MULTINODE_PARAM_MAPPING = {
     "model_path": "model-path",
     "模型路径": "model-path",
     "模型位置": "model-path",
+    "基础模型路径": "model-path",
+    "模型在": "model-path",
+    "MODEL_PATH": "model-path",
+    "model-path": "model-path",
+    "base_model_path": "model-path",
     "dataset_dir": "dataset-dir",
+    "dataset-dir": "dataset-dir",
     "data_dir": "dataset-dir",
     "sft_data_dir": "dataset-dir",
     "sft_dataset_dir": "dataset-dir",
@@ -151,6 +157,7 @@ MULTINODE_PARAM_MAPPING = {
     "数据集目录": "dataset-dir",
     "数据目录": "dataset-dir",
     "dataset_date": "dataset-date",
+    "dataset-date": "dataset-date",
     "data_identifier": "dataset-date",
     "data_id": "dataset-date",
     "dataset_id": "dataset-date",
@@ -166,14 +173,19 @@ MULTINODE_PARAM_MAPPING = {
     "mbs": "batch-size",
     "MBS": "batch-size",
     "batch_size": "batch-size",
+    "batch-size": "batch-size",
     "批量大小": "batch-size",
     "批次大小": "batch-size",
     "批大小": "batch-size",
     "acc": "acc",
     "ACC": "acc",
-    "lr": "lr",
-    "LR": "lr",
+    "gradient_accumulation_steps": "acc",
+    "梯度累积": "acc",
+    "累积步数": "acc",
+    "lr": "learning-rate",
+    "LR": "learning-rate",
     "learning_rate": "learning-rate",
+    "learning-rate": "learning-rate",
     "学习率": "learning-rate",
     "学习速率": "learning-rate",
     "tem": "template",
@@ -1081,6 +1093,32 @@ def _cli_arg_value(cli_args: Dict[str, Any], *keys: str) -> str:
 def _normalize_multinode_cli_args(script_name: str, cli_args: Dict[str, Any]) -> None:
     if not _is_multinode_train_script(script_name):
         return
+    aliases = {
+        "model_path": "model-path",
+        "MODEL_PATH": "model-path",
+        "base_model_path": "model-path",
+        "dataset_dir": "dataset-dir",
+        "data_dir": "dataset-dir",
+        "sft_data_dir": "dataset-dir",
+        "sft_dataset_dir": "dataset-dir",
+        "dataset_date": "dataset-date",
+        "data_identifier": "dataset-date",
+        "data_id": "dataset-date",
+        "dataset_id": "dataset-date",
+        "batch_size": "batch-size",
+        "MBS": "batch-size",
+        "ACC": "acc",
+        "gradient_accumulation_steps": "acc",
+        "LR": "learning-rate",
+        "learning_rate": "learning-rate",
+        "TEM": "template",
+        "RESUME": "resume-from-checkpoint",
+        "resume_from_checkpoint": "resume-from-checkpoint",
+    }
+    for legacy_key, canonical_key in aliases.items():
+        if legacy_key in cli_args and canonical_key not in cli_args:
+            cli_args[canonical_key] = cli_args.get(legacy_key)
+        cli_args.pop(legacy_key, None)
     for legacy_key in ("dataset-name", "dataset_name"):
         if legacy_key in cli_args and "dataset" not in cli_args:
             cli_args["dataset"] = cli_args.get(legacy_key)
@@ -2467,14 +2505,26 @@ def validate_training_inputs_preflight(
     if script_name == MULTINODE_SFT_SCRIPT:
         dataset_dir = _cli_arg_value(cli_args, "dataset-dir", "dataset_dir").strip().rstrip("/")
         dataset_date = _cli_arg_value(cli_args, "dataset-date", "dataset_date").strip()
+        base_dataset_path = (
+            _cli_arg_value(cli_args, "base-dataset-path", "base_dataset_path").strip()
+            or "/home/workspace/dataset_batch_train"
+        )
         if not dataset_dir and dataset_date:
-            base_dataset_path = _cli_arg_value(cli_args, "base-dataset-path", "base_dataset_path").strip() or "/home/workspace/dataset_batch_train"
             dataset_dir = f"{base_dataset_path.rstrip('/')}/{dataset_date}"
         if not dataset_dir:
-            return issue(
-                "dataset_dir_missing",
-                "多机 SFT 未提供 dataset-dir 或 dataset-date，已阻止启动。",
+            latest = run_shell(
+                f"find {shlex.quote(base_dataset_path)} -mindepth 1 -maxdepth 1 "
+                "-type d -printf '%f\\n' 2>/dev/null | sort | tail -n 1"
             )
+            if isinstance(latest, dict):
+                return latest
+            latest_name = str(latest.stdout or "").strip()
+            if latest.returncode != 0 or not latest_name:
+                return issue(
+                    "dataset_dir_missing",
+                    f"未找到可用的多机 SFT 批量训练数据目录：{base_dataset_path}，请提供 dataset-dir 或 dataset-date。",
+                )
+            dataset_dir = f"{base_dataset_path.rstrip('/')}/{latest_name}"
         return validate_dataset_info_dir(dataset_dir)
 
     if script_name == "grpo_train":
@@ -2880,6 +2930,26 @@ def run_script_by_name_train(
             pname_lower = pname.lower()
             normalized_launcher_param = pname_lower.replace("_", "-")
             template_managed_script = script_name in {"batch_train_lora", "batch_train_full", MULTINODE_SFT_SCRIPT, "dpo_train_launcher", MULTINODE_DPO_SCRIPT}
+            if _is_multinode_train_script(script_name):
+                multinode_cli_param = script_info.get("param_mapping", {}).get(pname)
+                if not multinode_cli_param:
+                    multinode_cli_param = script_info.get("param_mapping", {}).get(pname_lower)
+                if not multinode_cli_param and normalized_launcher_param in script_info.get("supported_cli_params", []):
+                    multinode_cli_param = normalized_launcher_param
+                if multinode_cli_param:
+                    if multinode_cli_param == "container":
+                        params_to_update["container"] = str(param_value)
+                    elif multinode_cli_param in RESOURCE_LAUNCHER_ONLY_PARAMS:
+                        launcher_options[multinode_cli_param] = param_value
+                    elif multinode_cli_param in script_info.get("supported_cli_params", []):
+                        cli_params_to_update[multinode_cli_param] = _coerce_cli_value(
+                            script_info,
+                            multinode_cli_param,
+                            param_value,
+                        )
+                    else:
+                        unknown_params.append(f"{param_name} ({multinode_cli_param})")
+                    continue
             if template_managed_script and (pname in TEMPLATE_PARAM_KEYS or pname_lower in {"tem", "template"}):
                 explicit_template_provided = True
                 if script_info.get("cli_args_only", False):
@@ -3336,6 +3406,19 @@ def run_script_by_name_train(
         }
 
         if not docker_kwargs["docker_container"]:
+            if _is_multinode_train_script(script_name):
+                response_text = (
+                    "错误: 多机训练需要配置独立的 Docker 容器\n"
+                    f"脚本: {script_info['description']}\n"
+                    "请在 runtime.env 设置 MULTINODE_DOCKER_CONTAINER，指向包含多机训练脚本的 LLaMAFactory 容器"
+                )
+                return _train_error_response(
+                    script_name,
+                    response_text,
+                    error_reason="multinode_container_required",
+                    required_params=["MULTINODE_DOCKER_CONTAINER"],
+                    recoverable=True,
+                )
             response_text = (
                 f"错误: 需要指定Docker容器才能运行脚本\n"
                 f"脚本: {script_info['description']}\n"

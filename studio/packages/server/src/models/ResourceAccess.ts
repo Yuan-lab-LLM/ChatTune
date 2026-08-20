@@ -37,8 +37,11 @@ export class UserGroupTable extends BaseEntity {
     @Column({ default: 'evaluation_container' })
     defaultEvaluateContainerName: string;
 
-    @Column({ default: 'grpo_container' })
+    @Column({ default: 'qingnang_grpo' })
     defaultGrpoContainerName: string;
+
+    @Column({ default: 'qingnang_train_multi' })
+    defaultMultinodeContainerName: string;
 
     @CreateDateColumn({ type: 'datetime' })
     createdAt: Date;
@@ -93,6 +96,12 @@ export class GroupNodeAssignmentTable extends BaseEntity {
 
     @Column({ type: 'text', nullable: true })
     grpoContainerError?: string | null;
+
+    @Column({ default: 'pending' })
+    multinodeContainerStatus: string;
+
+    @Column({ type: 'text', nullable: true })
+    multinodeContainerError?: string | null;
 
     @UpdateDateColumn({ type: 'datetime' })
     updatedAt: Date;

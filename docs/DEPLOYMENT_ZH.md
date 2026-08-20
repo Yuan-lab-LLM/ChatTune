@@ -8,7 +8,7 @@
 - `agent-studio-runtime-bridge/`：Studio 与 Agent API 后端之间的桥接服务。
 - `agent/`：Agent API、工作流编排、资源探测、任务路由和内部资源 API。
 - `runtime.sh`：初始化、检查、启动、停止、状态和日志脚本。
-- `docker_scripts/`：Agent、训练、评测/推理和 GRPO 容器创建脚本。
+- `docker_scripts/`：Agent、训练、多机训练、评测/推理和 GRPO 容器创建脚本。
 - `medflow/`：MedFlow 推理服务、推理运维 Agent、测试和 Benchmark 相关代码。
 
 ## 镜像和资源
@@ -23,11 +23,12 @@
 
 ### 训练镜像补丁包
 
-后续训练镜像的发布将以补丁包形式进行。下载对应的 `.run` 包后，只需要执行 `bash xx.run` 完成安装；除非发布说明另有要求，不需要重新获取完整训练镜像包。
+后续训练镜像的发布将以补丁包形式进行。下载最新的 `.run` 包后，只需要执行 `bash xx.run` 完成安装；除非发布说明另有要求，不需要重新获取完整训练镜像包。
 
 | 资源 | 链接 | 备注 |
 | --- | --- | --- |
 | 训练镜像补丁包-0813 | https://pan.quark.cn/s/db69395cbde7 | 提取码：6K2h |
+| 训练镜像补丁包-0820 | https://pan.quark.cn/s/609582f1f4c9 | 提取码：68uc |
 
 ## 容器类型 
 
@@ -35,6 +36,7 @@
 | --- | --- | --- |
 | Agent 容器 | 单机、中心节点或计算节点 | 挂载代码目录，运行 Runtime、Agent API、资源探测、Studio 或 Bridge。 |
 | 通用训练任务容器 | GPU 计算节点 | 执行 LoRA、全参、DPO 等常规训练任务。 |
+| 多机训练任务容器 | GPU 计算节点 | 执行多机 LoRA SFT 和 DPO 增强训练任务。 |
 | 评测/推理任务容器 | GPU 计算节点 | 执行模型评测、推理服务相关任务。 |
 | GRPO/verl 任务容器 | GPU 计算节点 | 执行 GRPO 训练及相关数据/模型操作。 |
 
@@ -44,6 +46,7 @@
 | --- | --- | --- |
 | Agent 容器 | `docker_scripts/create_agent_docker.sh` | `AGENT_CONTAINER_NAME`、`AGENT_IMAGE`、`HOST_WORKSPACE` |
 | 通用训练任务容器 | `docker_scripts/create_training_dockers.sh` | `HOST_IP`、`TRAIN_IMAGE`、`TRAIN_CONTAINER_NAME`、`HOST_WORKSPACE` |
+| 多机训练任务容器 | `docker_scripts/create_multinode_training_dockers.sh` | `HOST_IP`、`TRAIN_IMAGE`、`TRAIN_CONTAINER_NAME`、`HOST_WORKSPACE` |
 | 评测/推理任务容器 | `docker_scripts/create_inference_docker.sh` | `HOST_IP`、`IMAGE_NAME`、`IMAGE_VERSION`、`DOCKER_NAME`、`HOST_WORKSPACE` |
 | GRPO/verl 任务容器 | `docker_scripts/create_grpo_docker.sh` | `HOST_IP`、`GRPO_IMAGE`、`GRPO_CONTAINER_NAME`、`HOST_WORKSPACE` |
 
@@ -87,7 +90,7 @@
 
 ### 注意
 
-训练任务使用 Weights & Biases 记录训练指标。创建上述两个训练容器后、开始首次在线训练前，必须在训练容器中完成 W&B 登录：
+训练任务使用 Weights & Biases 记录训练指标。创建通用训练容器、多机训练容器或 GRPO/verl 容器后、开始首次在线训练前，必须在对应训练容器中完成 W&B 登录：
 
 ```bash
 wandb login
@@ -97,6 +100,74 @@ wandb login
 
 - W&B 登录信息保存在容器内当前用户的配置中；删除或重新创建训练容器后需要重新登录。
 - 登录失败时，在容器中检查网络连通性。
+
+## 多机训练容器准备
+
+多机训练容器的基础挂载和创建方式与通用训练容器一致，创建后除了完成 `wandb login`，还需要在每个参与多机训练的容器中安装 `openssh-server` 和 `pdsh`，然后运行 `setup_multinode_ssh.sh` 配置 sshd 与节点互信。
+
+启动多机训练前，必须确认每台参与训练机器的多机训练 Docker 容器内，在相同容器路径下存在相同的数据集和基础模型。例如主节点使用 `/home/workspace/dataset_batch_train/my_sft` 和 `/home/workspace/models/base/qwen3` 时，从节点容器内也必须存在内容一致的这两个路径；只在宿主机路径相同或只在其中一台机器准备数据/模型都不够。
+
+两个训练容器里都先设置 root 密码：
+
+```bash
+apt update
+apt install openssh-server -y
+apt install -y pdsh
+passwd
+```
+
+检查pdsh是否通过安全检查：
+
+```bash
+stat -c '%U:%G %a %n' /usr /usr/lib /usr/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu/pdsh
+```
+
+正常这些目录应该是 root:root，并且不能被 group/other 写。直接修复可以执行：
+
+```bash
+chown root:root /usr /usr/lib /usr/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu/pdsh
+chmod go-w /usr /usr/lib /usr/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu/pdsh
+```
+
+然后两边先各自准备本地 sshd：
+
+```bash
+# 主节点容器
+bash setup_multinode_ssh.sh \
+  --user root \
+  --self-node ds35 \
+  --nodes ds35,ds36 \
+  --hosts <ds35-host>,<ds36-host> \
+  --ports 2222,2222 \
+  --slots 4 \
+  --prepare-only
+```
+
+```bash
+# 从节点容器
+bash setup_multinode_ssh.sh \
+  --user root \
+  --self-node ds36 \
+  --nodes ds35,ds36 \
+  --hosts <ds35-host>,<ds36-host> \
+  --ports 2222,2222 \
+  --slots 4 \
+  --prepare-only
+```
+
+然后两边再跑完整互信：
+
+```bash
+bash setup_multinode_ssh.sh \
+  --user root \
+  --self-node ds35 \
+  --nodes ds35,ds36 \
+  --hosts <ds35-host>,<ds36-host> \
+  --ports 2222,2222 \
+  --slots 4
+```
+
+从节点把 `--self-node ds35` 改成 `--self-node ds36`。
 
 ## 评测/推理容器挂载
 

@@ -43,6 +43,7 @@ This creates `runtime.env`, including local runtime tokens and the initial admin
 | Field | Value |
 | --- | --- |
 | `MEDFLOW_LOCAL_TRAINING_CONTAINER` | Training container name that actually exists on this machine, used for standard training tasks. |
+| `MULTINODE_DOCKER_CONTAINER` | Dedicated LLaMAFactory container name for multi-node LoRA SFT and DPO enhanced training. |
 | `MEDFLOW_LOCAL_EVALUATE_CONTAINER` | Evaluation/inference container name that actually exists on this machine, used for evaluation and inference-related tasks. |
 | `MEDFLOW_LOCAL_GRPO_CONTAINER` | GRPO/verl container name that actually exists on this machine, used for GRPO/verl training tasks. |
 | `MODEL_NAME` / `MODEL_API_KEY` / `MODEL_BASE_URL` | OpenAI-compatible model name, API key, and service URL used by Agent. |

@@ -287,6 +287,7 @@ export class SocketManager {
             defaultContainerName: group.defaultContainerName,
             defaultEvaluateContainerName: group.defaultEvaluateContainerName,
             defaultGrpoContainerName: group.defaultGrpoContainerName,
+            defaultMultinodeContainerName: group.defaultMultinodeContainerName,
           }
         : null,
     };
@@ -327,6 +328,7 @@ export class SocketManager {
           defaultContainerName: explicitGroup.defaultContainerName,
           defaultEvaluateContainerName: explicitGroup.defaultEvaluateContainerName,
           defaultGrpoContainerName: explicitGroup.defaultGrpoContainerName,
+          defaultMultinodeContainerName: explicitGroup.defaultMultinodeContainerName,
         },
       };
     }
@@ -344,6 +346,7 @@ export class SocketManager {
             defaultContainerName: runOwnerGroup.defaultContainerName,
             defaultEvaluateContainerName: runOwnerGroup.defaultEvaluateContainerName,
             defaultGrpoContainerName: runOwnerGroup.defaultGrpoContainerName,
+            defaultMultinodeContainerName: runOwnerGroup.defaultMultinodeContainerName,
           },
         };
       }
@@ -374,6 +377,9 @@ export class SocketManager {
       grpoContainer:
         resourceUser?.group?.defaultGrpoContainerName ||
         ConfigManager.getInstance().getDefaultGrpoContainerName(),
+      multinodeTrainingContainer:
+        resourceUser?.group?.defaultMultinodeContainerName ||
+        ConfigManager.getInstance().getDefaultMultinodeContainerName(),
       resourceGroupId: resourceUser?.group?.id,
     };
   }
@@ -1539,6 +1545,7 @@ export class SocketManager {
       trainingContainer: runtimeContext.trainingContainer,
       evaluationContainer: runtimeContext.evaluationContainer,
       grpoContainer: runtimeContext.grpoContainer,
+      multinodeTrainingContainer: runtimeContext.multinodeTrainingContainer,
     });
     if (currentUser?.role === UserRole.ADMIN) {
       await SocketManager.auditAdminAction(
@@ -1548,6 +1555,7 @@ export class SocketManager {
           runId,
           resourceGroupId: runtimeContext.resourceGroupId,
           trainingPoolId: trainingPoolId || null,
+          multinodeTrainingContainer: runtimeContext.multinodeTrainingContainer,
           targetBackendUrl,
         },
       );
@@ -1573,6 +1581,7 @@ export class SocketManager {
           training_container: runtimeContext.trainingContainer,
           evaluation_container: runtimeContext.evaluationContainer,
           grpo_container: runtimeContext.grpoContainer,
+          multinode_training_container: runtimeContext.multinodeTrainingContainer,
           resource_group_id: runtimeContext.resourceGroupId,
           training_pool_id: trainingPoolId || undefined,
           message,

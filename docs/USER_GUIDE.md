@@ -83,7 +83,23 @@ LoRA batch training and full-parameter batch training use the latest dated datas
 
 ## Multi-node Training
 
-Multi-node training is planned for the next phase.
+Multi-node LoRA SFT and DPO enhanced training are available after an administrator configures a training resource pool and sets `MULTINODE_DOCKER_CONTAINER` on the participating Runtime nodes. The Agent supports requests such as `执行多机lora批量训练` and `执行多机增强训练`.
+
+Every machine that participates in the training job must be a Runtime node with Agent API/resource probing available. Ask an administrator to add each participating machine to the training resource pool before starting dual-node or multi-node training.
+
+If the request does not specify whether the task is SFT or DPO, Agent will ask you to choose `多机lora批量训练` or `多机增强训练`. The resource pool assigns nodes, GPU indexes, `MASTER_ADDR`, `MASTER_PORT`, and the allocation file automatically.
+
+When the user does not specify the resource shape, multi-node LoRA SFT and multi-node enhanced training both request `2` nodes and `1` GPU per node by default. Administrators can change this environment default with `MEDFLOW_MULTINODE_NODE_COUNT` and `MEDFLOW_MULTINODE_GPUS_PER_NODE`. The resource pool still decides the concrete GPU indexes according to node `allowedGpuIndexes`, current GPU availability, active reservations, and user-group quota.
+
+If you need to specify the number of GPUs per node, add `gpus-per-node` to the command:
+
+| Purpose | Natural-language example |
+| --- | --- |
+| Multi-node LoRA with default resources | `执行多机lora批量训练` |
+| Multi-node LoRA with 2 GPUs per node | `执行多机lora批量训练，gpus-per-node=2` |
+| Multi-node enhanced training with default resources | `执行多机增强训练` |
+
+Multi-node LoRA defaults to the latest model in /home/workspace/models/base and the most recent dataset. Explicit specification is required to use any other model or data.
 
 ## Medical Evaluation
 

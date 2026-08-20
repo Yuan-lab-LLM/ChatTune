@@ -27,6 +27,8 @@ import { AddResourcePoolEnabled1860000000000 } from './1860000000000-AddResource
 import { AddAuthPasswordPolicy1870000000000 } from './1870000000000-AddAuthPasswordPolicy';;
 import { AddTrainingReservationDiagnostics1880000000000 } from './1880000000000-AddTrainingReservationDiagnostics';
 import { AddTrainingReservationTaskType1890000000000 } from './1890000000000-AddTrainingReservationTaskType';
+import { AddUserGroupMultinodeContainer1900000000000 } from './1900000000000-AddUserGroupMultinodeContainer';
+import { BackfillUserGroupGrpoContainer1910000000000 } from './1910000000000-BackfillUserGroupGrpoContainer';
 
 /**
  * 所有迁移列表（按时间戳顺序）
@@ -49,6 +51,8 @@ export const migrations: (new () => MigrationInterface)[] = [
     AddAuthPasswordPolicy1870000000000,
     AddTrainingReservationDiagnostics1880000000000,
     AddTrainingReservationTaskType1890000000000,
+    AddUserGroupMultinodeContainer1900000000000,
+    BackfillUserGroupGrpoContainer1910000000000,
 ];
 
 

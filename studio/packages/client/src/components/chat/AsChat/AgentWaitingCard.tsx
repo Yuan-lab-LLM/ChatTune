@@ -398,59 +398,10 @@ export const cleanupAgentWaitingText = (text: string): string => {
     content = content.replace(/你可以直接回复[:：][\s\S]*$/m, '');
     content = content.replace(/请直接回复[:：][\s\S]*$/m, '');
     content = content.replace(/当前参数[:：][\s\S]*$/m, '');
-    if (content.includes('训练类型') || content.includes('训练方式')) {
-        content = hideMultinodeTrainingChoices(content);
-    }
 
     return content.trim();
 };
 
-
-const isHiddenMultinodeTrainingOption = (value: string): boolean => {
-    const normalized = value.trim().toLowerCase().replace(/[\s_-]+/g, '');
-    return (
-        value.includes('多机') ||
-        value.includes('双机') ||
-        normalized.includes('multinode') ||
-        normalized.includes('multi-node')
-    );
-};
-
-const filterHiddenMultinodeTrainingOptions = (options: string[]): string[] =>
-    options.filter((option) => !isHiddenMultinodeTrainingOption(option));
-
-const escapeRegExp = (value: string): string =>
-    value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-const hideMultinodeTrainingChoices = (text: string): string => {
-    let content = text;
-    const hiddenChoices = [
-        '双机 LoRA SFT',
-        '双机LoRA SFT',
-        '双机增强训练',
-        '多机LoRA批量训练',
-        '多机lora批量训练',
-        '多机增强训练',
-        'multinode_lora_sft',
-        'multinode_enhanced',
-        'Multinode LoRA Batch Training',
-        'Multinode Enhanced Training',
-    ];
-
-    for (const choice of hiddenChoices) {
-        const escapedChoice = escapeRegExp(choice);
-        content = content.replace(new RegExp(`(?:[、,，或]|\\s)+${escapedChoice}`, 'gi'), '');
-        content = content.replace(new RegExp(`${escapedChoice}(?:[、,，或]|\\s)+`, 'gi'), '');
-        content = content.replace(new RegExp(escapedChoice, 'gi'), '');
-    }
-
-    return content
-        .replace(/可选类型[:：]\s*[、,，]/g, '可选类型：')
-        .replace(/[、,，]\s*[。\.]/g, '。')
-        .replace(/(?:[、,，]\s*){2,}/g, '、')
-        .replace(/\s{2,}/g, ' ')
-        .trim();
-};
 
 const extractOptionsFromParentheses = (text: string): string[] => {
 
@@ -478,7 +429,7 @@ const resourceContainerFromProtocol = (protocol: AgentUiProtocol): string | unde
 const inferQuickReplies = (text: string, fields: string[]): string[] => {
     const replies: string[] = [];
     if (text.includes('训练类型') || text.includes('训练方式')) {
-        replies.push('lora批量训练', '全参批量训练', '增强训练', 'grpo训练');
+        replies.push('lora批量训练', '全参批量训练', '增强训练', 'grpo训练', '双机 LoRA SFT', '双机增强训练');
     }
 
     if (text.includes('评估方式') || text.includes('评估类型') || text.includes('评测方式')) {
@@ -495,7 +446,6 @@ const inferQuickReplies = (text: string, fields: string[]): string[] => {
 
     return unique([...extractOptionsFromParentheses(text), ...extractBacktickOptions(text), ...replies])
         .filter(isDirectReplyOption)
-        .filter((reply) => !isHiddenMultinodeTrainingOption(reply))
         .filter((reply) => {
             if (fields.includes('data_type') && fields.includes('strategy')) {
                 return !/(?:data_type|strategy)\s*=/.test(reply);
@@ -535,9 +485,7 @@ export const parseAgentWaitingPrompt = (
             scriptName === 'data_preprocessing' &&
             fields.includes('data_type') &&
             fields.includes('strategy');
-        const explicitOptions = filterHiddenMultinodeTrainingOptions(
-            (protocol.options || []).filter(isDirectReplyOption),
-        );
+        const explicitOptions = (protocol.options || []).filter(isDirectReplyOption);
         const quickReplies = unique(
             explicitOptions.length > 0
                 ? explicitOptions
@@ -570,7 +518,7 @@ export const parseAgentWaitingPrompt = (
             quickReplies,
             fields,
             resourceContainer: resourceContainerFromProtocol(protocol),
-            options: filterHiddenMultinodeTrainingOptions(protocol.options || []),
+            options: protocol.options || [],
             knownParams,
             scriptName,
             detectedFormat,

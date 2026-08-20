@@ -49,7 +49,7 @@
 
 1. 创建资源池。
 2. 添加资源池节点。
-3. 配置每个节点的 `sshAlias`、`trainAddress`、允许 GPU 索引和可选 `ncclSocketIfname`。
+3. 配置每个节点的 `sshAlias`、`trainAddress`、允许 GPU 索引和可选 `ncclSocketIfname`。使用多机训练时，ncclSocketIfname为必须项。
 4. 配置用户组配额：归属节点、保底 GPU 数、最大 GPU 数、最大并发任务数和单任务最大节点数。
 5. 查看预约列表，处理过期或异常预约。
 

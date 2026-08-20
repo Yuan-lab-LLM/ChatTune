@@ -77,6 +77,12 @@ const getEnvironmentDefaultGrpoContainerName = () =>
     process.env.MEDFLOW_GRPO_CONTAINER?.trim() ||
     '';
 
+const getEnvironmentDefaultMultinodeContainerName = () =>
+    process.env.MULTINODE_DOCKER_CONTAINER?.trim() ||
+    process.env.MEDFLOW_MULTINODE_DOCKER_CONTAINER?.trim() ||
+    process.env.MEDFLOW_LOCAL_MULTINODE_CONTAINER?.trim() ||
+    '';
+
 const resolveConfigValue = (value: string): string => {
     const trimmedValue = value.trim().replace(/^['"]|['"]$/g, '');
     const envPattern = /^\$\{([A-Z0-9_]+)(?::([^}]*))?\}$/;
@@ -139,6 +145,9 @@ export const ServerConfig = {
         defaultGrpoContainerName:
             getEnvironmentDefaultGrpoContainerName() ||
             DEFAULT_ENVIRONMENT_CONFIG.defaultGrpoContainerName,
+        defaultMultinodeContainerName:
+            getEnvironmentDefaultMultinodeContainerName() ||
+            DEFAULT_ENVIRONMENT_CONFIG.defaultMultinodeContainerName,
     },
 } as const;
 
@@ -221,6 +230,14 @@ export class ConfigManager {
         return value;
     }
 
+    private getUserDefaultMultinodeContainerName(): string {
+        const value = this.config.environment?.defaultMultinodeContainerName?.trim();
+        if (!value || value === DEFAULT_ENVIRONMENT_CONFIG.defaultMultinodeContainerName) {
+            return '';
+        }
+        return value;
+    }
+
     getDefaultContainerName(): string {
         this.reloadUserConfig();
         return (
@@ -248,6 +265,15 @@ export class ConfigManager {
             getEnvironmentDefaultGrpoContainerName() ||
             this.getUserDefaultGrpoContainerName() ||
             DEFAULT_ENVIRONMENT_CONFIG.defaultGrpoContainerName
+        );
+    }
+
+    getDefaultMultinodeContainerName(): string {
+        this.reloadUserConfig();
+        return (
+            getEnvironmentDefaultMultinodeContainerName() ||
+            this.getUserDefaultMultinodeContainerName() ||
+            DEFAULT_ENVIRONMENT_CONFIG.defaultMultinodeContainerName
         );
     }
 

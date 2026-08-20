@@ -16,6 +16,7 @@ Healthcare-ready out of the box and extensible to general-purpose model training
 
 ## What's New
 
+- [2026-08-20] Multi-node training is supported.
 - [2026-08-13] Inference is now managed through the resource pool, and the base training image was updated with LLaMA-Factory upgraded to 0.9.5.
 - [2026-07-29] Initial release.
 
@@ -131,6 +132,7 @@ Open `runtime.env` and verify at least:
 | Setting | Purpose |
 | --- | --- |
 | `MEDFLOW_LOCAL_TRAINING_CONTAINER` | Container for LoRA, full-parameter, DPO, and related training jobs. |
+| `MULTINODE_DOCKER_CONTAINER` | Dedicated LLaMAFactory container for multi-node LoRA SFT and DPO enhanced training. |
 | `MEDFLOW_LOCAL_EVALUATE_CONTAINER` | Container for model evaluation and inference-related jobs. |
 | `MEDFLOW_LOCAL_GRPO_CONTAINER` | GRPO/verl task container. |
 | `MODEL_NAME` / `MODEL_API_KEY` / `MODEL_BASE_URL` | OpenAI-compatible endpoint used by the agent. |
@@ -183,7 +185,7 @@ When required values are missing, the agent explains the fields and asks for the
 | Center node | Runs Studio and Bridge, with an optional local Agent API | `bash runtime.sh init --profile center --nodes ...` |
 | Compute node | Runs the Agent API, resource probes, and task containers | `bash runtime.sh init --profile node ...` |
 
-See [Multi-node Configuration](docs/MULTI_NODE.md) for tokens, URLs, and startup order. The current user guide marks multi-machine training as a later-stage capability; multi-node Runtime and multi-node inference should not be confused with distributed training.
+See [Multi-node Configuration](docs/MULTI_NODE.md) for tokens, URLs, startup order, and the resource-pool settings required by multi-node training. Distributed training uses the dedicated `MULTINODE_DOCKER_CONTAINER` and Studio-issued GPU reservations; multi-node Runtime and multi-node inference are related deployment modes but are configured separately.
 
 ## Adapting MedFlow to another domain
 

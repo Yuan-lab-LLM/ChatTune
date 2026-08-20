@@ -23,6 +23,17 @@ import {
 
 const DEFAULT_GROUP_ID = 'default-users';
 const SAFE_CONTAINER_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+const defaultMultinodeContainerName = () =>
+    process.env.MULTINODE_DOCKER_CONTAINER?.trim() ||
+    process.env.MEDFLOW_MULTINODE_DOCKER_CONTAINER?.trim() ||
+    process.env.MEDFLOW_LOCAL_MULTINODE_CONTAINER?.trim() ||
+    'qingnang_train_multi';
+const defaultGrpoContainerName = () =>
+    process.env.MEDFLOW_LOCAL_GRPO_CONTAINER?.trim() ||
+    process.env.MEDFLOW_GRPO_DOCKER_CONTAINER?.trim() ||
+    process.env.MEDFLOW_GRPO_CONTAINER?.trim() ||
+    process.env.AGENT3_DEFAULT_GRPO_DOCKER_CONTAINER?.trim() ||
+    'qingnang_grpo';
 
 export class ResourceAccessService {
     static async ensureDefaultGroup() {
@@ -35,8 +46,8 @@ export class ResourceAccessService {
                 defaultContainerName: process.env.AGENT3_DEFAULT_DOCKER_CONTAINER?.trim() || 'training_container',
                 defaultEvaluateContainerName:
                     process.env.AGENT3_DEFAULT_EVALUATE_DOCKER_CONTAINER?.trim() || 'evaluation_container',
-                defaultGrpoContainerName:
-                    process.env.AGENT3_DEFAULT_GRPO_DOCKER_CONTAINER?.trim() || 'grpo_container',
+                defaultGrpoContainerName: defaultGrpoContainerName(),
+                defaultMultinodeContainerName: defaultMultinodeContainerName(),
             });
             await group.save();
         }
@@ -90,6 +101,8 @@ export class ResourceAccessService {
             evaluationContainerError: nodeAssignments.find((item) => item.groupId === group.id)?.evaluationContainerError || null,
             grpoContainerStatus: nodeAssignments.find((item) => item.groupId === group.id)?.grpoContainerStatus || null,
             grpoContainerError: nodeAssignments.find((item) => item.groupId === group.id)?.grpoContainerError || null,
+            multinodeContainerStatus: nodeAssignments.find((item) => item.groupId === group.id)?.multinodeContainerStatus || null,
+            multinodeContainerError: nodeAssignments.find((item) => item.groupId === group.id)?.multinodeContainerError || null,
         }));
     }
 
@@ -98,12 +111,14 @@ export class ResourceAccessService {
         defaultContainerName: string,
         defaultEvaluateContainerName: string,
         defaultGrpoContainerName: string,
+        defaultMultinodeContainerName: string,
         description?: string,
     ) {
         const containerName = await this.validateAvailableContainerName(defaultContainerName);
         const evaluateContainerName = await this.validateAvailableContainerName(defaultEvaluateContainerName);
         const grpoContainerName = await this.validateAvailableContainerName(defaultGrpoContainerName);
-        if (new Set([containerName, evaluateContainerName, grpoContainerName]).size !== 3) {
+        const multinodeContainerName = await this.validateAvailableContainerName(defaultMultinodeContainerName);
+        if (new Set([containerName, evaluateContainerName, grpoContainerName, multinodeContainerName]).size !== 4) {
             throw new Error('auth.error.containerRolesMustDiffer');
         }
         const group = UserGroupTable.create({
@@ -113,6 +128,7 @@ export class ResourceAccessService {
             defaultContainerName: containerName,
             defaultEvaluateContainerName: evaluateContainerName,
             defaultGrpoContainerName: grpoContainerName,
+            defaultMultinodeContainerName: multinodeContainerName,
         });
         return group.save();
     }
@@ -126,7 +142,11 @@ export class ResourceAccessService {
             groupId,
             assignment?.nodeId,
         );
-        if (containerName === group.defaultEvaluateContainerName || containerName === group.defaultGrpoContainerName) {
+        if (
+            containerName === group.defaultEvaluateContainerName ||
+            containerName === group.defaultGrpoContainerName ||
+            containerName === group.defaultMultinodeContainerName
+        ) {
             throw new Error('auth.error.containerRolesMustDiffer');
         }
         if (assignment) await this.assertContainerReady(assignment.nodeId, containerName);
@@ -145,7 +165,11 @@ export class ResourceAccessService {
             groupId,
             assignment?.nodeId,
         );
-        if (containerName === group.defaultContainerName || containerName === group.defaultGrpoContainerName) {
+        if (
+            containerName === group.defaultContainerName ||
+            containerName === group.defaultGrpoContainerName ||
+            containerName === group.defaultMultinodeContainerName
+        ) {
             throw new Error('auth.error.containerRolesMustDiffer');
         }
         if (assignment) await this.assertContainerReady(assignment.nodeId, containerName);
@@ -164,11 +188,38 @@ export class ResourceAccessService {
             groupId,
             assignment?.nodeId,
         );
-        if (containerName === group.defaultContainerName || containerName === group.defaultEvaluateContainerName) {
+        if (
+            containerName === group.defaultContainerName ||
+            containerName === group.defaultEvaluateContainerName ||
+            containerName === group.defaultMultinodeContainerName
+        ) {
             throw new Error('auth.error.containerRolesMustDiffer');
         }
         if (assignment) await this.assertContainerReady(assignment.nodeId, containerName);
         group.defaultGrpoContainerName = containerName;
+        await group.save();
+        if (assignment) await this.validateGroupContainers(groupId, assignment);
+        return group;
+    }
+
+    static async setGroupMultinodeContainer(groupId: string, defaultMultinodeContainerName: string) {
+        const group = await UserGroupTable.findOne({ where: { id: groupId } });
+        if (!group) throw new Error('auth.error.groupNotFound');
+        const assignment = await GroupNodeAssignmentTable.findOne({ where: { groupId } });
+        const containerName = await this.validateAvailableContainerName(
+            defaultMultinodeContainerName,
+            groupId,
+            assignment?.nodeId,
+        );
+        if (
+            containerName === group.defaultContainerName ||
+            containerName === group.defaultEvaluateContainerName ||
+            containerName === group.defaultGrpoContainerName
+        ) {
+            throw new Error('auth.error.containerRolesMustDiffer');
+        }
+        if (assignment) await this.assertContainerReady(assignment.nodeId, containerName);
+        group.defaultMultinodeContainerName = containerName;
         await group.save();
         if (assignment) await this.validateGroupContainers(groupId, assignment);
         return group;
@@ -214,6 +265,7 @@ export class ResourceAccessService {
                 { id: In(otherGroupIds), defaultContainerName: containerName },
                 { id: In(otherGroupIds), defaultEvaluateContainerName: containerName },
                 { id: In(otherGroupIds), defaultGrpoContainerName: containerName },
+                { id: In(otherGroupIds), defaultMultinodeContainerName: containerName },
             ],
         });
         if (existing) {
@@ -235,6 +287,11 @@ export class ResourceAccessService {
     static async getDefaultGrpoContainerForUser(user: SafeAuthUser) {
         if (user.role === UserRole.ADMIN) return null;
         return (await this.getGroupForUser(user.id))?.defaultGrpoContainerName || null;
+    }
+
+    static async getDefaultMultinodeContainerForUser(user: SafeAuthUser) {
+        if (user.role === UserRole.ADMIN) return null;
+        return (await this.getGroupForUser(user.id))?.defaultMultinodeContainerName || null;
     }
 
     static async resolveContainerForUser(user: SafeAuthUser, requestedContainer: string, adminDefault: string) {
@@ -337,9 +394,11 @@ export class ResourceAccessService {
             await this.validateAvailableContainerName(group.defaultContainerName, groupId, nodeId);
             await this.validateAvailableContainerName(group.defaultEvaluateContainerName, groupId, nodeId);
             await this.validateAvailableContainerName(group.defaultGrpoContainerName, groupId, nodeId);
+            await this.validateAvailableContainerName(group.defaultMultinodeContainerName, groupId, nodeId);
             await this.assertContainerReady(nodeId, group.defaultContainerName);
             await this.assertContainerReady(nodeId, group.defaultEvaluateContainerName);
             await this.assertContainerReady(nodeId, group.defaultGrpoContainerName);
+            await this.assertContainerReady(nodeId, group.defaultMultinodeContainerName);
         }
         await GroupNodeAssignmentTable.delete({ groupId });
         if (!nodeId) return null;
@@ -353,6 +412,8 @@ export class ResourceAccessService {
             evaluationContainerError: null,
             grpoContainerStatus: 'pending',
             grpoContainerError: null,
+            multinodeContainerStatus: 'pending',
+            multinodeContainerError: null,
         }).save();
         return this.validateGroupContainers(groupId, assignment);
     }
@@ -372,6 +433,8 @@ export class ResourceAccessService {
         assignment.evaluationContainerError = null;
         assignment.grpoContainerStatus = 'pending';
         assignment.grpoContainerError = null;
+        assignment.multinodeContainerStatus = 'pending';
+        assignment.multinodeContainerError = null;
         await assignment.save();
         const validate = async (container: string) =>
             remoteResourceClient.request<{ data: { exists: boolean; running: boolean } }>(
@@ -379,15 +442,16 @@ export class ResourceAccessService {
                 'containers/status',
                 { method: 'POST', body: JSON.stringify({ container }) },
             );
-        const [training, evaluation, grpo] = await Promise.allSettled([
+        const [training, evaluation, grpo, multinode] = await Promise.allSettled([
             validate(group.defaultContainerName),
             validate(group.defaultEvaluateContainerName),
             validate(group.defaultGrpoContainerName),
+            validate(group.defaultMultinodeContainerName),
         ]);
         const apply = (
             result: PromiseSettledResult<{ data: { exists: boolean; running: boolean } }>,
-            statusKey: 'trainingContainerStatus' | 'evaluationContainerStatus' | 'grpoContainerStatus',
-            errorKey: 'trainingContainerError' | 'evaluationContainerError' | 'grpoContainerError',
+            statusKey: 'trainingContainerStatus' | 'evaluationContainerStatus' | 'grpoContainerStatus' | 'multinodeContainerStatus',
+            errorKey: 'trainingContainerError' | 'evaluationContainerError' | 'grpoContainerError' | 'multinodeContainerError',
         ) => {
             if (result.status === 'fulfilled' && result.value.data.exists && result.value.data.running) {
                 assignment[statusKey] = 'ready';
@@ -401,6 +465,7 @@ export class ResourceAccessService {
         apply(training, 'trainingContainerStatus', 'trainingContainerError');
         apply(evaluation, 'evaluationContainerStatus', 'evaluationContainerError');
         apply(grpo, 'grpoContainerStatus', 'grpoContainerError');
+        apply(multinode, 'multinodeContainerStatus', 'multinodeContainerError');
         return assignment.save();
     }
 

@@ -8,7 +8,7 @@ This guide only covers container, image, and workspace mount preparation for the
 - `agent-studio-runtime-bridge/`: bridge service between Studio and Agent API backends.
 - `agent/`: Agent API, workflow orchestration, resource probing, task routing, and internal resource APIs.
 - `runtime.sh`: initialization, checks, start/stop commands, status, and log scripts.
-- `docker_scripts/`: scripts for creating Agent, training, evaluation/inference, and GRPO containers.
+- `docker_scripts/`: scripts for creating Agent, training, multi-node training, evaluation/inference, and GRPO containers.
 - `medflow/`: MedFlow inference services, inference operations Agent, tests, and benchmark code.
 
 ## Images and Resources
@@ -28,6 +28,7 @@ Future training image updates will be released as patch packages. Download the c
 | Resource | Link | Notes |
 | --- | --- | --- |
 | Training image patch package-0813 | https://pan.quark.cn/s/db69395cbde7 | Extraction code: 6K2h |
+| Training image patch package-0820 | https://pan.quark.cn/s/609582f1f4c9 | Extraction code: 68uc |
 
 ## Container Types
 
@@ -35,6 +36,7 @@ Future training image updates will be released as patch packages. Download the c
 | --- | --- | --- |
 | Agent container | single machine, center node, or compute node | Mounts the code directory and runs Runtime, Agent API, resource probing, Studio, or Bridge. |
 | General training task container | GPU compute node | Runs LoRA, full-parameter, DPO, and other standard training tasks. |
+| Multi-node training task container | GPU compute node | Runs multi-node LoRA SFT and DPO enhanced training tasks. |
 | Evaluation/inference task container | GPU compute node | Runs model evaluation and inference-service tasks. |
 | GRPO/verl task container | GPU compute node | Runs GRPO training and related data/model operations. |
 
@@ -44,6 +46,7 @@ Before running the container creation scripts, replace their default parameters.
 | --- | --- | --- |
 | Agent container | `docker_scripts/create_agent_docker.sh` | `AGENT_CONTAINER_NAME`, `AGENT_IMAGE`, `HOST_WORKSPACE` |
 | General training task container | `docker_scripts/create_training_dockers.sh` | `HOST_IP`, `TRAIN_IMAGE`, `TRAIN_CONTAINER_NAME`, `HOST_WORKSPACE` |
+| Multi-node training task container | `docker_scripts/create_multinode_training_dockers.sh` | `HOST_IP`, `TRAIN_IMAGE`, `TRAIN_CONTAINER_NAME`, `HOST_WORKSPACE` |
 | Evaluation/inference task container | `docker_scripts/create_inference_docker.sh` | `HOST_IP`, `IMAGE_NAME`, `IMAGE_VERSION`, `DOCKER_NAME`, `HOST_WORKSPACE` |
 | GRPO/verl task container | `docker_scripts/create_grpo_docker.sh` | `HOST_IP`, `GRPO_IMAGE`, `GRPO_CONTAINER_NAME`, `HOST_WORKSPACE` |
 
@@ -87,7 +90,7 @@ When creating the container, the host directory mounted through `HOST_WORKSPACE`
 
 ### Note
 
-Training tasks use Weights & Biases to record metrics. After creating the two training containers above and before the first online training run, log in inside the training container:
+Training tasks use Weights & Biases to record metrics. After creating the general training container, multi-node training container, or GRPO/verl container and before the first online training run, log in inside the corresponding training container:
 
 ```bash
 wandb login
@@ -97,6 +100,74 @@ Notes:
 
 - W&B login information is stored in the current user configuration inside the container. Recreate the container means logging in again.
 - If login fails, check network connectivity inside the container.
+
+## Multi-node Training Container Preparation
+
+The multi-node training container uses the same base mounts and creation flow as the general training container. After creation, besides running `wandb login`, install `openssh-server` and `pdsh` in every container that participates in multi-node training, then run `setup_multinode_ssh.sh` to configure sshd and node trust.
+
+Before starting multi-node training, confirm that every participating machine's multi-node training Docker container has the same dataset and base model at the same container paths. For example, if the master node uses `/home/workspace/dataset_batch_train/my_sft` and `/home/workspace/models/base/qwen3`, the worker containers must also contain identical content at those exact paths; matching only the host path, or preparing the data/model on only one machine, is not sufficient.
+
+Install SSH/pdsh dependencies and set the root password in both training containers first:
+
+```bash
+apt update
+apt install openssh-server -y
+apt install -y pdsh
+passwd
+```
+
+Check whether pdsh passes the security check:
+
+```bash
+stat -c '%U:%G %a %n' /usr /usr/lib /usr/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu/pdsh
+```
+
+Normally these directories should be owned by `root:root` and must not be writable by group or other users. To fix them directly, run:
+
+```bash
+chown root:root /usr /usr/lib /usr/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu/pdsh
+chmod go-w /usr /usr/lib /usr/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu/pdsh
+```
+
+Then prepare local sshd on both sides:
+
+```bash
+# 主节点容器
+bash setup_multinode_ssh.sh \
+  --user root \
+  --self-node ds35 \
+  --nodes ds35,ds36 \
+  --hosts <ds35-host>,<ds36-host> \
+  --ports 2222,2222 \
+  --slots 4 \
+  --prepare-only
+```
+
+```bash
+# 从节点容器
+bash setup_multinode_ssh.sh \
+  --user root \
+  --self-node ds36 \
+  --nodes ds35,ds36 \
+  --hosts <ds35-host>,<ds36-host> \
+  --ports 2222,2222 \
+  --slots 4 \
+  --prepare-only
+```
+
+Then run the full mutual-trust setup on both sides:
+
+```bash
+bash setup_multinode_ssh.sh \
+  --user root \
+  --self-node ds35 \
+  --nodes ds35,ds36 \
+  --hosts <ds35-host>,<ds36-host> \
+  --ports 2222,2222 \
+  --slots 4
+```
+
+On the worker node, change `--self-node ds35` to `--self-node ds36`.
 
 ## Evaluation/Inference Container Mounts
 

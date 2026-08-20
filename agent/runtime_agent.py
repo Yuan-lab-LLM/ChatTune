@@ -251,6 +251,11 @@ from medflow_agent_tools.runlocal_train import (
     _release_resource_allocation,
     _runtime_training_resource_request,
 )
+from resource_api import (
+    _read_training_allocation,
+    _stop_multinode_allocation_processes,
+    _training_allocation_file_from_record,
+)
 
 def _model_generate_kwargs() -> Dict[str, Any]:
     generate_kwargs = config.model.generate_kwargs
@@ -554,6 +559,10 @@ REQUEST_EVALUATION_CONTAINER: ContextVar[str] = ContextVar(
 REQUEST_GRPO_CONTAINER: ContextVar[str] = ContextVar(
     "request_grpo_container",
     default=DEFAULT_DOCKER_CONTAINER,
+)
+REQUEST_MULTINODE_TRAINING_CONTAINER: ContextVar[str] = ContextVar(
+    "request_multinode_training_container",
+    default="",
 )
 REQUEST_RESOURCE_GROUP_ID: ContextVar[str] = ContextVar(
     "request_resource_group_id",
@@ -903,6 +912,10 @@ def _current_grpo_container() -> str:
     return REQUEST_GRPO_CONTAINER.get() or _current_training_container()
 
 
+def _current_multinode_training_container() -> str:
+    return REQUEST_MULTINODE_TRAINING_CONTAINER.get() or MULTINODE_DOCKER_CONTAINER
+
+
 def _current_resource_group_id() -> str:
     return REQUEST_RESOURCE_GROUP_ID.get() or os.getenv("MEDFLOW_RESOURCE_GROUP_ID", "")
 
@@ -920,6 +933,23 @@ def _is_grpo_training_query(script_query: str) -> bool:
 def _is_special_training_query(script_query: str) -> bool:
     normalized = str(script_query or "").lower()
     return any(keyword in normalized for keyword in ["grpo", "多机", "multinode"])
+
+
+def _is_multinode_training_query(script_query: str) -> bool:
+    normalized = str(script_query or "").lower()
+    return any(
+        keyword in normalized
+        for keyword in [
+            "train_multinode_sft_pipeline",
+            "train_multinode_dpo_pipeline",
+            "多机",
+            "双机",
+            "multinode",
+            "multi-node",
+            "2node",
+            "two-node",
+        ]
+    )
 
 
 def _owner_aliases_from_any(value: Any) -> list[str]:
@@ -1038,6 +1068,12 @@ def run_group_train(script_query: str, *args, **kwargs):
         additional_args = dict(kwargs.get("additional_args") or {})
         additional_args.setdefault("container", container)
         kwargs["additional_args"] = additional_args
+    elif _is_multinode_training_query(script_query):
+        container = _current_multinode_training_container()
+        env_vars.setdefault("container", container)
+        additional_args = dict(kwargs.get("additional_args") or {})
+        additional_args.setdefault("container", container)
+        kwargs["additional_args"] = additional_args
     elif not _is_special_training_query(script_query):
         container = _current_training_container()
         env_vars.setdefault("container", container)
@@ -1109,7 +1145,10 @@ def _workflow_training_container(workflow: Dict[str, Any]) -> str:
     if explicit:
         return explicit
     if context.get("launch_mode") == "multinode":
-        return MULTINODE_DOCKER_CONTAINER
+        return (
+            str(context.get("multinode_training_container") or "").strip()
+            or _current_multinode_training_container()
+        )
     if str(context.get("train_type") or "").lower() == "grpo":
         return str(context.get("grpo_container") or "").strip() or _current_grpo_container()
     return str(context.get("training_container") or "").strip() or _current_training_container()
@@ -3422,6 +3461,7 @@ class OrchestratorSystem:
         self.training_container = DEFAULT_DOCKER_CONTAINER
         self.evaluation_container = DEFAULT_EVALUATE_DOCKER_CONTAINER
         self.grpo_container = DEFAULT_DOCKER_CONTAINER
+        self.multinode_training_container = MULTINODE_DOCKER_CONTAINER
         self.shared_model = shared_model
         self.agents: Dict[str, Agent] = {}
         self.orchestrator: Optional[Agent] = None
@@ -4084,10 +4124,53 @@ class OrchestratorSystem:
             return explicit_container
         if self._infer_train_type(text) == "grpo":
             return self.grpo_container
-        return MULTINODE_DOCKER_CONTAINER if self._is_multinode_training_request(text) else self.training_container
+        return self.multinode_training_container if self._is_multinode_training_request(text) else self.training_container
 
     def _extract_multinode_cli_args(self, text: str) -> Dict[str, str]:
         args: Dict[str, str] = {}
+        aliases = {
+            "model_path": "model-path",
+            "MODEL_PATH": "model-path",
+            "base_model_path": "model-path",
+            "dataset_dir": "dataset-dir",
+            "data_dir": "dataset-dir",
+            "sft_data_dir": "dataset-dir",
+            "sft_dataset_dir": "dataset-dir",
+            "dataset_name": "dataset",
+            "dataset-name": "dataset",
+            "data_identifier": "dataset-date",
+            "dataset_date": "dataset-date",
+            "data_id": "dataset-date",
+            "dataset_id": "dataset-date",
+            "MBS": "batch-size",
+            "mbs": "batch-size",
+            "batch_size": "batch-size",
+            "ACC": "acc",
+            "gradient_accumulation_steps": "acc",
+            "LR": "learning-rate",
+            "learning_rate": "learning-rate",
+            "TEM": "template",
+            "tem": "template",
+            "RESUME": "resume-from-checkpoint",
+            "resume_from_checkpoint": "resume-from-checkpoint",
+            "gpus_per_node": "gpus-per-node",
+            "node_count": "node-count",
+            "resource_pool_id": "resource-pool-id",
+            "resource_group_id": "resource-group-id",
+        }
+
+        def canonical_key(raw_key: str) -> str:
+            key = (raw_key or "").strip()
+            if not key:
+                return key
+            return aliases.get(key) or aliases.get(key.lower()) or key.replace("_", "-")
+
+        def set_arg(raw_key: str, raw_value: str) -> None:
+            key = canonical_key(raw_key)
+            value = str(raw_value or "").strip().rstrip("\\")
+            if key and value:
+                args[key] = value
+
         boolean_params = {
             "no-python",
             "skip-preflight",
@@ -4105,7 +4188,16 @@ class OrchestratorSystem:
                 continue
             value = next((group for group in match.groups()[1:] if group is not None), "")
             if value:
-                args[key] = value.strip().rstrip("\\")
+                set_arg(key, value)
+
+        for match in re.finditer(
+            r"\b([A-Za-z][A-Za-z0-9_-]*)\s*=\s*(/[^\s,，;；]+|[A-Za-z0-9_.:+-]+)",
+            text or "",
+        ):
+            key = match.group(1).strip()
+            if key == "extra-train-args":
+                continue
+            set_arg(key, match.group(2))
 
         for key in boolean_params:
             if re.search(rf"--{re.escape(key)}(?:\s|$)", text or "") and key not in args:
@@ -4113,7 +4205,23 @@ class OrchestratorSystem:
 
         named_values = self._extract_named_param_values(text)
         for key, value in named_values.items():
-            args.setdefault(key, value)
+            mapped_key = canonical_key(key)
+            args.setdefault(mapped_key, value)
+
+        natural_patterns = {
+            "model-path": r"(?:模型路径|模型位置|基础模型路径|模型在)\s*(?:是|为|=|:)?\s*(/[^\s,，;；]+)",
+            "dataset-dir": r"(?:数据集路径|数据路径|数据集目录|数据目录|数据集位置|数据位置)\s*(?:是|为|=|:)?\s*(/[^\s,，;；]+)",
+            "batch-size": r"(?:批量大小|批次大小|批大小|mbs)\s*(?:是|为|=|:)?\s*([0-9]+)",
+            "acc": r"(?:梯度累积|梯度累计|累积步数|acc)\s*(?:是|为|=|:)?\s*([0-9]+)",
+            "learning-rate": r"(?:学习率|学习速率|lr)\s*(?:是|为|=|:)?\s*([0-9.eE+-]+)",
+            "template": r"(?:模型模板|模型类别|tem)\s*(?:是|为|=|:)?\s*([A-Za-z0-9_.-]+)",
+        }
+        for key, pattern in natural_patterns.items():
+            if key in args:
+                continue
+            match = re.search(pattern, text or "", re.IGNORECASE)
+            if match:
+                args[key] = match.group(1).strip()
 
         container = self._extract_container_override(text)
         if container:
@@ -5984,8 +6092,9 @@ class OrchestratorSystem:
         job_type = str(protocol.get("jobType") or "").strip().lower()
         agent_name = str(protocol.get("agent") or "").strip().lower()
         is_assessment = job_type in {"assessment", "evaluate"} or agent_name == "assessment_monitor"
-        train_type_raw = str(protocol.get("trainType") or "").strip()
-        train_type = train_type_map.get(train_type_raw.lower(), train_type_raw)
+        train_type_text_raw = str(protocol.get("trainTypeText") or "").strip()
+        train_type_raw = str(protocol.get("trainTypeEn") or protocol.get("trainType") or "").strip()
+        train_type = train_type_text_raw or train_type_map.get(train_type_raw.lower(), train_type_raw)
         assessment_type_raw = str(
             protocol.get("assessmentTypeText")
             or protocol.get("evalTypeText")
@@ -9077,6 +9186,49 @@ class OrchestratorSystem:
                 unique.append(pattern)
         return unique
 
+    def _stop_multinode_training_record_processes(
+        self,
+        container: Optional[str],
+        record: Optional[Dict[str, Any]],
+        stop_output: str = "",
+    ) -> str:
+        if not container:
+            return ""
+        allocation_file = _training_allocation_file_from_record(record or {})
+        if not allocation_file and stop_output:
+            match = re.search(r"--allocation-file(?:=|\s+)(\S+)", stop_output)
+            if match:
+                allocation_file = match.group(1).strip("'\"")
+        if not allocation_file:
+            return ""
+        allocation = _read_training_allocation(container, allocation_file)
+        stop_result = _stop_multinode_allocation_processes(container, allocation)
+        lines = [f"多机训练节点清理: allocation={allocation_file}"]
+        remaining = stop_result.get("remainingGpuPids") or []
+        for node in stop_result.get("nodeStopResults") or []:
+            before = node.get("before") or []
+            node_remaining = node.get("remaining") or []
+            lines.append(
+                "节点 {alias}({mode}) GPU[{gpus}] 清理前 {before_count} 个训练进程，残留 {remaining_count} 个".format(
+                    alias=node.get("sshAlias") or node.get("nodeId") or "<unknown>",
+                    mode=node.get("executionMode") or "unknown",
+                    gpus=",".join(str(gpu) for gpu in (node.get("gpuIndexes") or [])),
+                    before_count=len(before),
+                    remaining_count=len(node_remaining),
+                )
+            )
+        if remaining:
+            remaining_pids = []
+            for item in remaining:
+                pid = str(item.get("pid") or "").strip()
+                if pid and pid not in remaining_pids:
+                    remaining_pids.append(pid)
+            pid_summary = ", ".join(remaining_pids) or "; ".join(str(item) for item in remaining[:3])
+            lines.append(f"仍发现残留 PID: {pid_summary}")
+        else:
+            lines.append("多机训练 GPU worker 已完成清理。")
+        return "\n".join(lines)
+
     def _default_train_stop_patterns(self) -> List[str]:
         return [
             "train_multinode_sft_pipeline",
@@ -10048,6 +10200,10 @@ exit 0
                             )
                     else:
                         result = "结束指令已发送；虽然等待命令返回超时，但复查未发现残留进程，任务已完成清理。"
+                multinode_stop_result = self._stop_multinode_training_record_processes(container, record, result)
+                multinode_remaining = "仍发现残留 PID" in multinode_stop_result
+                if multinode_stop_result:
+                    result = f"{result}\n{multinode_stop_result}"
                 stopped_task_type = self._task_type_from_stop_result(result)
                 if stopped_task_type == "assessment":
                     assessment_patterns = self._all_stop_patterns_for_type("assessment")
@@ -10062,12 +10218,13 @@ exit 0
                     self.pending_parameters.clear()
                     extra = f"\n\n{worker_result}" if worker_result else ""
                     return f"已发送结束模型评估指令。\n容器: {container}\nPID: {pid}\n{result}{extra}"
-                self._release_stopped_gpu_reservations(
-                    {"train"},
-                    container,
-                    pid=pid,
-                    fallback_patterns=train_fallback_patterns,
-                )
+                if not multinode_remaining:
+                    self._release_stopped_gpu_reservations(
+                        {"train"},
+                        container,
+                        pid=pid,
+                        fallback_patterns=train_fallback_patterns,
+                    )
                 self.current_task_state = {"status": "idle"}
                 self.pending_parameters.clear()
                 return f"已发送结束训练指令。\n容器: {container}\nPID: {pid}\n{result}"
@@ -10984,7 +11141,7 @@ exit 0
         values = self._extract_named_param_values(message)
         launch_mode = "multinode" if self._is_multinode_training_request(message) else "single"
         container = self._extract_container_override(message) or (
-            MULTINODE_DOCKER_CONTAINER
+            self.multinode_training_container
             if launch_mode == "multinode"
             else self.training_container
         )
@@ -11027,7 +11184,7 @@ exit 0
         launch_mode = "multinode" if self._is_multinode_training_request(message) else "single"
         container = self._extract_container_override(message)
         request_container = container or (
-            MULTINODE_DOCKER_CONTAINER
+            self.multinode_training_container
             if launch_mode == "multinode"
             else self.training_container
         )
@@ -11074,6 +11231,7 @@ exit 0
                 "training_container": self.training_container,
                 "evaluation_container": self.evaluation_container,
                 "grpo_container": self.grpo_container,
+                "multinode_training_container": self.multinode_training_container,
                 "resource_group_id": _current_resource_group_id().strip(),
                 "training_pool_id": _current_training_pool_id().strip(),
                 "train_args": self._workflow_batch_train_args(message),
@@ -11104,6 +11262,7 @@ exit 0
             "training_container": self.training_container,
             "evaluation_container": self.evaluation_container,
             "grpo_container": self.grpo_container,
+            "multinode_training_container": self.multinode_training_container,
             "resource_group_id": _current_resource_group_id().strip(),
             "training_pool_id": _current_training_pool_id().strip(),
             "model_path": model_path,
@@ -12714,6 +12873,7 @@ async def process_user_message_structured(
     training_container: str = "",
     evaluation_container: str = "",
     grpo_container: str = "",
+    multinode_training_container: str = "",
     resource_group_id: str = "",
     training_pool_id: str = "",
     user_role: str = "",
@@ -12728,17 +12888,19 @@ async def process_user_message_structured(
     resolved_training_container = training_container.strip() or DEFAULT_DOCKER_CONTAINER
     resolved_evaluation_container = evaluation_container.strip() or DEFAULT_EVALUATE_DOCKER_CONTAINER
     resolved_grpo_container = grpo_container.strip() or resolved_training_container
+    resolved_multinode_training_container = multinode_training_container.strip() or MULTINODE_DOCKER_CONTAINER
     resolved_resource_group_id = resource_group_id.strip()
     resolved_training_pool_id = training_pool_id.strip()
     resolved_user_role = user_role.strip().lower()
     resolved_owner_user_id = str(owner_user_id or "").strip()
     resolved_owner_aliases = _owner_aliases_from_any(owner_aliases)
     logger.info(
-        "用户%s; resolved containers training=%s evaluation=%s grpo=%s resource_group=%s training_pool=%s user_role=%s",
+        "用户%s; resolved containers training=%s evaluation=%s grpo=%s multinode=%s resource_group=%s training_pool=%s user_role=%s",
         user_id,
         resolved_training_container,
         resolved_evaluation_container,
         resolved_grpo_container,
+        resolved_multinode_training_container,
         resolved_resource_group_id,
         resolved_training_pool_id,
         resolved_user_role,
@@ -12762,6 +12924,7 @@ async def process_user_message_structured(
     training_token = REQUEST_TRAINING_CONTAINER.set(resolved_training_container)
     evaluation_token = REQUEST_EVALUATION_CONTAINER.set(resolved_evaluation_container)
     grpo_token = REQUEST_GRPO_CONTAINER.set(resolved_grpo_container)
+    multinode_token = REQUEST_MULTINODE_TRAINING_CONTAINER.set(resolved_multinode_training_container)
     resource_group_token = REQUEST_RESOURCE_GROUP_ID.set(resolved_resource_group_id)
     training_pool_token = REQUEST_TRAINING_POOL_ID.set(resolved_training_pool_id)
     user_role_token = REQUEST_USER_ROLE.set(resolved_user_role)
@@ -12770,6 +12933,7 @@ async def process_user_message_structured(
     session.system.training_container = resolved_training_container
     session.system.evaluation_container = resolved_evaluation_container
     session.system.grpo_container = resolved_grpo_container
+    session.system.multinode_training_container = resolved_multinode_training_container
     try:
         response = await session.system.process_message(message, raw_content=raw_content)
     finally:
@@ -12779,6 +12943,7 @@ async def process_user_message_structured(
         REQUEST_TRAINING_CONTAINER.reset(training_token)
         REQUEST_EVALUATION_CONTAINER.reset(evaluation_token)
         REQUEST_GRPO_CONTAINER.reset(grpo_token)
+        REQUEST_MULTINODE_TRAINING_CONTAINER.reset(multinode_token)
         REQUEST_RESOURCE_GROUP_ID.reset(resource_group_token)
         REQUEST_TRAINING_POOL_ID.reset(training_pool_token)
     if _current_reset_epoch(user_id) != reset_epoch:

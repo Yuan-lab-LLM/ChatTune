@@ -393,6 +393,8 @@ const getWorkflowTrainMetricsHint = (
         value === undefined || value === null ? "" : String(value).trim(),
       )
       .find(Boolean);
+  const firstBoolean = (...values: unknown[]) =>
+    values.find((value): value is boolean => typeof value === "boolean");
 
   return {
     container: firstString(
@@ -426,6 +428,42 @@ const getWorkflowTrainMetricsHint = (
       getRecordValue(workflowStatus, "trainType"),
       getRecordValue(workflowStatus, "train_type"),
       getRecordValue(workflowStatus, "trainTypeText"),
+    ),
+    launchMode: firstString(
+      getRecordValue(currentStageData, "launchMode"),
+      getRecordValue(currentStageData, "launch_mode"),
+      getRecordValue(currentMetrics, "launchMode"),
+      getRecordValue(currentMetrics, "launch_mode"),
+      getRecordValue(trainStage, "launchMode"),
+      getRecordValue(trainStage, "launch_mode"),
+      getRecordValue(trainMetrics, "launchMode"),
+      getRecordValue(trainMetrics, "launch_mode"),
+      getRecordValue(workflowStatus, "launchMode"),
+      getRecordValue(workflowStatus, "launch_mode"),
+    ),
+    isMultinode: firstBoolean(
+      getRecordValue(currentStageData, "isMultinode"),
+      getRecordValue(currentStageData, "is_multinode"),
+      getRecordValue(currentMetrics, "isMultinode"),
+      getRecordValue(currentMetrics, "is_multinode"),
+      getRecordValue(trainStage, "isMultinode"),
+      getRecordValue(trainStage, "is_multinode"),
+      getRecordValue(trainMetrics, "isMultinode"),
+      getRecordValue(trainMetrics, "is_multinode"),
+      getRecordValue(workflowStatus, "isMultinode"),
+      getRecordValue(workflowStatus, "is_multinode"),
+    ),
+    scriptName: firstString(
+      getRecordValue(currentStageData, "scriptName"),
+      getRecordValue(currentStageData, "script_name"),
+      getRecordValue(currentMetrics, "scriptName"),
+      getRecordValue(currentMetrics, "script_name"),
+      getRecordValue(trainStage, "scriptName"),
+      getRecordValue(trainStage, "script_name"),
+      getRecordValue(trainMetrics, "scriptName"),
+      getRecordValue(trainMetrics, "script_name"),
+      getRecordValue(workflowStatus, "scriptName"),
+      getRecordValue(workflowStatus, "script_name"),
     ),
   };
 };
@@ -782,6 +820,8 @@ const getDefaultEvaluateContainerName = () =>
   ConfigManager.getInstance().getDefaultEvaluateContainerName();
 const getDefaultGrpoContainerName = () =>
   ConfigManager.getInstance().getDefaultGrpoContainerName();
+const getDefaultMultinodeContainerName = () =>
+  ConfigManager.getInstance().getDefaultMultinodeContainerName();
 const systemAdminUser = (): SafeAuthUser => ({
   id: "__system__",
   username: "system",
@@ -1553,6 +1593,7 @@ export const appRouter = t.router({
       containerName: z.string().trim().min(1).max(128),
       evaluateContainerName: z.string().trim().min(1).max(128),
       grpoContainerName: z.string().trim().min(1).max(128),
+      multinodeContainerName: z.string().trim().min(1).max(128),
       description: z.string().max(256).optional(),
     }))
     .mutation(async ({ ctx, input }) => {
@@ -1561,6 +1602,7 @@ export const appRouter = t.router({
         input.containerName,
         input.evaluateContainerName,
         input.grpoContainerName,
+        input.multinodeContainerName,
         input.description,
       );
       await auditAdminAction(ctx.user as SafeAuthUser, "admin_resource_group_created", {
@@ -1665,6 +1707,21 @@ export const appRouter = t.router({
       return {
         success: true,
         message: "用户组 GRPO Docker 已更新",
+        data,
+      };
+    }),
+
+  setResourceGroupMultinodeContainer: adminProcedure
+    .input(z.object({ groupId: z.string().min(1), containerName: z.string().trim().min(1).max(128) }))
+    .mutation(async ({ ctx, input }) => {
+      const data = await ResourceAccessService.setGroupMultinodeContainer(input.groupId, input.containerName);
+      await auditAdminAction(ctx.user as SafeAuthUser, "admin_resource_group_multinode_container_set", {
+        groupId: input.groupId,
+        containerName: input.containerName,
+      });
+      return {
+        success: true,
+        message: "用户组多机训练 Docker 已更新",
         data,
       };
     }),
@@ -1776,6 +1833,10 @@ export const appRouter = t.router({
     const resolvedGrpoContainerName =
       await ResourceAccessService.getDefaultGrpoContainerForUser(user) ||
       defaultGrpoContainerName;
+    const defaultMultinodeContainerName = getDefaultMultinodeContainerName();
+    const resolvedMultinodeContainerName =
+      await ResourceAccessService.getDefaultMultinodeContainerForUser(user) ||
+      defaultMultinodeContainerName;
     return {
       success: true,
       message: "Environment config retrieved successfully",
@@ -1783,11 +1844,13 @@ export const appRouter = t.router({
         defaultContainerName,
         defaultEvaluateContainerName: resolvedEvaluateContainerName,
         defaultGrpoContainerName: resolvedGrpoContainerName,
+        defaultMultinodeContainerName: resolvedMultinodeContainerName,
       },
     } as ResponseBody<{
       defaultContainerName: string;
       defaultEvaluateContainerName: string;
       defaultGrpoContainerName: string;
+      defaultMultinodeContainerName: string;
     }>;
   }),
 
@@ -2331,6 +2394,9 @@ export const appRouter = t.router({
         container: z.string().trim().optional(),
         pid: z.string().optional(),
         trainType: z.string().optional(),
+        launchMode: z.string().optional(),
+        isMultinode: z.boolean().optional(),
+        scriptName: z.string().optional(),
         historyLimit: z.number().int().positive().max(1000).optional(),
         timeWindowMinutes: z.number().int().positive().max(1440).optional(),
       }),
@@ -2374,6 +2440,9 @@ export const appRouter = t.router({
               container,
               pid: workflowHint?.pid || input.pid,
               trainType: workflowHint?.trainType || input.trainType,
+              launchMode: workflowHint?.launchMode || input.launchMode,
+              isMultinode: workflowHint?.isMultinode ?? input.isMultinode,
+              scriptName: workflowHint?.scriptName || input.scriptName,
               historyLimit: input.historyLimit,
               timeWindowMinutes: input.timeWindowMinutes,
             }),

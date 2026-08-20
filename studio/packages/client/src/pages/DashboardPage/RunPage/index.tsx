@@ -149,6 +149,8 @@ interface TrainingTaskSummary {
   trainType?: string;
   status?: string;
   launchMode?: string;
+  isMultinode?: boolean;
+  scriptName?: string;
   workflowId?: string;
   wandbUrl?: string;
 }
@@ -172,6 +174,8 @@ interface WorkflowTaskSummary {
   trainType?: string;
   status?: string;
   launchMode?: string;
+  isMultinode?: boolean;
+  scriptName?: string;
   wandbUrl?: string;
   stageStatuses?: Record<string, string>;
   workflowLogs?: Record<string, WorkflowStageLogSummary>;
@@ -768,6 +772,7 @@ interface TrainingJobProtocol {
   container_name?: string;
   pid?: string | number;
   trainType?: string;
+  trainTypeEn?: string;
   trainTypeText?: string;
   launchMode?: string;
   isMultinode?: boolean;
@@ -787,6 +792,12 @@ interface TrainingJobProtocol {
       pid?: string | number;
       trainType?: string;
       train_type?: string;
+      launchMode?: string;
+      launch_mode?: string;
+      isMultinode?: boolean;
+      is_multinode?: boolean;
+      scriptName?: string;
+      script_name?: string;
       message?: string;
       model_path?: string;
       modelPath?: string;
@@ -798,6 +809,12 @@ interface TrainingJobProtocol {
         pid?: string | number;
         trainType?: string;
         train_type?: string;
+        launchMode?: string;
+        launch_mode?: string;
+        isMultinode?: boolean;
+        is_multinode?: boolean;
+        scriptName?: string;
+        script_name?: string;
         wandb_url?: string;
         wandbUrl?: string;
       };
@@ -838,6 +855,7 @@ interface TrainingJobProtocol {
   progress_percent?: number | string;
   progressPercent?: number | string;
   script?: string;
+  scriptName?: string;
   assessmentType?: string;
   assessmentTypeText?: string;
   evalType?: string;
@@ -936,7 +954,10 @@ const inferTrainingLaunchMode = (
   if (
     protocol?.isMultinode ||
     protocol?.script?.startsWith("train_multinode_") ||
-    protocol?.trainTypeText?.includes("多机")
+    protocol?.scriptName?.startsWith("train_multinode_") ||
+    protocol?.trainTypeEn?.startsWith("multinode_") ||
+    protocol?.trainTypeText?.includes("多机") ||
+    protocol?.trainTypeText?.includes("双机")
   ) {
     return "multinode";
   }
@@ -960,10 +981,55 @@ const normalizeTrainingTaskStatus = (
   if (/running|运行/.test(normalized)) {
     return "running";
   }
+  if (/interrupted|interrupt|中断/.test(normalized)) {
+    return "interrupted";
+  }
+  if (/^(?:stop|stopped|cancelled|canceled)$|已停止|停止|取消/.test(normalized)) {
+    return "stopped";
+  }
+  if (/finished|complete|completed|done|success|succeeded|完成|成功/.test(normalized)) {
+    return "finished";
+  }
   if (/failed|failure|fail|error|失败|异常|错误/.test(normalized)) {
     return "failed";
   }
   return fallback;
+};
+
+const isTrainingTerminalStatus = (status?: string): boolean =>
+  [
+    "interrupted",
+    "stopped",
+    "cancelled",
+    "canceled",
+    "finished",
+    "complete",
+    "completed",
+    "done",
+    "success",
+    "succeeded",
+    "failed",
+    "error",
+  ].includes((status || "").trim().toLowerCase());
+
+const isTrainingTerminalProtocol = (
+  protocol: TrainingJobProtocol | null,
+): boolean => {
+  if (!protocol || isWorkflowProtocol(protocol)) {
+    return false;
+  }
+  if (protocol.type === "job_stopped" && protocol.jobType === "train") {
+    return true;
+  }
+  if (
+    ["job_started", "job_preparing", "monitor_status"].includes(protocol.type) &&
+    protocol.jobType === "train"
+  ) {
+    return isTrainingTerminalStatus(
+      normalizeTrainingTaskStatus(protocol.status, ""),
+    );
+  }
+  return false;
 };
 
 const trainingSummaryFromProtocol = (
@@ -993,16 +1059,18 @@ const trainingSummaryFromProtocol = (
   const status = protocol.type === "job_preparing"
     ? "preparing"
     : normalizeTrainingTaskStatus(protocol.status, "running");
-  if (status === "failed" || status === "error") {
+  if (isTrainingTerminalStatus(status)) {
     return null;
   }
 
   return {
     container,
     pid,
-    trainType: protocol.trainType || protocol.trainTypeText,
+    trainType: protocol.trainTypeEn || protocol.trainType || protocol.trainTypeText,
     status,
     launchMode: inferTrainingLaunchMode(protocol),
+    isMultinode: Boolean(protocol.isMultinode),
+    scriptName: protocol.scriptName || protocol.script,
     wandbUrl,
   };
 };
@@ -1167,7 +1235,25 @@ const workflowSummaryFromProtocol = (
       stageMetrics?.train_type ||
       protocol.trainType ||
       protocol.trainTypeText,
-    launchMode: inferTrainingLaunchMode(protocol),
+    launchMode:
+      stage?.launchMode ||
+      stage?.launch_mode ||
+      stageMetrics?.launchMode ||
+      stageMetrics?.launch_mode ||
+      inferTrainingLaunchMode(protocol),
+    isMultinode:
+      stage?.isMultinode ??
+      stage?.is_multinode ??
+      stageMetrics?.isMultinode ??
+      stageMetrics?.is_multinode ??
+      protocol.isMultinode,
+    scriptName:
+      stage?.scriptName ||
+      stage?.script_name ||
+      stageMetrics?.scriptName ||
+      stageMetrics?.script_name ||
+      protocol.scriptName ||
+      protocol.script,
     wandbUrl,
     stageStatuses,
     workflowLogs,
@@ -1567,8 +1653,8 @@ const parseTrainingTaskSummary = (text: string): TrainingTaskSummary | null => {
     /训练任务已成功在后台启动/.test(text) ||
     /训练正在后台进行中/.test(text) ||
     /训练任务监控结果/.test(text) ||
-    /当前训练任务.{0,80}状态为\s*[:：]?\s*\*{0,2}(?:启动中|运行中|starting|running)/i.test(text) ||
-    /当前状态\*{0,2}\s*[:：]\s*\*{0,2}(?:启动中|运行中|starting|running)/i.test(text) ||
+    /当前训练任务.{0,80}状态为\s*[:：]?\s*\*{0,2}(?:启动中|运行中|starting|running|interrupted|stopped|finished|completed|failed|error|中断|停止|完成|失败)/i.test(text) ||
+    /当前状态\*{0,2}\s*[:：]\s*\*{0,2}(?:启动中|运行中|starting|running|interrupted|stopped|finished|completed|failed|error|中断|停止|完成|失败)/i.test(text) ||
     /训练任务已启动/.test(text) ||
     /(?:开始|启动|运行).{0,24}(?:训练|微调)/.test(text);
   if (!hasStartedText) {
@@ -1582,7 +1668,7 @@ const parseTrainingTaskSummary = (text: string): TrainingTaskSummary | null => {
     /(?:PID|进程ID\s*(?:\(\s*PID\s*\))?)\s*[:：]\s*`?([0-9]+)/i,
   )?.[1];
   const trainTypeText = text.match(
-    /(LoRA\s*SFT|全参\s*SFT|lora批量训练|全参批量训练|增强训练|grpo训练)/i,
+    /(双机\s*LoRA\s*SFT|多机\s*LoRA\s*SFT|LoRA\s*SFT|全参\s*SFT|多机lora批量训练|lora批量训练|全参批量训练|双机增强训练|多机增强训练|增强训练|grpo训练|multinode_lora_sft|multinode_enhanced)/i,
   )?.[1];
   const normalizedTrainType = trainTypeText
     ? trainTypeText.replace(/\s+/g, "").toLowerCase()
@@ -1599,8 +1685,8 @@ const parseTrainingTaskSummary = (text: string): TrainingTaskSummary | null => {
     Boolean(trainType) ||
     /(?:train|training|finetune|lora|grpo)/i.test(scriptName) ||
     /训练任务监控结果/.test(text) ||
-    /当前训练任务.{0,80}状态为\s*[:：]?\s*\*{0,2}(?:启动中|运行中|starting|running)/i.test(text) ||
-    /当前状态\*{0,2}\s*[:：]\s*\*{0,2}(?:启动中|运行中|starting|running)/i.test(text) ||
+    /当前训练任务.{0,80}状态为\s*[:：]?\s*\*{0,2}(?:启动中|运行中|starting|running|interrupted|stopped|finished|completed|failed|error|中断|停止|完成|失败)/i.test(text) ||
+    /当前状态\*{0,2}\s*[:：]\s*\*{0,2}(?:启动中|运行中|starting|running|interrupted|stopped|finished|completed|failed|error|中断|停止|完成|失败)/i.test(text) ||
     /(?:开始|启动|运行).{0,24}(?:训练|微调)/.test(text);
 
   if ((!container && !pid) || !hasTrainingSignal) {
@@ -1614,9 +1700,13 @@ const parseTrainingTaskSummary = (text: string): TrainingTaskSummary | null => {
     status: parsedStatus,
     launchMode:
       scriptName.startsWith("train_multinode_") ||
-      /多机/.test(text)
+      /(?:多机|双机|qingnang_train_multi)/.test(text)
         ? "multinode"
         : undefined,
+    isMultinode:
+      scriptName.startsWith("train_multinode_") ||
+      /(?:多机|双机|qingnang_train_multi)/.test(text),
+    scriptName,
   };
 };
 
@@ -2114,13 +2204,14 @@ const isTrainingTaskStopped = (text: string): boolean => {
   if (isWorkflowProtocol(protocol)) {
     return false;
   }
-  if (protocol?.type === "job_stopped" && protocol.jobType === "train") {
+  if (isTrainingTerminalProtocol(protocol)) {
     return true;
   }
 
   return (
-    /(?:停止|结束).{0,12}训练/.test(text) &&
-    /(?:已完成清理|未发现残留进程|已结束)/.test(text)
+    (/(?:停止|结束).{0,12}训练/.test(text) &&
+      /(?:已完成清理|未发现残留进程|已结束)/.test(text)) ||
+    /当前训练任务.{0,100}状态为\s*[:：]?\s*\*{0,2}(?:interrupted|stopped|finished|completed|failed|error|中断|已停止|停止|已完成|完成|失败)/i.test(text)
   );
 };
 
@@ -3022,7 +3113,13 @@ const RunContentPage = ({
   const { showPostTourChoice, closePostTourChoice } = useFirstTimeGuide();
 
   const translateStatusBarTypeValue = useCallback(
-    (value?: string, launchMode?: string, container?: string): string => {
+    (
+      value?: string,
+      launchMode?: string,
+      container?: string,
+      scriptName?: string,
+      isMultinode?: boolean,
+    ): string => {
       if (!value) {
         return "";
       }
@@ -3035,11 +3132,15 @@ const RunContentPage = ({
         lora: "loraBatchTraining",
         sft: "loraBatchTraining",
         lora批量训练: "loraBatchTraining",
-        多机lora批量训练: "loraBatchTraining",
+        多机lora批量训练: "multinodeLoraBatchTraining",
+        双机lorasft: "multinodeLoraBatchTraining",
+        多机lorasft: "multinodeLoraBatchTraining",
+        双机lora批量训练: "multinodeLoraBatchTraining",
         lorabatchtrain: "loraBatchTraining",
         lorabatchtraining: "loraBatchTraining",
-        multinodelorabatchtrain: "loraBatchTraining",
-        multinodelorabatchtraining: "loraBatchTraining",
+        multinodelorasft: "multinodeLoraBatchTraining",
+        multinodelorabatchtrain: "multinodeLoraBatchTraining",
+        multinodelorabatchtraining: "multinodeLoraBatchTraining",
         full: "fullParamBatchTraining",
         全参批量训练: "fullParamBatchTraining",
         fullparambatchtrain: "fullParamBatchTraining",
@@ -3048,11 +3149,13 @@ const RunContentPage = ({
         enhanced: "enhancedTraining",
         dpo: "enhancedTraining",
         增强训练: "enhancedTraining",
-        多机增强训练: "enhancedTraining",
+        多机增强训练: "multinodeEnhancedTraining",
+        双机增强训练: "multinodeEnhancedTraining",
         enhancedtrain: "enhancedTraining",
         enhancedtraining: "enhancedTraining",
-        multinodeenhancedtrain: "enhancedTraining",
-        multinodeenhancedtraining: "enhancedTraining",
+        multinodeenhanced: "multinodeEnhancedTraining",
+        multinodeenhancedtrain: "multinodeEnhancedTraining",
+        multinodeenhancedtraining: "multinodeEnhancedTraining",
         grpo: "grpoTraining",
         grpo训练: "grpoTraining",
         grpotrain: "grpoTraining",
@@ -3074,6 +3177,17 @@ const RunContentPage = ({
       let typeKey = typeKeyMap[normalizedValue];
       if (!typeKey) {
         return value;
+      }
+      const isMultinodeTraining =
+        Boolean(isMultinode) ||
+        (launchMode || "").trim().toLowerCase() === "multinode" ||
+        (scriptName || "").trim().startsWith("train_multinode_") ||
+        (container || "").trim().includes("qingnang_train_multi");
+      if (isMultinodeTraining && typeKey === "loraBatchTraining") {
+        typeKey = "multinodeLoraBatchTraining";
+      }
+      if (isMultinodeTraining && typeKey === "enhancedTraining") {
+        typeKey = "multinodeEnhancedTraining";
       }
 
       return t(`runpage.statusBar.typeValues.${typeKey}`, {
@@ -4437,6 +4551,8 @@ const RunContentPage = ({
       pid: displayedWorkflowTask.pid,
       trainType: displayedWorkflowTask.trainType,
       launchMode: displayedWorkflowTask.launchMode,
+      isMultinode: displayedWorkflowTask.isMultinode,
+      scriptName: displayedWorkflowTask.scriptName,
       wandbUrl: displayedWorkflowTask.wandbUrl,
     };
   }, [displayedWorkflowTask]);
@@ -5025,6 +5141,9 @@ const RunContentPage = ({
         if (isWorkflowProtocol(metadataProtocol)) {
           return null;
         }
+        if (isTrainingTerminalProtocol(metadataProtocol)) {
+          return null;
+        }
         if (
           metadataProtocol?.type === "job_stopped" &&
           metadataProtocol.jobType === "train"
@@ -5074,6 +5193,8 @@ const RunContentPage = ({
       metricsTrainingTask.trainType || "",
       metricsTrainingTask.status || "",
       metricsTrainingTask.launchMode || "",
+      metricsTrainingTask.isMultinode ? "multinode" : "",
+      metricsTrainingTask.scriptName || "",
     ]);
   }, [
     runId,
@@ -5083,6 +5204,8 @@ const RunContentPage = ({
     metricsTrainingTask?.trainType,
     metricsTrainingTask?.status,
     metricsTrainingTask?.launchMode,
+    metricsTrainingTask?.isMultinode,
+    metricsTrainingTask?.scriptName,
   ]);
 
   useEffect(() => {
@@ -5099,6 +5222,9 @@ const RunContentPage = ({
       container: metricsTrainingTask.container,
       pid: metricsTrainingTask.pid,
       trainType: metricsTrainingTask.trainType,
+      launchMode: metricsTrainingTask.launchMode,
+      isMultinode: metricsTrainingTask.isMultinode,
+      scriptName: metricsTrainingTask.scriptName,
     };
   }, [
     metricsCacheKey,
@@ -5106,6 +5232,9 @@ const RunContentPage = ({
     metricsTrainingTask?.container,
     metricsTrainingTask?.pid,
     metricsTrainingTask?.trainType,
+    metricsTrainingTask?.launchMode,
+    metricsTrainingTask?.isMultinode,
+    metricsTrainingTask?.scriptName,
   ]);
 
   const latestAssessmentTask = useMemo(() => {
@@ -5640,6 +5769,9 @@ const RunContentPage = ({
           container: monitorTarget.container,
           pid: monitorTarget.pid,
           trainType: monitorTarget.trainType,
+          launchMode: monitorTarget.launchMode,
+          isMultinode: monitorTarget.isMultinode,
+          scriptName: monitorTarget.scriptName,
           historyLimit: 1000,
           timeWindowMinutes: 1440,
         };
@@ -5711,6 +5843,13 @@ const RunContentPage = ({
           .map((value) => String(value ?? ""))
           .join("|");
         const hasMetrics = hasLatestMetric || hasHistoryMetric;
+        const trainingStartedWithoutMetrics =
+          !hasMetrics &&
+          (metrics.training_process_exists === true ||
+            metrics.pid_alive === true ||
+            ["starting", "running"].includes(
+              String((result.data as { status?: unknown }).status || "").toLowerCase(),
+            ));
         const hasNewData =
           hasMetrics && metricSignature !== lastMetricSignature;
         if (hasNewData) {
@@ -5728,7 +5867,9 @@ const RunContentPage = ({
             ? hasNewData
               ? "已获取训练指标"
               : "暂无新指标"
-            : "尚未获取到训练指标",
+            : trainingStartedWithoutMetrics
+              ? "训练已启动，等待指标写入"
+              : "尚未获取到训练指标",
         });
         const timestamp = new Date().toISOString();
         const reply: Reply = {
@@ -6521,6 +6662,8 @@ const RunContentPage = ({
                                 latestTrainingTask.trainType,
                                 latestTrainingTask.launchMode,
                                 latestTrainingTask.container,
+                                latestTrainingTask.scriptName,
+                                latestTrainingTask.isMultinode,
                               )}
                             </span>
                           )}
