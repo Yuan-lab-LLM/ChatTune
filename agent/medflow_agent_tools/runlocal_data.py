@@ -689,6 +689,29 @@ def _iter_sample_json_items(payload: Any) -> List[Any]:
     return [payload]
 
 
+def _detect_json_prefix_item_format(text: str) -> str:
+    stripped = str(text or "").lstrip()
+    if not stripped:
+        return "unknown"
+
+    decoder = json.JSONDecoder()
+    starts = [0]
+    object_start = stripped.find("{")
+    if object_start > 0:
+        starts.append(object_start)
+
+    for start in starts:
+        try:
+            payload, _ = decoder.raw_decode(stripped[start:])
+        except (TypeError, ValueError):
+            continue
+        for item in _iter_sample_json_items(payload):
+            detected = detect_data_preprocessing_item_format(item)
+            if detected != "unknown":
+                return detected
+    return "unknown"
+
+
 def detect_data_preprocessing_text_format(text: str) -> str:
     text = str(text or "").strip()
     if not text:
@@ -707,6 +730,9 @@ def detect_data_preprocessing_text_format(text: str) -> str:
             detected = detect_data_preprocessing_item_format(payload)
             if detected != "unknown":
                 return detected
+        detected = _detect_json_prefix_item_format(text)
+        if detected != "unknown":
+            return detected
         return "unknown"
 
     for item in _iter_sample_json_items(payload):
@@ -754,14 +780,18 @@ def detect_data_preprocessing_dir_format_in_container(
             content_result = subprocess.run(
                 ["docker", "exec", docker_container, "head", "-c", "65536", file_path],
                 capture_output=True,
-                text=True,
             )
         except Exception:
             logger.exception("Failed to read preprocessing data sample: %s", file_path)
             continue
         if content_result.returncode != 0:
             continue
-        detected = detect_data_preprocessing_text_format(content_result.stdout)
+        stdout = content_result.stdout or b""
+        if isinstance(stdout, bytes):
+            sample_text = stdout.decode("utf-8", errors="replace")
+        else:
+            sample_text = str(stdout)
+        detected = detect_data_preprocessing_text_format(sample_text)
         if detected != "unknown":
             return detected
     return "unknown"
