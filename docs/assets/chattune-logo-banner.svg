@@ -1,28 +1,30 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="180" viewBox="0 0 1200 180" fill="none">
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="190" viewBox="0 0 1200 190" fill="none">
   <defs>
-    <linearGradient id="brand" x1="420" y1="38" x2="780" y2="142" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#23B6D9"/>
-      <stop offset="0.5" stop-color="#5B78EE"/>
-      <stop offset="1" stop-color="#8B5CF6"/>
+    <linearGradient id="brand" x1="392" y1="28" x2="820" y2="146" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3284F6"/>
+      <stop offset="1" stop-color="#7657E8"/>
     </linearGradient>
-    <filter id="softShadow" x="-30%" y="-30%" width="160%" height="170%">
-      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#5B78EE" flood-opacity="0.16"/>
+    <filter id="softShadow" x="-35%" y="-35%" width="170%" height="180%">
+      <feDropShadow dx="0" dy="8" stdDeviation="9" flood-color="#5269D9" flood-opacity="0.13"/>
     </filter>
   </defs>
 
-  <g transform="translate(422 34)">
-    <path d="M12 14C12 6.27 18.27 0 26 0H94C101.73 0 108 6.27 108 14V76C108 83.73 101.73 90 94 90H55L28 110L32 90H26C18.27 90 12 83.73 12 76V14Z"
-          fill="url(#brand)" filter="url(#softShadow)"/>
-    <path d="M34 29H86M34 45H86M34 61H86" stroke="white" stroke-width="5" stroke-linecap="round" opacity="0.82"/>
-    <circle cx="52" cy="29" r="8" fill="white"/>
-    <circle cx="73" cy="45" r="8" fill="white"/>
-    <circle cx="44" cy="61" r="8" fill="white"/>
+  <g transform="translate(390 38)">
+    <g filter="url(#softShadow)">
+      <path d="M91 28C81 17 67 11 52 11C29 11 11 29 11 52C11 76 29 94 53 94C69 94 83 87 92 75"
+            stroke="url(#brand)" stroke-width="9" stroke-linecap="round"/>
+      <path d="M27 86L18 109L43 95" stroke="url(#brand)" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M38 38H72M38 54H72M38 70H72" stroke="#4E66D8" stroke-width="4.5" stroke-linecap="round" opacity="0.55"/>
+      <circle cx="49" cy="38" r="7" fill="white" stroke="url(#brand)" stroke-width="4"/>
+      <circle cx="64" cy="54" r="7" fill="white" stroke="url(#brand)" stroke-width="4"/>
+      <circle cx="45" cy="70" r="7" fill="white" stroke="url(#brand)" stroke-width="4"/>
+    </g>
 
-    <text x="137" y="73"
+    <text x="126" y="75"
           font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif"
-          font-size="58" font-weight="720" letter-spacing="-2" fill="#1E293B">Chat</text>
-    <text x="257" y="73"
+          font-size="60" font-weight="680" letter-spacing="-2.4" fill="#182033">Chat</text>
+    <text x="251" y="75"
           font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif"
-          font-size="58" font-weight="720" letter-spacing="-2" fill="url(#brand)">Tune</text>
+          font-size="60" font-weight="680" letter-spacing="-2.4" fill="url(#brand)">Tune</text>
   </g>
 </svg>
