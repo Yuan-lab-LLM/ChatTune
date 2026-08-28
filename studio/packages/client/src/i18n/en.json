@@ -790,7 +790,7 @@
   "help": {},
   "hint": {
     "empty-trace": "No data available",
-    "messages": "In Medflow, a reply consists of multiple messages with different roles and names",
+    "messages": "In ChatTune, a reply consists of multiple messages with different roles and names",
     "no-running-session": "No running session was found. Please start a run instance or select an available one first.",
     "select-run": "Select a run instance first",
     "select-run-badge": "No session is selected yet",
@@ -884,13 +884,13 @@
       }
     },
     "recent-projects": "Recent Projects",
-    "recent-projects-empty": "No recent projects, try running a Medflow project!",
+    "recent-projects-empty": "No recent projects, try running a ChatTune project!",
     "recent-projects-description": "The recent projects you have run in last 30 days",
     "run-number": "# of runs",
     "overview-description": "The number of runs in the last each month"
   },
   "userLanding": {
-    "serviceName": "MedFlow AI Service",
+    "serviceName": "ChatTune AI Service",
     "title": "Start AI work through conversation",
     "description": "One entry point for data prep, training launch, monitoring, and evaluation. Follow the guided flow or jump straight into chat.",
     "available": "Service available",
@@ -1076,7 +1076,7 @@
       "data-view-title": "Data View",
       "run-table-description": "The run instances of the current project will be displayed in this table",
       "run-table-title": "Run Instances",
-      "textarea-description": "Once connected to MedFlow ChatTune, the user input operations of the UserAgent instances will be transferred to this input box",
+      "textarea-description": "Once connected to ChatTune, the user input operations of the UserAgent instances will be transferred to this input box",
       "textarea-title": "User Input Transfer",
       "send-description": "When user input is required in the application, this button will be activated. Click to send the message in the voice of the corresponding role",
       "send-title": "Send Message"

@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="180" viewBox="0 0 1200 180" fill="none">
+  <defs>
+    <linearGradient id="brand" x1="420" y1="38" x2="780" y2="142" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#23B6D9"/>
+      <stop offset="0.5" stop-color="#5B78EE"/>
+      <stop offset="1" stop-color="#8B5CF6"/>
+    </linearGradient>
+    <filter id="softShadow" x="-30%" y="-30%" width="160%" height="170%">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#5B78EE" flood-opacity="0.16"/>
+    </filter>
+  </defs>
+
+  <g transform="translate(422 34)">
+    <path d="M12 14C12 6.27 18.27 0 26 0H94C101.73 0 108 6.27 108 14V76C108 83.73 101.73 90 94 90H55L28 110L32 90H26C18.27 90 12 83.73 12 76V14Z"
+          fill="url(#brand)" filter="url(#softShadow)"/>
+    <path d="M34 29H86M34 45H86M34 61H86" stroke="white" stroke-width="5" stroke-linecap="round" opacity="0.82"/>
+    <circle cx="52" cy="29" r="8" fill="white"/>
+    <circle cx="73" cy="45" r="8" fill="white"/>
+    <circle cx="44" cy="61" r="8" fill="white"/>
+
+    <text x="137" y="73"
+          font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif"
+          font-size="58" font-weight="720" letter-spacing="-2" fill="#1E293B">Chat</text>
+    <text x="257" y="73"
+          font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif"
+          font-size="58" font-weight="720" letter-spacing="-2" fill="url(#brand)">Tune</text>
+  </g>
+</svg>

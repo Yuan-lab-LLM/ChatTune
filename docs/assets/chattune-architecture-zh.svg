@@ -41,7 +41,7 @@
   <circle cx="1328" cy="35" r="92" fill="#7C6DF2" fill-opacity="0.035"/>
   <circle cx="1383" cy="94" r="58" fill="#13A89E" fill-opacity="0.035"/>
 
-  <text x="48" y="52" class="title">MedFlow ChatTune</text>
+  <text x="48" y="52" class="title">ChatTune</text>
   <text x="48" y="78" class="subtitle">通过自然语言描述目标，由智能体完成数据处理、模型微调、评估、发布与部署。</text>
 
   <path d="M45 112H1395" stroke="#E7ECF3"/>
@@ -63,7 +63,7 @@
     <text x="155" y="346" text-anchor="middle" class="heading">描述任务目标</text>
     <text x="155" y="364" text-anchor="middle" class="body">用户 / 管理员</text>
     <rect x="82" y="376" width="146" height="29" rx="9" fill="#FFFFFF" stroke="#D4E5F7"/>
-    <text x="155" y="395" text-anchor="middle" class="label">MedFlow Studio</text>
+    <text x="155" y="395" text-anchor="middle" class="label">ChatTune Studio</text>
   </g>
 
   <!-- Orchestrator -->

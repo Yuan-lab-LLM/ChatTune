@@ -15,7 +15,7 @@ export function AutoPopup() {
     const projectName = location.pathname.match(/\/projects\/([^/]+)/)?.[1];
     
     const content = {
-        title: isZh ? '🎉 欢迎使用 MedFlow ChatTune！' : '🎉 Welcome to MedFlow ChatTune!',
+        title: isZh ? '🎉 欢迎使用 ChatTune Studio！' : '🎉 Welcome to ChatTune Studio!',
         layoutTitle: isZh ? '📍 页面布局' : '📍 Page Layout',
         layoutDesc: isZh 
             ? '• 左侧区域：功能导航和资源管理\n• 右侧区域：AI 对话和交互'

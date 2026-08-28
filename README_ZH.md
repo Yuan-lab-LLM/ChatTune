@@ -1,10 +1,10 @@
-![MedFlow ChatTune](docs/assets/medflow-chattune-logo-banner.svg)
+![ChatTune](docs/assets/chattune-logo-banner.svg)
 
-# MedFlow ChatTune
+# ChatTune
 
 **对话式大模型微调智能体：用自然语言完成数据处理、训练、评估与部署**
 
-面向医疗场景开箱即用，也可扩展为通用领域的模型训练、评估与部署平台。
+面向通用场景设计，可扩展到不同领域的模型训练、评估、部署与基准测试流程。
 
 [![Apache-2.0 License](https://img.shields.io/badge/License-Apache--2.0-0B6E4F.svg)](LICENSE)
 ![Python >= 3.10](https://img.shields.io/badge/Python-%E2%89%A53.10-3776AB.svg)
@@ -14,23 +14,17 @@
 
 **简体中文** · [English](README.md)
 
-## 最新更新
+## 什么是 ChatTune？
 
-- [2026-08-20] 支持多机训练。
-- [2026-08-13] 将推理纳入资源池管理中，同时更新底层训练镜像版本，LLaMA-Factory 升级到 0.9.5。
-- [2026-07-29] 首次发布。
-
-## 什么是 MedFlow ChatTune？
-
-MedFlow ChatTune 是 MedFlow 产品体系中的开源 **对话式大模型微调智能体**。用户不需要手写复杂的训练脚本，只需在 Web Studio 中描述目标，即可通过自然语言发起数据处理、模型微调、评估、发布、推理部署和 Benchmark 任务。
+ChatTune 是一个开源的 **对话式大模型微调智能体**。用户不需要手写复杂的训练脚本，只需在 Web Studio 中描述目标，即可通过自然语言发起数据处理、模型微调、评估、发布、推理部署和 Benchmark 任务。
 
 ChatTune 会理解任务意图、解释并补齐必要参数、选择合适的训练或评估工具、调度 Docker 任务容器，并持续回传运行状态，把传统的命令行微调流程转化为可对话、可观察、可管理的模型迭代过程。
 
-项目源于医疗大模型实践，内置医疗数据处理策略、医疗评测集成和 MedFlow 推理服务；核心的 Agent 编排、训练、资源管理和多用户治理能力不依赖特定医疗模型，也可用于其他垂直领域。
+ChatTune 的核心能力与具体领域解耦。Agent 编排、训练、评估、资源管理和多用户治理可以与自定义数据集、模型模板、评测套件及推理服务组合，适用于不同产业和业务场景。
 
 > ⚠️ **重要提示**
 >
-> MedFlow ChatTune 当前面向研发、测试与私有化部署集成，仍在持续迭代。生产使用前请完成安全加固、权限审查、数据合规评估和充分的模型验证。
+> ChatTune 当前面向研发、测试与私有化部署集成，仍在持续迭代。生产使用前请完成安全加固、权限审查、数据合规评估和充分的模型验证。
 
 ## 为什么选择 ChatTune？
 
@@ -39,14 +33,14 @@ ChatTune 会理解任务意图、解释并补齐必要参数、选择合适的�
 | 对话式微调 | 用自然语言启动任务；参数不足时 Agent 会解释并追问，而不是要求用户手写完整训练命令。 |
 | 完整模型闭环 | 串联数据处理、训练、评估、发布、推理部署和基准评测，工作流状态可持久化、停止和恢复。 |
 | 多种训练方式 | 支持 LoRA SFT、全参 SFT、DPO 增强训练和 GRPO；底层训练流程基于 LLaMA-Factory 与 verl。 |
-| 医疗与通用兼容 | 提供医疗数据策略、Benchmark 和推理服务，也允许替换数据集、模型模板和评测集用于其他领域。 |
+| 领域可扩展 | 可组合自定义数据集、模板、评测套件与推理服务，无需修改核心编排层。 |
 | 可观测训练 | 展示进程、阶段、Loss、进度和 W&B 信息，并支持基于训练曲线的 AI 分析。 |
 | 资源与权限治理 | 提供用户、用户组、任务容器、GPU 资源池、配额、并发控制、资源共享和审计记录。 |
 | 单机到多节点 | Runtime 支持单机或中心节点/计算节点部署；推理 Agent 支持 controller/worker 管理。 |
 
 ## 核心工作流
 
-![MedFlow ChatTune 对话式微调架构](docs/assets/chattune-architecture-zh.svg)
+![ChatTune 对话式微调架构](docs/assets/chattune-architecture-zh.svg)
 
 “一键工作流”会按顺序推进以下阶段：
 
@@ -61,8 +55,8 @@ ChatTune 会理解任务意图、解释并补齐必要参数、选择合适的�
 ### 数据与模型
 
 - 数据准备、SFT/DPO 预处理和高级筛选。
-- 内置 `inspection`、`diagnosis`、`prescription` 医疗数据策略。
-- 数据集、模型、医疗测试集和评估结果的查看、预览、上传、下载与删除。
+- 数据策略可插拔，`inspection`、`diagnosis`、`prescription` 仅作为可选参考实现保留。
+- 数据集、模型、领域测试集和评估结果的查看、预览、上传、下载与删除。
 - 私有资源发布、共享范围管理与管理员审批。
 
 ### 训练与评估
@@ -77,7 +71,7 @@ ChatTune 会理解任务意图、解释并补齐必要参数、选择合适的�
 
 - 查看和修改模型路径、端口、GPU、张量并行度、显存比例和最大 Token 等配置。
 - 启动、停止和重启推理服务，查询节点、状态与日志。
-- 运行 MedFlow 功能测试、医疗选择题、MedBench 和通用 Benchmark。
+- 运行功能测试、自定义评测套件、领域 Benchmark 和通用 Benchmark。
 - 仓库内置 C-Eval、CMMLU、MMLU、MedQA、MedMCQA 和 CMB-Single 数据加载资源；相关数据集适用各自许可证，详见 [NOTICE](NOTICE)。
 
 ### Studio 与平台治理
@@ -132,7 +126,6 @@ bash runtime.sh init --profile single --iphost <本机可达IP>
 | 配置 | 用途 |
 | --- | --- |
 | `MEDFLOW_LOCAL_TRAINING_CONTAINER` | LoRA、全参和 DPO 等常规训练任务容器。 |
-| `MULTINODE_DOCKER_CONTAINER` | 多机 LoRA SFT 与 DPO 增强训练使用的独立 LLaMAFactory 容器。 |
 | `MEDFLOW_LOCAL_EVALUATE_CONTAINER` | 模型评估与推理相关任务容器。 |
 | `MEDFLOW_LOCAL_GRPO_CONTAINER` | GRPO/verl 任务容器。 |
 | `MODEL_NAME` / `MODEL_API_KEY` / `MODEL_BASE_URL` | Agent 使用的 OpenAI-compatible 模型服务。 |
@@ -185,11 +178,11 @@ bash runtime.sh stop
 | 中心节点 | 运行 Studio、Bridge，并可选运行本机 Agent API | `bash runtime.sh init --profile center --nodes ...` |
 | 计算节点 | 运行 Agent API、资源探测和任务容器 | `bash runtime.sh init --profile node ...` |
 
-中心节点与计算节点的 token、地址、启动顺序以及多机训练所需的资源池配置见 [多机部署配置](docs/MULTI_NODE_ZH.md)。多机训练使用独立的 `MULTINODE_DOCKER_CONTAINER` 和 Studio 下发的 GPU 预约；多节点 Runtime 与多节点推理是相关部署模式，但配置入口不同。
+中心节点与计算节点的 token、地址和启动顺序见 [多机部署配置](docs/MULTI_NODE_ZH.md)。当前用户文档将多机训练标记为后续阶段能力；多节点 Runtime 与多节点推理不等同于多机训练。
 
 ## 用于通用领域
 
-医疗能力主要集中在默认数据策略、内置评测资源和 `medflow/` 推理子项目。要用于法律、金融、客服或其他垂直领域，可以：
+领域相关能力主要集中在数据策略、评测资源和可选推理集成中。要将 ChatTune 用于法律、金融、客服、科研或其他领域，可以：
 
 1. 替换训练数据，并选择 SFT、DPO 或 GRPO 流程。
 2. 通过 `TEM` / `template` 选择训练镜像支持的模型模板。
@@ -206,7 +199,7 @@ bash runtime.sh stop
 ├── agent/                        # Agent API、工作流编排、工具与资源 API
 ├── agent-studio-runtime-bridge/  # Studio 与 Agent API 的桥接服务
 ├── docker_scripts/               # 任务容器创建与内置评测资源
-├── medflow/                      # 医疗推理服务、推理 Agent、测试与 Benchmark
+├── medflow/                      # 可选的历史兼容推理示例、Agent、测试与 Benchmark
 └── docs/                         # 部署、使用和管理文档
 ```
 
@@ -221,9 +214,9 @@ bash runtime.sh stop
 | [管理员指南](docs/ADMIN_GUIDE_ZH.md) | 用户组、容器、GPU 配额、共享和审计 |
 | [多机部署](docs/MULTI_NODE_ZH.md) | 中心节点与计算节点配置 |
 
-## 医疗与数据安全
+## 数据与模型安全
 
-本项目不构成医疗建议，不能作为诊断、处方或治疗的唯一依据。任何面向真实患者的使用都必须由具备资质的专业人员审核，并遵守适用的隐私、数据安全、医疗器械和人工智能监管要求。
+ChatTune 不会自动验证模型输出的正确性、安全性或法律适用性。任何生产部署都需要完成领域评测、人工审核、权限控制、隐私保护，并遵守适用的数据与人工智能监管要求。用于医疗时还必须经过具备资质的专业人员审核，不能将模型输出作为诊断或治疗的唯一依据。
 
 请勿将真实患者数据、个人身份信息、API Key、内部地址、模型私有路径或生产日志提交到 GitHub。测试和示例数据应为合成数据或经过充分去标识化的数据。
 

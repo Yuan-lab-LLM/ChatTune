@@ -791,7 +791,7 @@
   "help": {},
   "hint": {
     "empty-trace": "数据为空",
-    "messages": "Medflow 一次回复（reply）可能包含多个消息，每条消息有对应的 role 和 name 字段",
+    "messages": "ChatTune 一次回复（reply）可能包含多个消息，每条消息有对应的 role 和 name 字段",
     "no-running-session": "未找到运行中的会话，请先启动运行实例或选择可用运行实例。",
     "select-run": "先选择一个运行实例",
     "select-run-badge": "当前还没有选中会话",
@@ -885,13 +885,13 @@
       }
     },
     "recent-projects": "最近项目",
-    "recent-projects-empty": "项目为空，尝试运行一个 Medflow 项目吧！",
+    "recent-projects-empty": "项目为空，尝试运行一个 ChatTune 项目吧！",
     "recent-projects-description": "过去 30 天内运行过的项目",
     "run-number": "运行数量",
     "overview-description": "最近一年中，每个月运行的实例数量统计"
   },
   "userLanding": {
-    "serviceName": "MedFlow 智能服务",
+    "serviceName": "ChatTune 智能服务",
     "title": "从对话开始完成AI 工作",
     "description": "一个入口完成数据准备、训练发起、过程监控和结果评估。按流程进入，也可以直接开始对话。",
     "available": "服务可用",
@@ -1077,7 +1077,7 @@
       "data-view-title": "数据视图",
       "run-table-description": "该项目所有的运行实例将会显示在该表中",
       "run-table-title": "运行实例",
-      "textarea-description": "连接 MedFlow ChatTune 后，应用中 UserAgent 的用户输入操作将被转移到该输入框",
+      "textarea-description": "连接 ChatTune 后，应用中 UserAgent 的用户输入操作将被转移到该输入框",
       "textarea-title": "对话输入",
       "send-description": "当应用运行到需要 UserAgent 实例进行输入时，该按钮将激活，点击按钮扮演对应的角色进行输入",
       "send-title": "发送消息"

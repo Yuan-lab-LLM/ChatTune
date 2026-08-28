@@ -1,10 +1,10 @@
-![MedFlow ChatTune](docs/assets/medflow-chattune-logo-banner.svg)
+![ChatTune](docs/assets/chattune-logo-banner.svg)
 
-# MedFlow ChatTune
+# ChatTune
 
 **The conversational fine-tuning agent: process data, train, evaluate, and deploy LLMs with natural language**
 
-Healthcare-ready out of the box and extensible to general-purpose model training, evaluation, and deployment.
+Domain-agnostic by design and extensible across model training, evaluation, deployment, and benchmarking workflows.
 
 [![Apache-2.0 License](https://img.shields.io/badge/License-Apache--2.0-0B6E4F.svg)](LICENSE)
 ![Python >= 3.10](https://img.shields.io/badge/Python-%E2%89%A53.10-3776AB.svg)
@@ -14,23 +14,17 @@ Healthcare-ready out of the box and extensible to general-purpose model training
 
 [简体中文](README_ZH.md) · **English**
 
-## What's New
+## What is ChatTune?
 
-- [2026-08-20] Multi-node training is supported.
-- [2026-08-13] Inference is now managed through the resource pool, and the base training image was updated with LLaMA-Factory upgraded to 0.9.5.
-- [2026-07-29] Initial release.
-
-## What is MedFlow ChatTune?
-
-MedFlow ChatTune is an open-source **conversational LLM fine-tuning agent** in the MedFlow product family. Instead of writing complex training scripts, users describe their goals in the web-based Studio and start data processing, fine-tuning, evaluation, publishing, inference deployment, and benchmark tasks through natural language.
+ChatTune is an open-source **conversational LLM fine-tuning agent**. Instead of writing complex training scripts, users describe their goals in the web-based Studio and start data processing, fine-tuning, evaluation, publishing, inference deployment, and benchmark tasks through natural language.
 
 ChatTune understands task intent, explains and collects required parameters, selects the appropriate training or evaluation tools, schedules Docker task containers, and continuously reports execution status. It turns a traditional command-line fine-tuning workflow into a conversational, observable, and manageable model-iteration process.
 
-The project grew out of healthcare LLM practice and includes medical data strategies, medical evaluation integrations, and the MedFlow inference stack. Its core agent orchestration, training, resource management, and multi-user governance layers are not tied to a specific medical model and can be adapted to other domains.
+ChatTune is domain-agnostic at its core. Agent orchestration, training, evaluation, resource management, and multi-user governance can be combined with custom datasets, model templates, evaluation suites, and inference services for different industries and use cases.
 
 > ⚠️ **Important**
 >
-> MedFlow ChatTune is currently intended for research, testing, and private deployment integration, and remains under active development. Production deployments require security hardening, access reviews, data-compliance assessment, and thorough model validation.
+> ChatTune is currently intended for research, testing, and private deployment integration, and remains under active development. Production deployments require security hardening, access reviews, data-compliance assessment, and thorough model validation.
 
 ## Why ChatTune?
 
@@ -39,14 +33,14 @@ The project grew out of healthcare LLM practice and includes medical data strate
 | Conversational fine-tuning | Start jobs with natural language. When parameters are missing, the agent explains and requests them instead of requiring a complete training command. |
 | End-to-end lifecycle | Connect data processing, training, evaluation, publishing, inference deployment, and benchmarking in a persistent, stoppable, resumable workflow. |
 | Multiple training methods | Run LoRA SFT, full-parameter SFT, DPO-based enhancement, and GRPO on top of LLaMA-Factory and verl workflows. |
-| Healthcare-ready, domain-flexible | Use the included medical strategies, benchmarks, and inference services, or replace datasets, templates, and evaluations for another domain. |
+| Domain-extensible | Combine custom datasets, templates, evaluation suites, and inference services without changing the core orchestration layer. |
 | Observable training | Inspect processes, stages, loss, progress, and W&B metadata, with AI-assisted training-curve analysis. |
 | Resource and access governance | Manage users, groups, task containers, GPU pools, quotas, concurrency, resource sharing, and audit records. |
 | Single machine to multiple nodes | Deploy the Runtime on one machine or as center/compute nodes; operate inference through controller/worker agents. |
 
 ## Architecture
 
-![MedFlow ChatTune conversational fine-tuning architecture](docs/assets/chattune-architecture-en.svg)
+![ChatTune conversational fine-tuning architecture](docs/assets/chattune-architecture-en.svg)
 
 The one-click workflow advances through:
 
@@ -61,8 +55,8 @@ Each stage is persisted. Failed workflows can be inspected and resumed, while a 
 ### Data and models
 
 - Data preparation, SFT/DPO preprocessing, and advanced filtering.
-- Built-in `inspection`, `diagnosis`, and `prescription` medical data strategies.
-- Browse, preview, upload, download, and delete datasets, models, medical test sets, and evaluation results.
+- Pluggable data strategies, with `inspection`, `diagnosis`, and `prescription` retained as optional reference implementations.
+- Browse, preview, upload, download, and delete datasets, models, domain test sets, and evaluation results.
 - Publish private resources, control sharing scopes, and support administrator approval.
 
 ### Training and evaluation
@@ -77,7 +71,7 @@ Each stage is persisted. Failed workflows can be inspected and resumed, while a 
 
 - Inspect and modify model paths, ports, GPUs, tensor parallelism, memory utilization, and token limits.
 - Start, stop, and restart inference services; inspect nodes, status, and logs.
-- Run MedFlow functional tests, medical multiple-choice evaluations, MedBench, and general benchmarks.
+- Run functional tests, custom evaluation suites, domain benchmarks, and general-purpose benchmarks.
 - Bundled loaders and local resources include C-Eval, CMMLU, MMLU, MedQA, MedMCQA, and CMB-Single. These datasets retain their own license terms; see [NOTICE](NOTICE).
 
 ### Studio and governance
@@ -132,7 +126,6 @@ Open `runtime.env` and verify at least:
 | Setting | Purpose |
 | --- | --- |
 | `MEDFLOW_LOCAL_TRAINING_CONTAINER` | Container for LoRA, full-parameter, DPO, and related training jobs. |
-| `MULTINODE_DOCKER_CONTAINER` | Dedicated LLaMAFactory container for multi-node LoRA SFT and DPO enhanced training. |
 | `MEDFLOW_LOCAL_EVALUATE_CONTAINER` | Container for model evaluation and inference-related jobs. |
 | `MEDFLOW_LOCAL_GRPO_CONTAINER` | GRPO/verl task container. |
 | `MODEL_NAME` / `MODEL_API_KEY` / `MODEL_BASE_URL` | OpenAI-compatible endpoint used by the agent. |
@@ -185,11 +178,11 @@ When required values are missing, the agent explains the fields and asks for the
 | Center node | Runs Studio and Bridge, with an optional local Agent API | `bash runtime.sh init --profile center --nodes ...` |
 | Compute node | Runs the Agent API, resource probes, and task containers | `bash runtime.sh init --profile node ...` |
 
-See [Multi-node Configuration](docs/MULTI_NODE.md) for tokens, URLs, startup order, and the resource-pool settings required by multi-node training. Distributed training uses the dedicated `MULTINODE_DOCKER_CONTAINER` and Studio-issued GPU reservations; multi-node Runtime and multi-node inference are related deployment modes but are configured separately.
+See [Multi-node Configuration](docs/MULTI_NODE.md) for tokens, URLs, and startup order. The current user guide marks multi-machine training as a later-stage capability; multi-node Runtime and multi-node inference should not be confused with distributed training.
 
-## Adapting MedFlow to another domain
+## Adapting ChatTune to your domain
 
-Healthcare-specific behavior is concentrated in the default data strategies, bundled evaluation resources, and the `medflow/` inference subproject. To adapt the platform to legal, financial, customer-service, or another vertical domain:
+Domain-specific behavior is concentrated in data strategies, evaluation resources, and optional inference integrations. To adapt ChatTune to legal, financial, customer-service, research, or another domain:
 
 1. Replace the training data and choose an SFT, DPO, or GRPO workflow.
 2. Select a template supported by the training image through `TEM` / `template`.
@@ -206,7 +199,7 @@ Healthcare-specific behavior is concentrated in the default data strategies, bun
 ├── agent/                        # Agent API, workflows, tools, and resource API
 ├── agent-studio-runtime-bridge/  # Bridge between Studio and Agent API backends
 ├── docker_scripts/               # Task-container scripts and evaluation resources
-├── medflow/                      # Medical inference, inference agents, tests, benchmarks
+├── medflow/                      # Optional legacy inference examples, agents, tests, benchmarks
 └── docs/                         # Deployment, user, and administration documentation
 ```
 
@@ -221,9 +214,9 @@ Healthcare-specific behavior is concentrated in the default data strategies, bun
 | [Admin Guide](docs/ADMIN_GUIDE.md) | Groups, containers, GPU quotas, sharing, and audit |
 | [Multi-node Configuration](docs/MULTI_NODE.md) | Center and compute node setup |
 
-## Medical and data safety
+## Data and model safety
 
-This project does not provide medical advice and must not be the sole basis for diagnosis, prescriptions, or treatment. Any use involving real patients requires review by qualified professionals and compliance with applicable privacy, data-security, medical-device, and AI regulations.
+ChatTune does not validate the correctness, safety, or legal suitability of generated models. Every production deployment requires domain-appropriate evaluation, human review, access controls, privacy protection, and compliance with applicable data and AI regulations. Healthcare use additionally requires qualified professional review and must not rely on generated output as the sole basis for diagnosis or treatment.
 
 Never commit real patient data, personally identifiable information, API keys, internal addresses, private model paths, or production logs to GitHub. Test and example data must be synthetic or properly de-identified.
 
