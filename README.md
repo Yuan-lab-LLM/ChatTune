@@ -1,10 +1,12 @@
-![ChatTune](docs/assets/chattune-logo-banner.svg)
+<p align="center">
+  <img src="docs/assets/chattune-ribbon-banner.png" alt="ChatTune" width="800" />
+</p>
 
 # ChatTune
 
-**The conversational fine-tuning agent: process data, train, evaluate, and deploy LLMs with natural language**
+**A general-purpose conversational fine-tuning agent: turn natural language into reliable data, training, evaluation, and deployment workflows**
 
-Domain-agnostic by design and extensible across model training, evaluation, deployment, and benchmarking workflows.
+Built for any domain—from healthcare and finance to customer service, research, and beyond.
 
 [![Apache-2.0 License](https://img.shields.io/badge/License-Apache--2.0-0B6E4F.svg)](LICENSE)
 ![Python >= 3.10](https://img.shields.io/badge/Python-%E2%89%A53.10-3776AB.svg)
@@ -16,11 +18,11 @@ Domain-agnostic by design and extensible across model training, evaluation, depl
 
 ## What is ChatTune?
 
-ChatTune is an open-source **conversational LLM fine-tuning agent**. Instead of writing complex training scripts, users describe their goals in the web-based Studio and start data processing, fine-tuning, evaluation, publishing, inference deployment, and benchmark tasks through natural language.
+ChatTune is an open-source, general-purpose **conversational LLM fine-tuning agent**. Instead of writing complex training scripts, users describe their goals in the web-based Studio and start data processing, fine-tuning, evaluation, publishing, inference deployment, and benchmark tasks through natural language.
 
 ChatTune understands task intent, explains and collects required parameters, selects the appropriate training or evaluation tools, schedules Docker task containers, and continuously reports execution status. It turns a traditional command-line fine-tuning workflow into a conversational, observable, and manageable model-iteration process.
 
-ChatTune is domain-agnostic at its core. Agent orchestration, training, evaluation, resource management, and multi-user governance can be combined with custom datasets, model templates, evaluation suites, and inference services for different industries and use cases.
+ChatTune is domain-agnostic at its core. Agent orchestration, training, evaluation, resource management, and multi-user governance can be combined with custom datasets, model templates, evaluation suites, and inference services for different industries and use cases. Healthcare is one supported direction—not the product boundary.
 
 > ⚠️ **Important**
 >
@@ -55,7 +57,7 @@ Each stage is persisted. Failed workflows can be inspected and resumed, while a 
 ### Data and models
 
 - Data preparation, SFT/DPO preprocessing, and advanced filtering.
-- Pluggable data strategies, with `inspection`, `diagnosis`, and `prescription` retained as optional reference implementations.
+- Pluggable data strategies, with healthcare-oriented examples such as `inspection`, `diagnosis`, and `prescription` kept optional.
 - Browse, preview, upload, download, and delete datasets, models, domain test sets, and evaluation results.
 - Publish private resources, control sharing scopes, and support administrator approval.
 
@@ -72,7 +74,7 @@ Each stage is persisted. Failed workflows can be inspected and resumed, while a 
 - Inspect and modify model paths, ports, GPUs, tensor parallelism, memory utilization, and token limits.
 - Start, stop, and restart inference services; inspect nodes, status, and logs.
 - Run functional tests, custom evaluation suites, domain benchmarks, and general-purpose benchmarks.
-- Bundled loaders and local resources include C-Eval, CMMLU, MMLU, MedQA, MedMCQA, and CMB-Single. These datasets retain their own license terms; see [NOTICE](NOTICE).
+- Bundled loaders and local resources include general benchmarks such as C-Eval, CMMLU, MMLU, and CMB-Single, plus healthcare examples such as MedQA and MedMCQA. These datasets retain their own license terms; see [NOTICE](NOTICE).
 
 ### Studio and governance
 
@@ -180,7 +182,7 @@ When required values are missing, the agent explains the fields and asks for the
 
 See [Multi-node Configuration](docs/MULTI_NODE.md) for tokens, URLs, and startup order. The current user guide marks multi-machine training as a later-stage capability; multi-node Runtime and multi-node inference should not be confused with distributed training.
 
-## Adapting ChatTune to your domain
+## Use ChatTune in any domain
 
 Domain-specific behavior is concentrated in data strategies, evaluation resources, and optional inference integrations. To adapt ChatTune to legal, financial, customer-service, research, or another domain:
 
@@ -222,7 +224,7 @@ Never commit real patient data, personally identifiable information, API keys, i
 
 ## Origins and acknowledgements
 
-This project originated from [MedFlow2025/medflow](https://github.com/MedFlow2025/medflow) and extends the Qingnang medical-model ecosystem ([ModelScope](https://modelscope.cn/models/MedFlow/Qingnang-32B-0630)) with fine-tuning, evaluation, resource governance, and Runtime capabilities.
+ChatTune originated from [MedFlow2025/medflow](https://github.com/MedFlow2025/medflow) and initially grew out of healthcare-model work. The current Runtime is domain-agnostic: healthcare assets are retained as optional examples alongside general-purpose training, evaluation, and deployment capabilities.
 
 We thank the following open-source projects and their contributors:
 

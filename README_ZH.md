@@ -1,10 +1,12 @@
-![ChatTune](docs/assets/chattune-logo-banner.svg)
+<p align="center">
+  <img src="docs/assets/chattune-ribbon-banner.png" alt="ChatTune" width="800" />
+</p>
 
 # ChatTune
 
-**对话式大模型微调智能体：用自然语言完成数据处理、训练、评估与部署**
+**通用对话式大模型微调智能体：用自然语言驱动数据、训练、评估与部署工作流**
 
-面向通用场景设计，可扩展到不同领域的模型训练、评估、部署与基准测试流程。
+面向通用场景设计，可服务于医疗、金融、客服、科研等不同领域。
 
 [![Apache-2.0 License](https://img.shields.io/badge/License-Apache--2.0-0B6E4F.svg)](LICENSE)
 ![Python >= 3.10](https://img.shields.io/badge/Python-%E2%89%A53.10-3776AB.svg)
@@ -16,11 +18,11 @@
 
 ## 什么是 ChatTune？
 
-ChatTune 是一个开源的 **对话式大模型微调智能体**。用户不需要手写复杂的训练脚本，只需在 Web Studio 中描述目标，即可通过自然语言发起数据处理、模型微调、评估、发布、推理部署和 Benchmark 任务。
+ChatTune 是一个开源的、面向通用场景的 **对话式大模型微调智能体**。用户不需要手写复杂的训练脚本，只需在 Web Studio 中描述目标，即可通过自然语言发起数据处理、模型微调、评估、发布、推理部署和 Benchmark 任务。
 
 ChatTune 会理解任务意图、解释并补齐必要参数、选择合适的训练或评估工具、调度 Docker 任务容器，并持续回传运行状态，把传统的命令行微调流程转化为可对话、可观察、可管理的模型迭代过程。
 
-ChatTune 的核心能力与具体领域解耦。Agent 编排、训练、评估、资源管理和多用户治理可以与自定义数据集、模型模板、评测套件及推理服务组合，适用于不同产业和业务场景。
+ChatTune 的核心能力与具体领域解耦。Agent 编排、训练、评估、资源管理和多用户治理可以与自定义数据集、模型模板、评测套件及推理服务组合，适用于不同产业和业务场景。医疗是 ChatTune 支持的一个方向，而不是产品边界。
 
 > ⚠️ **重要提示**
 >
@@ -55,7 +57,7 @@ ChatTune 的核心能力与具体领域解耦。Agent 编排、训练、评估�
 ### 数据与模型
 
 - 数据准备、SFT/DPO 预处理和高级筛选。
-- 数据策略可插拔，`inspection`、`diagnosis`、`prescription` 仅作为可选参考实现保留。
+- 数据策略可插拔，`inspection`、`diagnosis`、`prescription` 等医疗示例仅作为可选参考实现保留。
 - 数据集、模型、领域测试集和评估结果的查看、预览、上传、下载与删除。
 - 私有资源发布、共享范围管理与管理员审批。
 
@@ -72,7 +74,7 @@ ChatTune 的核心能力与具体领域解耦。Agent 编排、训练、评估�
 - 查看和修改模型路径、端口、GPU、张量并行度、显存比例和最大 Token 等配置。
 - 启动、停止和重启推理服务，查询节点、状态与日志。
 - 运行功能测试、自定义评测套件、领域 Benchmark 和通用 Benchmark。
-- 仓库内置 C-Eval、CMMLU、MMLU、MedQA、MedMCQA 和 CMB-Single 数据加载资源；相关数据集适用各自许可证，详见 [NOTICE](NOTICE)。
+- 仓库内置 C-Eval、CMMLU、MMLU、CMB-Single 等通用 Benchmark，以及 MedQA、MedMCQA 等医疗示例资源；相关数据集适用各自许可证，详见 [NOTICE](NOTICE)。
 
 ### Studio 与平台治理
 
@@ -180,7 +182,7 @@ bash runtime.sh stop
 
 中心节点与计算节点的 token、地址和启动顺序见 [多机部署配置](docs/MULTI_NODE_ZH.md)。当前用户文档将多机训练标记为后续阶段能力；多节点 Runtime 与多节点推理不等同于多机训练。
 
-## 用于通用领域
+## 适配任意领域
 
 领域相关能力主要集中在数据策略、评测资源和可选推理集成中。要将 ChatTune 用于法律、金融、客服、科研或其他领域，可以：
 
@@ -222,7 +224,7 @@ ChatTune 不会自动验证模型输出的正确性、安全性或法律适用�
 
 ## 项目来源与致谢
 
-本项目源于 [MedFlow2025/medflow](https://github.com/MedFlow2025/medflow)，并围绕 Qingnang 系列医疗模型（[ModelScope](https://modelscope.cn/models/MedFlow/Qingnang-32B-0630)）扩展了微调、评估、资源治理和运行时能力。
+ChatTune 源于 [MedFlow2025/medflow](https://github.com/MedFlow2025/medflow)，早期工作聚焦医疗模型。当前 Runtime 已按通用智能体设计：医疗相关资产作为可选示例保留，同时支持通用的训练、评估、部署与治理流程。
 
 感谢以下开源项目及其贡献者：
 
