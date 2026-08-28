@@ -1,29 +1,28 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="190" viewBox="0 0 1200 190" fill="none">
   <defs>
-    <linearGradient id="brand" x1="392" y1="28" x2="820" y2="146" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#3284F6"/>
-      <stop offset="1" stop-color="#7657E8"/>
+    <linearGradient id="brand" x1="390" y1="30" x2="820" y2="150" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3478F6"/>
+      <stop offset="1" stop-color="#7456E8"/>
     </linearGradient>
-    <filter id="softShadow" x="-35%" y="-35%" width="170%" height="180%">
-      <feDropShadow dx="0" dy="8" stdDeviation="9" flood-color="#5269D9" flood-opacity="0.13"/>
+    <filter id="softShadow" x="-30%" y="-30%" width="160%" height="170%">
+      <feDropShadow dx="0" dy="7" stdDeviation="8" flood-color="#4F65CC" flood-opacity="0.12"/>
     </filter>
   </defs>
 
-  <g transform="translate(390 38)">
+  <g transform="translate(404 39)">
     <g filter="url(#softShadow)">
-      <path d="M91 28C81 17 67 11 52 11C29 11 11 29 11 52C11 76 29 94 53 94C69 94 83 87 92 75"
-            stroke="url(#brand)" stroke-width="9" stroke-linecap="round"/>
-      <path d="M27 86L18 109L43 95" stroke="url(#brand)" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
-      <path d="M38 38H72M38 54H72M38 70H72" stroke="#4E66D8" stroke-width="4.5" stroke-linecap="round" opacity="0.55"/>
-      <circle cx="49" cy="38" r="7" fill="white" stroke="url(#brand)" stroke-width="4"/>
-      <circle cx="64" cy="54" r="7" fill="white" stroke="url(#brand)" stroke-width="4"/>
-      <circle cx="45" cy="70" r="7" fill="white" stroke="url(#brand)" stroke-width="4"/>
+      <path d="M13 7H69C76.73 7 83 13.27 83 21V47C83 54.73 76.73 61 69 61H42L24 76L29 61H13C5.27 61 -1 54.73 -1 47V21C-1 13.27 5.27 7 13 7Z"
+            fill="#F4F7FF" stroke="#3478F6" stroke-width="7" stroke-linejoin="round"/>
+      <path d="M42 40H98C105.73 40 112 46.27 112 54V80C112 87.73 105.73 94 98 94H82L87 109L69 94H42C34.27 94 28 87.73 28 80V54C28 46.27 34.27 40 42 40Z"
+            fill="white" stroke="#7456E8" stroke-width="7" stroke-linejoin="round"/>
+      <path d="M47 67H93" stroke="url(#brand)" stroke-width="5" stroke-linecap="round"/>
+      <circle cx="70" cy="67" r="9" fill="white" stroke="url(#brand)" stroke-width="5"/>
     </g>
 
-    <text x="126" y="75"
+    <text x="137" y="77"
           font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif"
           font-size="60" font-weight="680" letter-spacing="-2.4" fill="#182033">Chat</text>
-    <text x="251" y="75"
+    <text x="262" y="77"
           font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif"
           font-size="60" font-weight="680" letter-spacing="-2.4" fill="url(#brand)">Tune</text>
   </g>
