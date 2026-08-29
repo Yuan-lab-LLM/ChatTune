@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/chattune-ribbon-banner.png" alt="ChatTune" width="800" />
+  <img src="docs/assets/chattune-ribbon-banner.png" alt="ChatTune" width="560" />
 </p>
 
 # ChatTune
