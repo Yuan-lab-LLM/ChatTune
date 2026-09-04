@@ -101,8 +101,9 @@ const KNOWN_FIELDS = [
 ];
 
 const DATA_TYPE_OPTIONS = [
-    { value: 'sft', label: 'SFT' },
-    { value: 'dpo', label: 'DPO' },
+    { value: 'sft', label: 'SFT', description: '监督微调数据' },
+    { value: 'dpo', label: 'DPO', description: '偏好优化数据' },
+    { value: 'pt', label: 'PT', description: '预训练文本数据' },
 ];
 
 const STRATEGY_OPTIONS = [
@@ -111,7 +112,7 @@ const STRATEGY_OPTIONS = [
     { value: 'prescription', label: '处方' },
 ];
 
-const GENERAL_PREPROCESS_FORMATS = new Set(['openai', 'sharegpt', 'sft', 'dpo', 'text']);
+const GENERAL_PREPROCESS_FORMATS = new Set(['openai', 'sharegpt', 'sft', 'dpo', 'pt', 'text']);
 
 const normalizeScriptName = (value?: string): string => (value || '').trim().toLowerCase();
 
@@ -740,6 +741,15 @@ export function AgentWaitingCard({
     const [selectedDataset, setSelectedDataset] = useState<AgentDatasetOption | null>(null);
     const [selectedTrainFile, setSelectedTrainFile] = useState<AgentFileOption | null>(null);
     const [selectedValFile, setSelectedValFile] = useState<AgentFileOption | null>(null);
+    const dataTypeOptions = useMemo(
+        () =>
+            DATA_TYPE_OPTIONS.map((option) =>
+                option.value === 'pt' && ['text', 'pt'].includes((prompt.detectedFormat || '').toLowerCase())
+                    ? { ...option, description: '预训练文本数据（推荐）' }
+                    : option,
+            ),
+        [prompt.detectedFormat],
+    );
     const { defaultGrpoContainerName } = useEnvironmentConfig();
     const [grpoContainerName, setGrpoContainerName] = useState(defaultGrpoContainerName);
     const [grpoModels, setGrpoModels] = useState<AgentModelOption[]>([]);
@@ -897,6 +907,11 @@ export function AgentWaitingCard({
 
     const knownPreprocessInputFolder =
         isDataPreprocessingPrompt ? (prompt.knownParams?.input_folder || '').trim() : '';
+    const shouldHideInputFolderBody =
+        !isDataPreprocessingPrompt &&
+        hasDatasetPicker &&
+        prompt.fields.length === 1 &&
+        prompt.fields.includes('input_folder');
 
     const submitDataTypeStrategy = (nextDataType: string, nextStrategy: string) => {
         if (!nextDataType) {
@@ -974,8 +989,8 @@ export function AgentWaitingCard({
             /(?:^|\/)base_train(?:\/|$)/.test(normalizedPath) ||
             /(?:^|\/)base(?:\/|$)/.test(normalizedPath);
         const isSftOrDpoModel =
-            ['sft', 'dpo', 'batch_trained', 'daily_trained'].includes(modelType) ||
-            /(?:^|\/)(?:batch_train|daily_train|dpo_train)(?:\/|$)/.test(normalizedPath);
+            ['sft', 'dpo', 'pt', 'batch_trained', 'pretrain', 'daily_trained'].includes(modelType) ||
+            /(?:^|\/)(?:batch_train|pretrain|daily_train|dpo_train)(?:\/|$)/.test(normalizedPath);
         return isBaseModel || (isSftOrDpoModel && isMergedModel(model, normalizedPath, baseName));
     };
 
@@ -990,8 +1005,8 @@ export function AgentWaitingCard({
         const baseName = normalizedPath.split('/').pop() || model.name;
         const modelType = (model.type || '').toLowerCase();
         const isSftOrDpoModel =
-            ['sft', 'dpo', 'batch_trained', 'daily_trained'].includes(modelType) ||
-            /(?:^|\/)(?:batch_train|daily_train|dpo_train)(?:\/|$)/.test(normalizedPath);
+            ['sft', 'dpo', 'pt', 'batch_trained', 'pretrain', 'daily_trained'].includes(modelType) ||
+            /(?:^|\/)(?:batch_train|pretrain|daily_train|dpo_train)(?:\/|$)/.test(normalizedPath);
 
         return isSftOrDpoModel && !isMergedModel(model, normalizedPath, baseName);
     };
@@ -1198,9 +1213,21 @@ export function AgentWaitingCard({
                 </div>
                 <div className="min-w-0 flex-1">
                     <div className="text-[15px] font-semibold leading-6 text-slate-900 dark:text-slate-100">{prompt.title}</div>
-                    <p className="mt-1.5 whitespace-pre-wrap text-[13px] leading-6 text-slate-600 dark:text-slate-300">
-                        {prompt.body}
-                    </p>
+                    {!shouldHideInputFolderBody && prompt.body && (
+                        <p className="mt-1.5 whitespace-pre-wrap text-[13px] leading-6 text-slate-600 dark:text-slate-300">
+                            {prompt.body}
+                        </p>
+                    )}
+                    {knownPreprocessInputFolder && (
+                        <div className="mt-3 rounded-2xl border border-sky-100 bg-sky-50/70 px-3.5 py-2.5 text-[12px] leading-5 text-slate-600 dark:border-sky-400/15 dark:bg-sky-500/10 dark:text-slate-300">
+                            <span className="font-medium text-slate-700 dark:text-slate-200">
+                                当前扫描到最新的待处理的数据集目录是：
+                            </span>
+                            <span className="break-all font-mono text-sky-700 dark:text-sky-200">
+                                {knownPreprocessInputFolder}
+                            </span>
+                        </div>
+                    )}
                     {hasSubmitted && (
                         <div className="mt-3 inline-flex rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-xs font-medium text-emerald-700 dark:border-emerald-400/20 dark:bg-emerald-500/10 dark:text-emerald-200">
                             已发送，等待后台继续处理
@@ -1233,8 +1260,8 @@ export function AgentWaitingCard({
                                 <div className="mb-2 text-xs font-semibold text-slate-500 dark:text-slate-400">
                                     数据类型
                                 </div>
-                                <div className="grid gap-2 sm:grid-cols-2">
-                                    {DATA_TYPE_OPTIONS.map((option) => {
+                                <div className={`grid gap-2 ${dataTypeOptions.length >= 3 ? 'sm:grid-cols-3' : 'sm:grid-cols-2'}`}>
+                                    {dataTypeOptions.map((option) => {
                                         const selected = dataType === option.value;
                                         return (
                                             <button
@@ -1252,6 +1279,9 @@ export function AgentWaitingCard({
                                                 }}
                                             >
                                                 <span className="block text-[13px] font-semibold">{option.label}</span>
+                                                <span className="mt-1 block text-[11px] leading-4 text-slate-500 dark:text-slate-400">
+                                                    {option.description}
+                                                </span>
                                             </button>
                                         );
                                     })}

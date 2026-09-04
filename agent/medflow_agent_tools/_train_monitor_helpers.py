@@ -48,6 +48,10 @@ def infer_train_type_from_name(name: Optional[str]) -> Optional[str]:
         return "scheduled"
     if "grpo" in lower:
         return "grpo"
+    if "batch_train_pretrain_full" in lower:
+        return "pretrain_full"
+    if "batch_train_pretrain_lora" in lower:
+        return "pretrain_lora"
     if "train_multinode_sft_pipeline" in lower:
         return "lora"
     if "train_multinode_dpo_pipeline" in lower:
@@ -79,6 +83,21 @@ def normalize_train_type(train_type: Optional[str]) -> Optional[str]:
         "lora批量训练": "lora",
         "full": "full",
         "full_train": "full",
+        "pretrain_full": "pretrain_full",
+        "pretrainfull": "pretrain_full",
+        "full_pt": "pretrain_full",
+        "fullpt": "pretrain_full",
+        "全参pt": "pretrain_full",
+        "全参预训练": "pretrain_full",
+        "pretrain_lora": "pretrain_lora",
+        "pretrainlora": "pretrain_lora",
+        "lora_pt": "pretrain_lora",
+        "lorapt": "pretrain_lora",
+        "lora预训练": "pretrain_lora",
+        "预训练": "pretrain_lora",
+        "pt": "pretrain_lora",
+        "pt训练": "pretrain_lora",
+        "继续预训练": "pretrain_lora",
         "全参": "full",
         "全参训练": "full",
         "全参批量训练": "full",
@@ -104,6 +123,10 @@ def public_train_type(
         return "multinode_lora_sft" if is_multinode else "lora_sft"
     if normalized == "full":
         return "full_sft"
+    if normalized == "pretrain_lora":
+        return "pretrain_lora"
+    if normalized == "pretrain_full":
+        return "pretrain_full"
     if normalized == "enhanced":
         return "multinode_enhanced" if is_multinode else "enhanced"
     if normalized == "grpo":
@@ -122,6 +145,8 @@ def public_train_type_text(
     return {
         "lora_sft": "LoRA SFT",
         "full_sft": "全参 SFT",
+        "pretrain_lora": "LoRA PT",
+        "pretrain_full": "全参 PT",
         "enhanced": "增强训练",
         "grpo": "GRPO",
         "multinode_lora_sft": "双机 LoRA SFT",
@@ -372,6 +397,19 @@ def fallback_key_by_substring(records: List[Dict[str, Any]], keyword: str) -> Op
     return sorted(freq.items(), key=lambda kv: kv[1], reverse=True)[0][0]
 
 
+def is_integer_step_value(value: Any) -> bool:
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, int):
+        return value >= 0
+    if isinstance(value, float):
+        return value >= 0 and value.is_integer()
+    text = str(value).strip()
+    if not text:
+        return False
+    return bool(re.fullmatch(r"\d+", text))
+
+
 def extract_wandb_history(
     records: List[Dict[str, Any]],
     history_limit: int,
@@ -393,18 +431,29 @@ def extract_wandb_history(
     ) or fallback_key_by_substring(key_records, "loss")
     step_key = pick_metric_key(
         key_records,
-        ["train/global_step", "step", "_step", "global_step", "train/step", "train/steps"],
+        ["train/global_step", "step", "global_step", "train/step", "train/steps"],
     ) or fallback_key_by_substring(key_records, "step")
+    if step_key == "_step":
+        step_key = None
     epoch_key = pick_metric_key(
         key_records,
         ["train/epoch", "epoch", "epochs", "trainer/epoch"],
     ) or fallback_key_by_substring(key_records, "epoch")
 
+    def _is_present(value: Any) -> bool:
+        return value is not None and str(value).strip() != ""
+
     history: List[Dict[str, Any]] = []
     for rec in records[-history_limit:] if history_limit > 0 else records:
         loss_val = rec.get(loss_key) if loss_key else None
-        step_val = rec.get(step_key) if step_key else rec.get("_step")
+        step_val = rec.get(step_key) if step_key else None
         epoch_val = rec.get(epoch_key) if epoch_key else None
+        if not _is_present(loss_val) or not (
+            _is_present(step_val) or is_integer_step_value(epoch_val)
+        ):
+            continue
+        if not _is_present(step_val) and is_integer_step_value(epoch_val):
+            step_val = epoch_val
         history.append(
             {
                 "step": step_val,
@@ -417,9 +466,12 @@ def extract_wandb_history(
     latest = history[-1] if history else None
     if not latest and summary:
         loss_val = summary.get(loss_key) if loss_key else None
-        step_val = summary.get(step_key) if step_key else summary.get("_step")
+        step_val = summary.get(step_key) if step_key else None
         epoch_val = summary.get(epoch_key) if epoch_key else None
-        latest = {"step": step_val, "epoch": epoch_val, "loss": loss_val, "timestamp": None}
+        if _is_present(loss_val) and (_is_present(step_val) or is_integer_step_value(epoch_val)):
+            if not _is_present(step_val) and is_integer_step_value(epoch_val):
+                step_val = epoch_val
+            latest = {"step": step_val, "epoch": epoch_val, "loss": loss_val, "timestamp": None}
 
     if not last_update_time and records:
         ts = records[-1].get("_timestamp")
@@ -506,6 +558,9 @@ def parse_output_log_history(lines: List[str]) -> List[Dict[str, Any]]:
             except Exception:
                 return None
         return None
+
+    def _is_present(value: Any) -> bool:
+        return value is not None and str(value).strip() != ""
 
     def _parse_step_metric_line(line: str) -> Optional[Dict[str, Any]]:
         # Example:
@@ -614,11 +669,27 @@ def parse_output_log_history(lines: List[str]) -> List[Dict[str, Any]]:
         if any(v is not None for v in item.values()):
             history.append(item)
 
-    for idx, item in enumerate(history, start=1):
-        if item.get("step") is None and item.get("epoch") is not None:
-            item["step"] = idx
+    deduped_by_step: Dict[str, Dict[str, Any]] = {}
+    for item in history:
+        if not _is_present(item.get("loss")):
+            continue
+        if not _is_present(item.get("step")) and is_integer_step_value(item.get("epoch")):
+            item = dict(item)
+            item["step"] = item.get("epoch")
+        if not _is_present(item.get("step")):
+            continue
+        step_key_text = str(item.get("step"))
+        previous = deduped_by_step.get(step_key_text)
+        if previous:
+            merged = dict(previous)
+            for key, value in item.items():
+                if _is_present(value):
+                    merged[key] = value
+            deduped_by_step[step_key_text] = merged
+        else:
+            deduped_by_step[step_key_text] = item
 
-    return history
+    return list(deduped_by_step.values())
 
 
 

@@ -32,10 +32,12 @@ DATASET_PATHS = {
     "raw": "/home/workspace/dataset",
     "sft": "/home/workspace/dataset_batch_train",
     "dpo": "/home/workspace/dataset_daily_train",
+    "pt": "/home/workspace/dataset_pretrain",
 }
 MODEL_PATHS = {
     "base_train": "/home/workspace/models/base",
     "batch_trained": "/home/workspace/models/batch_train",
+    "pretrain": "/home/workspace/models/pretrain",
     "daily_trained": "/home/workspace/models/dpo_train/internal/saves",
     "inference": "/home/workspace/medical_models",
 }
@@ -1102,10 +1104,14 @@ def _models(container: str) -> dict[str, list[dict[str, Any]]]:
             continue
 
         entries = _list_dirs(container, path)
+        entry_names = {entry["name"] for entry in entries}
         for entry in entries:
             entry["type"] = kind
-            entry["merged"] = entry["name"].endswith("_merged")
-            if kind == "batch_trained":
+            entry["merged"] = (
+                entry["name"].endswith("_merged")
+                or f"{entry['name']}_merged" in entry_names
+            )
+            if kind in {"batch_trained", "pretrain"}:
                 entry["checkpoints"] = _list_model_checkpoints(
                     container,
                     f"{path}/{entry['name']}",

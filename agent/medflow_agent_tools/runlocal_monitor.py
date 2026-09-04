@@ -34,6 +34,7 @@ from ._train_monitor_helpers import (
     select_wandb_run_by_start_time,
     validate_pid_binding,
     should_return_status_record,
+    is_integer_step_value,
     infer_train_type_from_name,
     normalize_train_type,
     public_train_type,
@@ -73,10 +74,13 @@ DEFAULT_MODEL_API_KEY = (
 )
 DEFAULT_SAVES_ROOT = "/home/workspace/models/dpo_train/internal/saves"
 DEFAULT_BATCH_TRAIN_ROOT = "/home/workspace/models/batch_train"
+DEFAULT_PRETRAIN_ROOT = "/home/workspace/models/pretrain"
 DEFAULT_WANDB_ROOT = "/home/workspace/llamafactory/wandb"
 DEFAULT_LOG_WANDB_ROOT = "/home/workspace/log/wandb/wandb"
 DEFAULT_VERL_WANDB_ROOT = "/home/workspace/verl/wandb"
 DEFAULT_INSINFER_WANDB_ROOT = "/usr/local/insinfersystem/wandb"
+DEFAULT_PRETRAIN_LOG_ROOT = "/home/workspace/log/pretrain"
+DEFAULT_BATCH_TRAIN_LOG_ROOT = "/home/workspace/log/batch_train"
 DEFAULT_HISTORY_LIMIT = 200
 DEFAULT_TIME_WINDOW_MINUTES = 180
 DEFAULT_STALE_MINUTES = 10
@@ -159,6 +163,8 @@ def _payload_for_monitor_display(payload: Dict[str, Any]) -> Dict[str, Any]:
     unconfirmed_startup_train_types = {
         "lora",
         "lora_sft",
+        "pretrain_lora",
+        "pretrain_full",
         "enhanced",
         "multinode_lora_sft",
         "multinode_enhanced",
@@ -192,7 +198,7 @@ def _monitor_protocol_hint(payload: Dict[str, Any]) -> Dict[str, Any]:
     progress_percent = metrics.get("progress_percent")
     latest_loss = metrics.get("latest_loss")
     latest_step = metrics.get("latest_step")
-    latest_epoch = metrics.get("latest_epoch")
+    latest_epoch = None if latest_step is not None else metrics.get("latest_epoch")
     required_params: List[str] = []
     error_reason = str(metrics.get("error_reason") or "")
     if error_reason in {"multiple_containers", "container_unknown", "container_required"}:
@@ -258,6 +264,8 @@ def _monitor_protocol_hint(payload: Dict[str, Any]) -> Dict[str, Any]:
         "successState": metrics.get("success_state"),
         "completionReason": metrics.get("completion_reason"),
         "errorReason": error_reason or None,
+        "errorSummary": metrics.get("error_summary") or None,
+        "errorDetail": metrics.get("error_detail") or None,
         "errorRecoverable": bool(error_reason) and error_reason != "pid_ended_no_wandb",
     }
 
@@ -818,7 +826,7 @@ def _parse_ps_aux(ps_output: str) -> List[Dict[str, Any]]:
             continue
         pid = parts[1]
         output_dir = _extract_param(cmd, "--output_dir") or _extract_param(cmd, "--output-dir") or ""
-        train_type = normalize_train_type(_extract_param(cmd, "--stage") or _infer_train_type(cmd))
+        train_type = normalize_train_type(_infer_train_type(cmd))
         processes.append(
             {
                 "pid": pid,
@@ -876,10 +884,110 @@ def _is_training_cmd(cmd: str) -> bool:
 def _infer_train_type(cmd: str) -> Optional[str]:
     if not cmd:
         return None
+    named_type = normalize_train_type(infer_train_type_from_name(cmd))
+    if named_type:
+        return named_type
+    stage = (_extract_param(cmd, "--stage") or "").strip().lower()
+    finetuning_type = (
+        _extract_param(cmd, "--finetuning_type")
+        or _extract_param(cmd, "--finetuning-type")
+        or ""
+    ).strip().lower()
+    if stage == "pt":
+        return "pretrain_full" if finetuning_type == "full" else "pretrain_lora"
     stage_type = normalize_train_type(_extract_param(cmd, "--stage"))
     if stage_type:
         return stage_type
-    return normalize_train_type(infer_train_type_from_name(cmd))
+    return None
+
+
+def _read_proc_cmdline(container: str, pid: Optional[str]) -> str:
+    if not container or not pid:
+        return ""
+    script = r"""
+import sys
+pid = sys.argv[1]
+try:
+    with open(f"/proc/{pid}/cmdline", "rb") as f:
+        data = f.read().replace(b"\x00", b" ").decode("utf-8", "ignore")
+    print(data.strip())
+except Exception:
+    print("")
+"""
+    code, out, _ = _docker_exec_python(container, script, [str(pid)])
+    if code == 0 and out:
+        return out.strip()
+    return ""
+
+
+def _pretrain_stdout_log_path(output_dir: Optional[str]) -> Optional[str]:
+    return _trainer_stdout_log_path(output_dir, "pretrain_lora")
+
+
+def _trainer_stdout_log_path(
+    output_dir: Optional[str],
+    train_type_public: Optional[str],
+) -> Optional[str]:
+    if not output_dir:
+        return None
+    name = os.path.basename(str(output_dir).rstrip("/"))
+    if not name:
+        return None
+    if train_type_public in {"pretrain_lora", "pretrain_full"}:
+        if not (name.startswith("model_pretrain_lora_") or name.startswith("model_pretrain_full_")):
+            return None
+        return f"{DEFAULT_PRETRAIN_LOG_ROOT.rstrip('/')}/{name}-train-log.log"
+    if train_type_public in {"lora_sft", "full_sft"}:
+        if not (name.startswith("model_lora_") or name.startswith("model_full_")):
+            return None
+        return f"{DEFAULT_BATCH_TRAIN_LOG_ROOT.rstrip('/')}/{name}-train-log.log"
+    return None
+
+
+def _find_pretrain_log_by_output_dir(container: str, output_dir: Optional[str]) -> Optional[str]:
+    path = _trainer_stdout_log_path(output_dir, "pretrain_lora")
+    if path and _docker_exec(container, ["test", "-f", path])[0] == 0:
+        return path
+    return None
+
+
+def _find_trainer_stdout_log_by_output_dir(
+    container: str,
+    output_dir: Optional[str],
+    train_type_public: Optional[str],
+) -> Optional[str]:
+    path = _trainer_stdout_log_path(output_dir, train_type_public)
+    if path and _docker_exec(container, ["test", "-f", path])[0] == 0:
+        return path
+    return None
+
+
+def _resolve_output_dir_from_pid_context(
+    container: str,
+    pid: Optional[str],
+    pid_record: Optional[Dict[str, Any]],
+) -> Tuple[Optional[str], Optional[str]]:
+    if isinstance(pid_record, dict):
+        for key in ("output_dir", "outputDir"):
+            value = str(pid_record.get(key) or "").strip()
+            if value:
+                return value, f"pid_registry:{key}"
+        command = str(pid_record.get("command") or "")
+        output_dir = _extract_param(command, "--output_dir") or _extract_param(command, "--output-dir")
+        if output_dir:
+            return output_dir, "pid_registry:command"
+        script_args = pid_record.get("script_args")
+        if isinstance(script_args, dict):
+            for key in ("output_dir", "output-dir"):
+                value = str(script_args.get(key) or "").strip()
+                if value:
+                    return value, f"pid_registry:script_args:{key}"
+
+    cmdline = _read_proc_cmdline(container, pid)
+    output_dir = _extract_param(cmdline, "--output_dir") or _extract_param(cmdline, "--output-dir")
+    if output_dir:
+        return output_dir, "proc_cmdline"
+    return None, None
 
 
 def _select_process(
@@ -1067,6 +1175,18 @@ def _to_float_or_none(value: Any) -> Optional[float]:
         return float(value)
     except Exception:
         return None
+
+
+def _latest_integer_step_from_history(history: Any) -> Optional[Any]:
+    if not isinstance(history, list):
+        return None
+    for item in reversed(history):
+        if not isinstance(item, dict):
+            continue
+        step = item.get("step")
+        if is_integer_step_value(step):
+            return step
+    return None
 
 
 def _apply_finished_wandb_status(
@@ -1374,6 +1494,57 @@ def _format_disk_warning_summary(warning: Optional[Dict[str, str]]) -> str:
     return f"磁盘提示：{path} 使用率超过 {threshold}%，剩余空间 {available}。"
 
 
+def _summarize_training_error_from_logs(*texts: Any) -> str:
+    joined = "\n".join(str(text or "") for text in texts if str(text or "").strip())
+    if not joined:
+        return ""
+    lower = joined.lower()
+    lines = [line.strip() for line in joined.splitlines() if line.strip()]
+
+    if "cannot find sufficient samples" in lower or (
+        "sufficient samples" in lower and "dataset size" in lower
+    ):
+        return "可用训练样本不足，数据集太小或预处理后没有足够样本，请增加数据量或检查数据格式。"
+    if "cuda out of memory" in lower or re.search(r"\boom\b", lower):
+        return "显存不足，训练进程被 CUDA OOM 中断。"
+    if (
+        "no space left on device" in lower
+        or "disk quota exceeded" in lower
+        or " is over " in lower and "available space" in lower
+        or "磁盘" in joined and ("空间不足" in joined or "剩余空间" in joined)
+    ):
+        return "磁盘空间不足或剩余空间过低，训练无法继续写入日志或模型文件。"
+    for line in lines:
+        line_lower = line.lower()
+        if not re.search(r"(?:no checkpoint found|checkpoint .* not found|model .* not found|no such file or directory|file not found|not found|cannot find)", line_lower):
+            continue
+        if re.search(r"(?:checkpoint|ckpt|model|adapter|safetensors|\.bin\b)", line_lower):
+            return "找不到模型或 checkpoint 文件，训练无法继续。"
+    for line in lines:
+        line_lower = line.lower()
+        if re.search(r"(?:no such file or directory|file not found|not found|cannot find)", line_lower):
+            if line_lower.lstrip().startswith(("[", "+", "/usr/local/insinfersystem/train")):
+                continue
+            return "找不到训练所需的文件或路径，请检查启动参数中的目录配置。"
+    if re.search(r"(?:no checkpoint found|checkpoint .* not found|model .* not found)", lower):
+        return "找不到模型或 checkpoint 文件，训练无法继续。"
+    if re.search(r"(?:no such file or directory|file not found|not found|cannot find)", lower):
+        return "找不到训练所需的文件或路径，请检查启动参数中的目录配置。"
+    if re.search(r"(?:returned non-zero|non-zero exit|exit status|exit code|calledprocesserror)", lower):
+        return "训练脚本返回非零退出码，可能是启动参数、环境或依赖配置错误。"
+    if re.search(r"(?:sigkill|killed|137\b|exitcode_137)", lower):
+        return "训练进程被系统结束，可能是内存/显存不足、资源限制或手动终止。"
+    if "segmentation fault" in lower:
+        return "训练进程发生段错误，可能与底层依赖、驱动或运行环境有关。"
+    if "permission denied" in lower:
+        return "训练进程没有访问所需文件或目录的权限。"
+    if "runtimeerror" in lower or "traceback" in lower or "exception" in lower:
+        return "训练脚本抛出运行时异常，请查看日志中的 traceback 定位具体报错。"
+    if "loss_not_finite" in lower or re.search(r"\b(?:nan|inf)\b", lower):
+        return "训练指标出现 NaN 或 Inf，训练未能稳定继续。"
+    return ""
+
+
 def _load_status_registry() -> List[Dict[str, Any]]:
     if not os.path.exists(_TRAIN_STATUS_REGISTRY):
         return []
@@ -1460,15 +1631,24 @@ def _build_payload_from_status_record(
     succeeded = bool(status == "finished" and not error_reason)
     completion_reason = record.get("completion_reason") or ("status_registry_finished" if succeeded else None)
     completion_source = record.get("completion_source") or ("status_registry" if succeeded else None)
+    error_summary = _summarize_training_error_from_logs(
+        record.get("output_log_error"),
+        record.get("launch_log_tail"),
+        error_reason,
+    )
     analysis_text = "训练状态已记录。"
     if status == "finished":
         analysis_text = f"训练已结束，最后loss为{latest_loss}，请根据需要检查最终指标与模型导出。"
     elif status == "failed":
-        analysis_text = f"当前训练状态异常，错误原因为“{error_reason}”，请检查日志与容器进程以进一步排查问题。"
+        if error_summary:
+            analysis_text = f"当前训练状态异常。原因：{error_summary}"
+        else:
+            analysis_text = f"当前训练状态异常，错误原因为“{error_reason}”，请检查日志与容器进程以进一步排查问题。"
     elif status == "interrupted":
+        reason_text = error_summary or f"未检测到正常完成标记（原因：{error_reason}），请检查日志或确认是否手动终止。"
         analysis_text = (
             f"训练已中断或提前停止，最后loss为{latest_loss}，"
-            f"未检测到正常完成标记（原因：{error_reason}），请检查日志或确认是否手动终止。"
+            f"原因：{reason_text}"
         )
     record_train_type = normalize_train_type(record.get("train_type") or record.get("trainType"))
     record_launch_mode = record.get("launch_mode") or record.get("launchMode")
@@ -1503,6 +1683,8 @@ def _build_payload_from_status_record(
             "completion_source": completion_source,
             "output_log_success": record.get("output_log_success"),
             "error_reason": error_reason,
+            "error_summary": error_summary or None,
+            "error_detail": record.get("output_log_error"),
             "history": [],
             "history_count": 0,
             "loss_source": "status_registry",
@@ -2895,7 +3077,15 @@ def _build_finished_payload_from_dpo_launch_log(
     if not export_dir and output_dir:
         save_name = os.path.basename(output_dir.rstrip("/"))
         if save_name:
-            export_dir = f"/home/workspace/models/dpo_train/internal/export/model_medical_{save_name}"
+            export_candidates = [
+                f"/home/workspace/models/dpo_train/internal/export/model_dpo_{save_name}",
+                f"/home/workspace/models/dpo_train/internal/export/model_medical_{save_name}",
+            ]
+            export_dir = export_candidates[0]
+            for candidate in export_candidates:
+                if _docker_exec(container, ["test", "-d", candidate], timeout=5)[0] == 0:
+                    export_dir = candidate
+                    break
 
     record_train_type = normalize_train_type(
         (pid_record or {}).get("train_type") or (pid_record or {}).get("trainType")
@@ -2992,9 +3182,9 @@ def _read_wandb_run(
     metadata = _read_wandb_json_file(container, metadata_path) if run_dir else None
 
     history_records: List[Dict[str, Any]] = []
-    history_count = None
+    raw_history_count = None
     if run_dir:
-        history_records, history_count = _read_wandb_history_tail(container, history_path, history_limit)
+        history_records, raw_history_count = _read_wandb_history_tail(container, history_path, history_limit)
 
     last_update_time = None
     if run_dir:
@@ -3025,19 +3215,19 @@ def _read_wandb_run(
         or (isinstance(state, str) and state.lower() in {"failed", "crashed", "error"})
     )
 
+    valid_history = extracted.get("history") or []
     history_truncated = (
-        history_count is not None and history_count > len(history_records)
+        raw_history_count is not None and raw_history_count > len(history_records)
     )
 
     return {
         "summary": summary,
         "metadata": metadata,
-        "history": extracted.get("history") or [],
+        "history": valid_history,
         "history_raw": history_records,
         "latest": extracted.get("latest"),
-        "history_count": len(extracted.get("history") or [])
-        if history_count is None
-        else history_count,
+        "history_count": len(valid_history),
+        "raw_history_count": raw_history_count,
         "history_truncated": history_truncated,
         "last_update_time": extracted.get("last_update_time"),
         "loss_key": extracted.get("loss_key"),
@@ -3140,6 +3330,7 @@ def _persist_wandb_snapshot(
         "run_dir": run_dir,
         "captured_at": datetime.now().isoformat(),
         "history_count": wandb_data.get("history_count"),
+        "raw_history_count": wandb_data.get("raw_history_count"),
         "history_truncated": wandb_data.get("history_truncated"),
         "exitcode": wandb_data.get("exitcode"),
         "state": wandb_data.get("state"),
@@ -3303,6 +3494,12 @@ def pick_loss(d):
             return to_number(d[k])
     return None
 
+def pick_lr(d):
+    for k in ("lr", "learning_rate", "train/lr", "train_learning_rate"):
+        if k in d:
+            return to_number(d[k])
+    return None
+
 def pick_step(d):
     for k in ("current_steps", "step", "global_step", "iteration"):
         if k in d:
@@ -3333,6 +3530,18 @@ def pick_max(d):
             return to_int_if_possible(d[k])
     return None
 
+def pick_elapsed(d):
+    for k in ("elapsed_time", "elapsed"):
+        if k in d and d[k] is not None:
+            return str(d[k])
+    return None
+
+def pick_remaining(d):
+    for k in ("remaining_time", "remaining"):
+        if k in d and d[k] is not None:
+            return str(d[k])
+    return None
+
 count = 0
 with open(path, "r", encoding="utf-8", errors="ignore") as f:
     for line in f:
@@ -3348,23 +3557,44 @@ with open(path, "r", encoding="utf-8", errors="ignore") as f:
             "step": pick_step(data),
             "epoch": pick_epoch(data),
             "loss": pick_loss(data),
+            "learning_rate": pick_lr(data),
             "percent": pick_percent(data),
             "completed_steps": pick_completed(data),
             "max_steps": pick_max(data),
+            "elapsed_time": pick_elapsed(data),
+            "remaining_time": pick_remaining(data),
         }
         history.append(item)
 
 if limit > 0 and len(history) > limit:
     history = history[-limit:]
-latest = history[-1] if history else None
+latest = None
+for item in reversed(history):
+    if item.get("loss") is not None:
+        latest = item
+        break
+if latest is None and history:
+    latest = history[-1]
 mtime = os.path.getmtime(path)
 finished = False
-if latest:
-    percent = latest.get("percent")
+progress_percent = None
+current_step = None
+total_steps = None
+elapsed_time = None
+remaining_time = None
+progress_item = history[-1] if history else latest
+if progress_item:
+    percent = progress_item.get("percent")
     if isinstance(percent, (int, float)) and percent >= 100:
         finished = True
-    completed = latest.get("completed_steps")
-    max_steps = latest.get("max_steps")
+    if isinstance(percent, (int, float)):
+        progress_percent = f"{percent:g}%"
+    current_step = progress_item.get("step")
+    completed = progress_item.get("completed_steps")
+    max_steps = progress_item.get("max_steps")
+    total_steps = max_steps
+    elapsed_time = progress_item.get("elapsed_time")
+    remaining_time = progress_item.get("remaining_time")
     if isinstance(completed, (int, float)) and isinstance(max_steps, (int, float)) and max_steps > 0 and completed >= max_steps:
         finished = True
 
@@ -3373,7 +3603,17 @@ print(json.dumps({
     "latest": latest,
     "count": count,
     "last_update_time": datetime.datetime.fromtimestamp(mtime).isoformat(),
-    "finished": finished
+    "finished": finished,
+    "path": path,
+    "progress_percent": progress_percent,
+    "current_step": current_step,
+    "total_steps": total_steps,
+    "elapsed_time": elapsed_time,
+    "remaining_time": remaining_time,
+    "progress_realtime_confirmed": current_step is not None,
+    "progress_realtime_reason": "trainer_log",
+    "training_start_signal": bool(history),
+    "completion_info": {"completed": finished, "succeeded": finished}
 }))
 """
     code, out, _ = _docker_exec_python(container, script, [log_path, str(history_limit)])
@@ -3903,6 +4143,12 @@ def monitor_training(
             else ""
         )
         dpo_launch_state = _parse_dpo_launch_log_state(launch_log_tail_for_state)
+        uses_trainer_log_metrics = train_type_public in {
+            "pretrain_lora",
+            "pretrain_full",
+            "lora_sft",
+            "full_sft",
+        }
 
         run_start_time: Optional[datetime] = None
         if selected_proc:
@@ -3914,15 +4160,34 @@ def monitor_training(
         if run_start_time:
             cutoff_ts = max(cutoff_ts, run_start_time.timestamp())
 
+        if not output_dir:
+            context_output_dir, context_output_dir_source = _resolve_output_dir_from_pid_context(
+                container_name,
+                pid,
+                pid_record,
+            )
+            if context_output_dir:
+                output_dir = context_output_dir
+                output_dir_source = context_output_dir_source or "pid_context"
+
         allow_output_dir_scan = pid_source != "input"
         if not output_dir and allow_output_dir_scan:
-            output_dir = _scan_latest_dir(container_name, DEFAULT_BATCH_TRAIN_ROOT, cutoff_ts)
+            scan_root = (
+                DEFAULT_PRETRAIN_ROOT
+                if train_type_public in {"pretrain_lora", "pretrain_full"}
+                else DEFAULT_BATCH_TRAIN_ROOT
+            )
+            output_dir = _scan_latest_dir(container_name, scan_root, cutoff_ts)
             if output_dir:
-                output_dir_source = "scan:batch_train"
+                output_dir_source = "scan:pretrain" if scan_root == DEFAULT_PRETRAIN_ROOT else "scan:batch_train"
         if not output_dir and allow_output_dir_scan:
             output_dir = _scan_latest_dir(container_name, DEFAULT_SAVES_ROOT, cutoff_ts)
             if output_dir:
                 output_dir_source = "scan:saves"
+        if not output_dir and train_type_public in {"pretrain_lora", "pretrain_full"}:
+            output_dir = _scan_latest_dir(container_name, DEFAULT_PRETRAIN_ROOT, cutoff_ts)
+            if output_dir:
+                output_dir_source = "scan:pretrain"
 
         output_dir_exists = None
         if output_dir:
@@ -3959,7 +4224,11 @@ def monitor_training(
                 wandb_root = cmd_wandb_root
                 wandb_root_source = "process_cmd"
 
-        training_log_path = None
+        training_log_path = (
+            _find_trainer_stdout_log_by_output_dir(container_name, output_dir, train_type_public)
+            if uses_trainer_log_metrics
+            else None
+        )
         wandb_url = _read_wandb_url_file(pid) if pid else None
         wandb_url_source = "pid_file" if wandb_url else None
         wandb_url_file = _wandb_url_file(pid) if pid else None
@@ -4110,7 +4379,11 @@ def monitor_training(
 
             disk_warning = _extract_ray_disk_warning(launch_log_tail)
             disk_warning_summary = _format_disk_warning_summary(disk_warning)
-            analysis_text = "训练已中断或异常结束（未检测到对应的 wandb 记录），请检查日志或确认是否手动终止。"
+            error_summary = (
+                _summarize_training_error_from_logs(disk_warning_summary, launch_log_tail)
+                or "训练进程已结束，但没有找到本次训练的指标或完成记录，可能是启动失败、手动停止或进程提前退出。"
+            )
+            analysis_text = f"训练已中断或异常结束。原因：{error_summary}"
             if launch_log_tail and not disk_warning_summary:
                 launch_log_summary = _format_launch_log_tail_for_user(
                     launch_log_tail,
@@ -4130,6 +4403,7 @@ def monitor_training(
                     "launch_log_tail": launch_log_tail,
                     "disk_warning": disk_warning,
                     "disk_warning_summary": disk_warning_summary or None,
+                    "error_summary": error_summary,
                 },
                 "analysis_text": analysis_text,
             }
@@ -4192,9 +4466,13 @@ def monitor_training(
                 output_log_full_data = _read_output_log(container_name, output_log_path, count)
 
         if not wandb_url and pid and pid_alive:
-            training_log_path = _find_log_file_by_pid(container_name, pid)
-            if training_log_path:
-                wandb_url = _read_wandb_url_from_log_file(container_name, training_log_path)
+            pid_log_path = _find_log_file_by_pid(container_name, pid)
+            if not training_log_path:
+                training_log_path = pid_log_path
+            for candidate_log_path in [training_log_path, pid_log_path]:
+                if not candidate_log_path:
+                    continue
+                wandb_url = _read_wandb_url_from_log_file(container_name, candidate_log_path)
                 if wandb_url:
                     dup_run_id = _extract_run_id_from_wandb_url(wandb_url)
                     if dup_run_id and dup_run_id in _list_pid_url_run_ids(pid):
@@ -4203,6 +4481,8 @@ def monitor_training(
                     else:
                         _write_wandb_url_file(pid, wandb_url)
                         wandb_url_source = "training_log"
+                        training_log_path = candidate_log_path
+                        break
         wandb_url_run_id = _extract_run_id_from_wandb_url(wandb_url)
         run_id = wandb_url_run_id or _extract_wandb_run_id(wandb_run_name, wandb_run_dir)
         if run_id and (training_log_path is None or wandb_url is None):
@@ -4226,6 +4506,16 @@ def monitor_training(
         pid_record_log_path = _extract_log_file(str(pid_record.get("command") or "")) if pid_record else None
         if (not training_log_path) and pid_record_log_path:
             training_log_path = pid_record_log_path
+        trainer_stdout_log_path = (
+            _find_trainer_stdout_log_by_output_dir(container_name, output_dir, train_type_public)
+            if uses_trainer_log_metrics
+            else None
+        )
+        if trainer_stdout_log_path and (
+            not training_log_path
+            or str(training_log_path).startswith("/usr/local/insinfersystem/")
+        ):
+            training_log_path = trainer_stdout_log_path
         if (not wandb_url) and pid_record_log_path and pid_record_log_path != training_log_path and wandb_mode != "offline":
             log_wandb_url = _read_wandb_url_from_log_file(container_name, pid_record_log_path)
             if log_wandb_url:
@@ -4252,6 +4542,10 @@ def monitor_training(
             not output_log_data or not output_log_data.get("latest")
         ):
             training_log_data = _read_output_log(container_name, training_log_path, history_limit)
+        trainer_log_path = f"{str(output_dir).rstrip('/')}/trainer_log.jsonl" if output_dir else None
+        trainer_log_data: Dict[str, Any] = {}
+        if uses_trainer_log_metrics and trainer_log_path:
+            trainer_log_data = _read_trainer_log(container_name, trainer_log_path, history_limit)
         logger.info(
             "[train-monitor] wandb_url_discovery "
             "container=%s pid=%s wandb_url_file=%s wandb_url_file_exists=%s "
@@ -4267,7 +4561,12 @@ def monitor_training(
             wandb_url_source,
             _extract_run_id_from_wandb_url(wandb_url),
         )
-        effective_output_log_data = _select_effective_log_data(output_log_data, training_log_data)
+        output_or_training_log_data = _select_effective_log_data(output_log_data, training_log_data)
+        effective_output_log_data = (
+            _select_effective_log_data(trainer_log_data, output_or_training_log_data)
+            if uses_trainer_log_metrics
+            else output_or_training_log_data
+        )
         wandb_run_dir_corrected = None
         if wandb_url_run_id and not (wandb_run_dir and wandb_url_run_id in wandb_run_dir):
             matched_run_dir = _find_wandb_run_dir_by_id(container_name, wandb_root, wandb_url_run_id)
@@ -4294,7 +4593,12 @@ def monitor_training(
                 count = output_log_data.get("count")
                 if isinstance(count, int) and count > history_limit:
                     output_log_full_data = _read_output_log(container_name, output_log_path, count)
-                effective_output_log_data = output_log_data
+                output_or_training_log_data = _select_effective_log_data(output_log_data, training_log_data)
+                effective_output_log_data = (
+                    _select_effective_log_data(trainer_log_data, output_or_training_log_data)
+                    if uses_trainer_log_metrics
+                    else output_or_training_log_data
+                )
 
                 history = wandb_data.get("history") or []
                 history = _normalize_history_loss(history)
@@ -4307,35 +4611,45 @@ def monitor_training(
                 latest_loss, loss_parse_note = _normalize_loss_value(raw_latest_loss)
                 latest_epoch = (wandb_data.get("latest") or {}).get("epoch")
                 latest_step = (wandb_data.get("latest") or {}).get("step")
+                if latest_step is None:
+                    latest_step = _latest_integer_step_from_history(history)
                 output_latest = effective_output_log_data.get("latest") if effective_output_log_data else None
                 should_use_output_log = False
                 if output_latest:
                     output_latest_step = output_latest.get("step")
                     output_last_update_time = effective_output_log_data.get("last_update_time")
-                    if latest_loss is None:
+                    output_has_step = isinstance(output_latest_step, (int, float)) or (
+                        isinstance(output_latest_step, str) and output_latest_step.strip() != ""
+                    )
+                    if latest_loss is None and output_has_step:
                         should_use_output_log = True
                     elif isinstance(output_latest_step, (int, float)) and isinstance(latest_step, (int, float)):
                         should_use_output_log = output_latest_step >= latest_step
-                    elif output_last_update_time and last_update_time:
+                    elif output_has_step and output_last_update_time and last_update_time:
                         try:
                             should_use_output_log = datetime.fromisoformat(output_last_update_time) >= datetime.fromisoformat(last_update_time)
                         except ValueError:
                             should_use_output_log = False
-                    elif output_last_update_time and not last_update_time:
+                    elif output_has_step and output_last_update_time and not last_update_time:
                         should_use_output_log = True
 
                 if should_use_output_log:
                     history = effective_output_log_data.get("history") or []
                     history = _normalize_history_loss(history)
-                    history_count = effective_output_log_data.get("count", len(history)) or len(history)
+                    history_count = len(history)
                     last_update_time = effective_output_log_data.get("last_update_time") or last_update_time
-                    loss_source = (
-                        "training_log" if effective_output_log_data is training_log_data else "output.log"
-                    )
+                    if effective_output_log_data is trainer_log_data:
+                        loss_source = "trainer_log"
+                    elif effective_output_log_data is training_log_data:
+                        loss_source = "training_log"
+                    else:
+                        loss_source = "output.log"
                     raw_latest_loss = (effective_output_log_data.get("latest") or {}).get("loss")
                     latest_loss, loss_parse_note = _normalize_loss_value(raw_latest_loss)
                     latest_epoch = (effective_output_log_data.get("latest") or {}).get("epoch")
                     latest_step = (effective_output_log_data.get("latest") or {}).get("step")
+                    if latest_step is None:
+                        latest_step = _latest_integer_step_from_history(history)
                 snapshot_dir = _persist_wandb_snapshot(
                     container_name,
                     wandb_run_name,
@@ -4356,6 +4670,7 @@ def monitor_training(
             _log_data_has_any_metrics(wandb_data)
             or _log_data_has_any_metrics(output_log_data)
             or _log_data_has_any_metrics(training_log_data)
+            or _log_data_has_any_metrics(trainer_log_data)
         )
         if (
             wandb_mode != "offline"
@@ -4392,7 +4707,12 @@ def monitor_training(
             wandb_data = {}
             output_log_data = {}
             output_log_full_data = None
-            effective_output_log_data = _select_effective_log_data(training_log_data, output_log_data)
+            output_or_training_log_data = _select_effective_log_data(training_log_data, output_log_data)
+            effective_output_log_data = (
+                _select_effective_log_data(trainer_log_data, output_or_training_log_data)
+                if uses_trainer_log_metrics
+                else output_or_training_log_data
+            )
 
             logger.info(
                 "[train-monitor] pending_wandb_url_reset_after "
@@ -4416,40 +4736,53 @@ def monitor_training(
         latest_loss, loss_parse_note = _normalize_loss_value(raw_latest_loss)
         latest_epoch = (wandb_data.get("latest") or {}).get("epoch")
         latest_step = (wandb_data.get("latest") or {}).get("step")
+        if latest_step is None:
+            latest_step = _latest_integer_step_from_history(history)
 
         output_latest = effective_output_log_data.get("latest") if effective_output_log_data else None
         should_use_output_log = False
         if output_latest:
             output_latest_step = output_latest.get("step")
             output_last_update_time = effective_output_log_data.get("last_update_time")
-            if latest_loss is None:
+            output_has_step = isinstance(output_latest_step, (int, float)) or (
+                isinstance(output_latest_step, str) and output_latest_step.strip() != ""
+            )
+            if latest_loss is None and output_has_step:
                 should_use_output_log = True
             elif isinstance(output_latest_step, (int, float)) and isinstance(latest_step, (int, float)):
                 should_use_output_log = output_latest_step >= latest_step
-            elif output_last_update_time and last_update_time:
+            elif output_has_step and output_last_update_time and last_update_time:
                 try:
                     should_use_output_log = datetime.fromisoformat(output_last_update_time) >= datetime.fromisoformat(last_update_time)
                 except ValueError:
                     should_use_output_log = False
-            elif output_last_update_time and not last_update_time:
+            elif output_has_step and output_last_update_time and not last_update_time:
                 should_use_output_log = True
 
         if should_use_output_log:
             history = effective_output_log_data.get("history") or []
             history = _normalize_history_loss(history)
-            history_count = effective_output_log_data.get("count", len(history)) or len(history)
+            history_count = len(history)
             last_update_time = effective_output_log_data.get("last_update_time") or last_update_time
-            loss_source = "training_log" if effective_output_log_data is training_log_data else "output.log"
+            if effective_output_log_data is trainer_log_data:
+                loss_source = "trainer_log"
+            elif effective_output_log_data is training_log_data:
+                loss_source = "training_log"
+            else:
+                loss_source = "output.log"
             raw_latest_loss = (effective_output_log_data.get("latest") or {}).get("loss")
             latest_loss, loss_parse_note = _normalize_loss_value(raw_latest_loss)
             latest_epoch = (effective_output_log_data.get("latest") or {}).get("epoch")
             latest_step = (effective_output_log_data.get("latest") or {}).get("step")
+            if latest_step is None:
+                latest_step = _latest_integer_step_from_history(history)
 
         logger.info(
             "[train-monitor] metrics_read "
             "container=%s pid=%s wandb_history_count=%s "
             "wandb_latest_loss_present=%s output_log_latest_present=%s "
-            "training_log_latest_present=%s loss_source=%s latest_loss=%s "
+            "training_log_latest_present=%s trainer_log_latest_present=%s "
+            "loss_source=%s latest_loss=%s "
             "latest_step=%s wandb_select_reason=%s wandb_run_dir=%s",
             container_name,
             pid,
@@ -4457,6 +4790,7 @@ def monitor_training(
             ((wandb_data.get("latest") or {}).get("loss") is not None) if wandb_data else False,
             bool(output_log_data.get("latest")) if output_log_data else False,
             bool(training_log_data.get("latest")) if training_log_data else False,
+            bool(trainer_log_data.get("latest")) if trainer_log_data else False,
             loss_source,
             latest_loss,
             latest_step,
@@ -4474,7 +4808,10 @@ def monitor_training(
             metrics_source=loss_source,
         )
 
-        output_log_payload = output_log_full_data or effective_output_log_data
+        if effective_output_log_data is output_log_data:
+            output_log_payload = output_log_full_data or effective_output_log_data
+        else:
+            output_log_payload = effective_output_log_data
         output_log_error = output_log_payload.get("error_hint") if output_log_payload else None
         output_log_success_hint = output_log_payload.get("success_hint") if output_log_payload else None
         output_log_finished = bool(output_log_payload.get("success_found")) if output_log_payload else False
@@ -4525,8 +4862,8 @@ def monitor_training(
             force_local_step=bool(resume_history_info),
         )
         resume_adjustment_info = resume_step_info or resume_history_info
-        axis = "epoch" if latest_epoch is not None else "step"
-        axis_note = "epoch_missing_use_step" if axis == "step" else "epoch_available"
+        axis = "step" if latest_step is not None else ("epoch" if latest_epoch is not None else "step")
+        axis_note = "step_available" if latest_step is not None else ("epoch_available" if latest_epoch is not None else "epoch_missing_use_step")
 
         iteration_finished = bool(wandb_data.get("finished"))
         wandb_failed = bool(wandb_data.get("failed"))
@@ -4675,6 +5012,28 @@ def monitor_training(
         if status == "failed" and not error_reason:
             error_reason = "unknown"
 
+        error_summary = ""
+        if status in {"failed", "interrupted", "unknown", "stopped"}:
+            error_summary = _summarize_training_error_from_logs(
+                output_log_error,
+                trainer_log_data.get("error") if trainer_log_data else None,
+                launch_log_tail_for_state,
+                error_reason,
+            )
+
+        if latest_step is None and current_step is not None:
+            latest_step = current_step
+        if latest_step is None:
+            latest_step = _latest_integer_step_from_history(history)
+        if status == "finished":
+            progress_percent = "100%"
+            if current_step is None and latest_step is not None:
+                current_step = latest_step
+        else:
+            progress_value = _to_float_or_none(str(progress_percent).rstrip("%") if progress_percent is not None else None)
+            if progress_value is not None:
+                progress_percent = f"{max(0.0, min(100.0, progress_value)):g}%"
+
         if pid and status in {"finished", "failed", "interrupted"}:
             _record_train_status(
                 container_name,
@@ -4720,11 +5079,15 @@ def monitor_training(
         indicator_text = (
             f"指标：状态={_status_cn(status)}，"
             f"loss={_fmt_float(latest_loss, 4)}，"
-            f"epoch={_fmt_float(latest_epoch, 4)}，"
             f"step={latest_step if latest_step is not None else 'N/A'}，"
-                    f"来源={loss_source}，"
+            f"来源={loss_source}，"
             f"last_update={last_update_time or 'N/A'}"
         )
+        if latest_step is None:
+            indicator_text = indicator_text.replace(
+                "step=N/A，",
+                f"epoch={_fmt_float(latest_epoch, 4)}，step=N/A，",
+            )
         if stale_minutes is not None:
             indicator_text += f"（stale={stale}，{stale_minutes}min）"
 
@@ -4770,12 +5133,13 @@ def monitor_training(
             if status == "finished":
                 analysis_text = f"训练已结束，最后loss为{latest_loss}，请根据需要检查最终指标与模型导出。"
             elif status == "failed":
-                analysis_text = f"当前训练状态异常，错误原因为“{error_reason}”，请检查日志与容器进程以进一步排查问题。"
+                if error_summary:
+                    analysis_text = f"当前训练状态异常。原因：{error_summary}"
+                else:
+                    analysis_text = f"当前训练状态异常，错误原因为“{error_reason}”，请检查日志与容器进程以进一步排查问题。"
             elif status == "interrupted":
-                analysis_text = (
-                    f"训练已中断或提前停止，最后loss为{latest_loss}，"
-                    f"未检测到正常完成标记（原因：{error_reason}），请检查日志或确认是否手动终止。"
-                )
+                reason_text = error_summary or "未检测到正常完成标记，可能是进程提前退出或被手动终止。"
+                analysis_text = f"训练已中断或提前停止，最后loss为{latest_loss}。原因：{reason_text}"
             elif status == "starting":
                 analysis_text = f"{STARTING_TEXT}（指标数据尚未写入）"
             elif merge_status == "running" and dpo_sub_stage == "merge":
@@ -4785,6 +5149,20 @@ def monitor_training(
 
         # ===== 新增：无论是否调用 LLM，都把“指标”放在最前面 =====
         analysis_text = f"{indicator_text}\n{analysis_text}"
+
+        metrics_log_path = (output_log_payload.get("path") if output_log_payload else None) or training_log_path
+        if output_log_payload is trainer_log_data:
+            metrics_log_source = "trainer_log"
+        elif output_log_payload is training_log_data:
+            metrics_log_source = "training_log"
+        elif output_log_payload:
+            metrics_log_source = (
+                "wandb_output_log"
+                if str(output_log_payload.get("path") or "").endswith("/files/output.log")
+                else loss_source
+            )
+        else:
+            metrics_log_source = None
 
         payload = {
             "status": status,
@@ -4816,12 +5194,8 @@ def monitor_training(
                 "wandb_run_dir_corrected": wandb_run_dir_corrected,
                 "wandb_url_pending": bool(training_process_exists and not wandb_url and wandb_mode != "offline"),
                 "training_log_path": training_log_path,
-                "metrics_log_path": (output_log_payload.get("path") if output_log_payload else None) or training_log_path,
-                "metrics_log_source": (
-                    "wandb_output_log"
-                    if output_log_payload and output_log_payload is not training_log_data
-                    else ("training_log" if output_log_payload else None)
-                ),
+                "metrics_log_path": metrics_log_path,
+                "metrics_log_source": metrics_log_source,
                 "pid": pid,
                 "pid_alive": pid_alive,
                 "pid_source": pid_source,
@@ -4831,7 +5205,7 @@ def monitor_training(
                 "latest_loss": latest_loss,
                 "latest_learning_rate": latest_learning_rate,
                 "latest_kl_coef": latest_kl_coef,
-                "latest_epoch": latest_epoch,
+                "latest_epoch": latest_epoch if latest_step is None else None,
                 "latest_step": latest_step,
                 "resume_checkpoint": (
                     resume_adjustment_info.get("resume_checkpoint") if resume_adjustment_info else None
@@ -4872,7 +5246,7 @@ def monitor_training(
                 "progress_realtime_confirmed": progress_realtime_confirmed,
                 "progress_realtime_reason": progress_realtime_reason,
                 "training_start_signal": output_log_payload.get("training_start_signal") if output_log_payload else False,
-                "latest_step_or_epoch": latest_epoch if latest_epoch is not None else latest_step,
+                "latest_step_or_epoch": latest_step if latest_step is not None else latest_epoch,
                 "axis": axis,
                 "axis_note": axis_note,
                 "history_count": history_count,
@@ -4892,6 +5266,7 @@ def monitor_training(
                 "output_log_success_hint": output_log_success_hint,
                 "iteration_finished": iteration_finished,
                 "error_reason": error_reason,
+                "error_summary": error_summary or None,
                 "error_detail": output_log_error if status == "failed" else None,
                 "debug": {
                     "selected_cmd": selected_proc.get("cmd") if selected_proc else None,
@@ -4899,12 +5274,16 @@ def monitor_training(
                     "wandb_history_path": wandb_data.get("history_path"),
                     "wandb_summary_path": wandb_data.get("summary_path"),
                     "wandb_metadata_path": wandb_data.get("metadata_path"),
+                    "wandb_raw_history_count": wandb_data.get("raw_history_count"),
                     "wandb_exitcode": wandb_data.get("exitcode"),
                     "wandb_state": wandb_data.get("state"),
                     "wandb_loss_key": wandb_data.get("loss_key"),
                     "wandb_step_key": wandb_data.get("step_key"),
                     "wandb_epoch_key": wandb_data.get("epoch_key"),
                     "wandb_history_truncated": wandb_data.get("history_truncated"),
+                    "trainer_log_path": trainer_log_path,
+                    "trainer_log_latest": trainer_log_data.get("latest") if trainer_log_data else None,
+                    "trainer_log_error": trainer_log_data.get("error") if trainer_log_data else None,
                     "output_log_path": effective_output_log_data.get("path") if effective_output_log_data else None,
                     "output_log_latest": effective_output_log_data.get("latest") if effective_output_log_data else None,
                     "output_log_error": output_log_error,

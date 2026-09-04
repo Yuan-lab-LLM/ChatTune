@@ -70,6 +70,8 @@ Data preprocessing uses the latest dated data by default. To use an older datase
 | LoRA batch training | `执行lora批量训练` |
 | Custom LoRA batch-training parameters | `执行lora批量训练，MBS=1，ACC=8，LR=1e-7` |
 | Full-parameter batch training | `执行全参批量训练` |
+| LoRA PT pretraining | `执行lora预训练` |
+| Full-parameter PT pretraining | `执行全参预训练` |
 | DPO enhanced training | `执行增强训练` |
 | GRPO training | `执行grpo训练` |
 
@@ -77,9 +79,9 @@ When required parameters are missing, Agent will ask follow-up questions.
 
 The current version of batch training and enhanced training supports the Qwen3 series for both training and evaluation by default. If you need to use other models, please explicitly specify the model template via the TEM or template parameter when executing training, for example: 执行lora批量训练，TEM=llama3 or 执行增强训练，template=deepseekr1.
 
-LoRA batch training and full-parameter batch training use the latest model under `/home/workspace/models/base` by default. To use another model, specify it explicitly, for example: `执行lora批量训练，模型在xxxx`.
+LoRA batch training, full-parameter batch training, and PT pretraining use the latest model under `/home/workspace/models/base` by default. To use another model, specify it explicitly, for example: `执行lora批量训练，模型在xxxx`.
 
-LoRA batch training and full-parameter batch training use the latest dated dataset by default. To use an older dataset, select it in the left data-management tab and click `Train with this`.
+LoRA batch training, full-parameter batch training, and PT pretraining use the latest dated dataset by default. To use an older dataset, select it in the left data-management tab and click `Train with this`.
 
 ## Multi-node Training
 

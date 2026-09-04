@@ -10,12 +10,27 @@ const DATASET_PATHS = {
     raw: '/home/workspace/dataset',
     sft: '/home/workspace/dataset_batch_train',
     dpo: '/home/workspace/dataset_daily_train',
+    pt: '/home/workspace/dataset_pretrain',
+};
+type DatasetType = keyof typeof DATASET_PATHS;
+
+const DATASET_DATA_EXTENSIONS: Record<DatasetType, string[]> = {
+    raw: ['.json'],
+    sft: ['.json'],
+    dpo: ['.json'],
+    pt: ['.json', '.jsonl', '.txt'],
+};
+
+const datasetFileMatchesType = (filename: string, datasetType: DatasetType): boolean => {
+    const lowerName = filename.toLowerCase();
+    return DATASET_DATA_EXTENSIONS[datasetType].some((extension) => lowerName.endsWith(extension));
 };
 
 // 模型路径映射
 const MODEL_PATHS = {
     base_train: '/home/workspace/models/base',
     batch_trained: '/home/workspace/models/batch_train',
+    pretrain: '/home/workspace/models/pretrain',
     daily_trained: '/home/workspace/models/dpo_train/internal/saves',
     inference: '/home/workspace/medical_models',
 };
@@ -291,6 +306,7 @@ export class DockerManager {
             DATASET_PATHS.raw,
             DATASET_PATHS.sft,
             DATASET_PATHS.dpo,
+            DATASET_PATHS.pt,
         ];
         const counts = await Promise.all(
             datasetPaths.map(async (datasetPath: string) => {
@@ -327,6 +343,7 @@ export class DockerManager {
         const modelPaths = [
             MODEL_PATHS.base_train,
             MODEL_PATHS.batch_trained,
+            MODEL_PATHS.pretrain,
             DPO_MODEL_PATHS.saves,
             DPO_MODEL_PATHS.export,
             MODEL_PATHS.inference,
@@ -758,8 +775,12 @@ export class DockerManager {
     private async listDatasetSummaries(
         container: string,
         datasetPath: string,
+        datasetType: DatasetType,
     ): Promise<DatasetDirectorySummary[]> {
         const safeDatasetPath = this.escapeForDoubleQuotes(datasetPath);
+        const findNameArgs = DATASET_DATA_EXTENSIONS[datasetType]
+            .map((extension) => `-name "*${extension}"`)
+            .join(' -o ');
         const command = [
             'sh -c ',
             `'if [ ! -d "${safeDatasetPath}" ]; then exit 0; fi; `,
@@ -768,7 +789,7 @@ export class DockerManager {
             `name=$(basename "$d"); `,
             `size=$(du -sb "$d" 2>/dev/null | cut -f1); `,
             `mtime=$(stat -c "%y" "$d" 2>/dev/null | cut -d "." -f1); `,
-            `files=$(find "$d" -maxdepth 1 -type f -name "*.json" ! -name "dataset_info.json" ! -name "preprocessing_audit.json" ! -name "preprocessing_summary.json" ! -name "score_audit.json" ! -name "score_summary.json" -exec basename {} \\; 2>/dev/null | tr "\\n" "\\t"); `,
+            `files=$(find "$d" -maxdepth 1 -type f \\( ${findNameArgs} \\) ! -name "dataset_info.json" ! -name "preprocessing_audit.json" ! -name "preprocessing_summary.json" ! -name "score_audit.json" ! -name "score_summary.json" -exec basename {} \\; 2>/dev/null | tr "\\n" "\\t"); `,
             `printf "%s\\t%s\\t%s\\t%s\\n" "$name" "$size" "$mtime" "$files"; `,
             `done'`,
         ].join('');
@@ -809,7 +830,7 @@ export class DockerManager {
     ): Promise<ModelDirectorySummary[]> {
         const safeModelPath = this.escapeForDoubleQuotes(modelPath);
         const mergedCommand = includeMerged
-            ? `merged=$(find "$d" -maxdepth 1 -name "*_merged*" -print -quit 2>/dev/null); `
+            ? `if echo "$name" | grep -Eq "(^|[_-])merged$"; then merged="$d"; elif [ -d "$d"_merged ]; then merged="$d"_merged; else merged=$(find "$d" -maxdepth 1 -name "*_merged*" -print -quit 2>/dev/null); fi; `
             : `merged=""; `;
         const command = [
             'sh -c ',
@@ -1071,7 +1092,7 @@ export class DockerManager {
                     return { dataType, datasets: [] };
                 }
                 
-                const datasetSummaries = await this.listDatasetSummaries(container, path);
+                const datasetSummaries = await this.listDatasetSummaries(container, path, dataType as DatasetType);
                 console.log(`[DockerManager] Found ${datasetSummaries.length} datasets in ${path}`);
                 
                 // 并行获取每个数据集的详情
@@ -1083,15 +1104,15 @@ export class DockerManager {
                 
                 // 过滤掉没有 json 文件的数据集
                 const validDatasets = datasets.filter(details => {
-                    const jsonFileCount = details.files.filter(
-                        (file) => file.endsWith('.json'),
+                    const dataFileCount = details.files.filter(
+                        (file) => datasetFileMatchesType(file, dataType as DatasetType),
                     ).length;
 
-                    if (jsonFileCount > 0) {
-                        console.log(`[DockerManager] Added dataset: ${details.name} (${jsonFileCount} json files)`);
+                    if (dataFileCount > 0) {
+                        console.log(`[DockerManager] Added dataset: ${details.name} (${dataFileCount} data files)`);
                         return true;
                     } else {
-                        console.log(`[DockerManager] Skipped dataset: ${details.name} (no json files)`);
+                        console.log(`[DockerManager] Skipped dataset: ${details.name} (no supported data files)`);
                         return false;
                     }
                 });
@@ -1112,7 +1133,7 @@ export class DockerManager {
 
     async getDatasetFilePreviews(
         container: string,
-        datasetType: 'raw' | 'sft' | 'dpo',
+        datasetType: DatasetType,
         datasetName: string
     ): Promise<DatasetFilePreview[]> {
         const datasetPath = DATASET_PATHS[datasetType];
@@ -1120,14 +1141,14 @@ export class DockerManager {
             throw new Error(`无效的数据集类型: ${datasetType}`);
         }
 
-        const summaries = await this.listDatasetSummaries(container, datasetPath);
+        const summaries = await this.listDatasetSummaries(container, datasetPath, datasetType);
         const summary = summaries.find((item) => item.name === datasetName);
         if (!summary) {
             throw new Error(`数据集 "${datasetName}" 不存在`);
         }
 
         const previewFiles = summary.files.filter(
-            (file) => isVisibleDatasetFile(file) && (file.endsWith('.json')),
+            (file) => isVisibleDatasetFile(file) && datasetFileMatchesType(file, datasetType),
         );
 
         return Promise.all(
@@ -1167,12 +1188,14 @@ export class DockerManager {
         const [
             baseSummaries,
             batchSummaries,
+            pretrainSummaries,
             dpoSaveSummaries,
             dpoExportSummaries,
             inferenceSummaries,
         ] = await Promise.all([
             this.listModelSummaries(container, MODEL_PATHS.base_train, false),
             this.listModelSummaries(container, MODEL_PATHS.batch_trained, true),
+            this.listModelSummaries(container, MODEL_PATHS.pretrain, true),
             this.listModelSummaries(container, DPO_MODEL_PATHS.saves, false),
             this.listModelSummaries(container, DPO_MODEL_PATHS.export, false),
             this.listModelSummaries(container, MODEL_PATHS.inference, false),
@@ -1184,6 +1207,9 @@ export class DockerManager {
             ),
             batch_trained: batchSummaries.map((summary) =>
                 toModelInfo('batch_trained', MODEL_PATHS.batch_trained, summary),
+            ),
+            pretrain: pretrainSummaries.map((summary) =>
+                toModelInfo('pretrain', MODEL_PATHS.pretrain, summary),
             ),
             daily_trained: [
                 ...dpoSaveSummaries.map((summary) =>
@@ -1269,7 +1295,7 @@ export class DockerManager {
      */
     async checkDatasetExists(
         container: string,
-        datasetType: 'raw' | 'sft' | 'dpo',
+        datasetType: DatasetType,
         datasetName: string
     ): Promise<boolean> {
         const basePath = DATASET_PATHS[datasetType];
@@ -1597,14 +1623,14 @@ export class DockerManager {
     /**
      * 检查数据集格式
      * - 检查是否有子目录（要求扁平结构）
-     * - 检查是否只包含 .json 文件
-     * - SFT/DPO 检查是否包含 dataset_info.json（仅警告）
+     * - SFT/DPO 检查是否只包含 .json 文件，PT 允许 .json/.jsonl/.txt
+     * - SFT/DPO/PT 检查是否包含 dataset_info.json（仅警告）
      * @returns { valid: boolean, message?: string, warning?: string }
      */
     private async checkDatasetFormat(
         container: string,
         path: string,
-        datasetType: 'raw' | 'sft' | 'dpo'
+        datasetType: DatasetType
     ): Promise<{ valid: boolean; message?: string; warning?: string }> {
         console.log(`[DockerManager] Checking dataset format: ${path} (type: ${datasetType})`);
         
@@ -1635,7 +1661,7 @@ export class DockerManager {
             errors.push(`检测到子目录：${subDirectories.join(', ')}\n请将所有文件直接放在压缩包根目录，不要包含子文件夹`);
         }
         
-        // 检查是否只包含 .json 文件
+        // 检查是否只包含当前数据类型支持的文件
         const invalidFiles: string[] = [];
         let hasDatasetInfo = false;
         
@@ -1653,8 +1679,7 @@ export class DockerManager {
             }
             
             // 检查文件扩展名
-            const lowerName = entry.toLowerCase();
-            if (!lowerName.endsWith('.json')) {
+            if (!datasetFileMatchesType(entry, datasetType)) {
                 invalidFiles.push(entry);
             }
         }
@@ -1663,7 +1688,8 @@ export class DockerManager {
             // 只显示前 10 个不符合要求的文件
             const displayFiles = invalidFiles.slice(0, 10);
             const moreCount = invalidFiles.length > 10 ? ` 等共${invalidFiles.length}个文件` : '';
-            errors.push(`检测到非 JSON 文件：${displayFiles.join(', ')}${moreCount}\n数据集只能包含 .json 格式的数据文件`);
+            const allowedText = datasetType === 'pt' ? '.json/.jsonl/.txt' : '.json';
+            errors.push(`检测到不支持的文件：${displayFiles.join(', ')}${moreCount}\n该类型数据集只能包含 ${allowedText} 格式的数据文件`);
         }
         
         // raw 原始数据不要求 dataset_info.json；SFT/DPO 缺失时仅提示警告。
@@ -1693,7 +1719,7 @@ export class DockerManager {
      */
     async uploadDataset(
         container: string,
-        datasetType: 'raw' | 'sft' | 'dpo',
+        datasetType: DatasetType,
         datasetName: string,
         fileBuffer: Buffer,
         filename: string
@@ -1836,7 +1862,7 @@ export class DockerManager {
      */
     async downloadDatasetAsTar(
         container: string,
-        datasetType: 'raw' | 'sft' | 'dpo',
+        datasetType: DatasetType,
         datasetName: string
     ): Promise<{ buffer: Buffer | null; filename: string; message: string }> {
         console.log(`[DockerManager] Downloading dataset: ${datasetName} from ${container}`);
@@ -1900,7 +1926,7 @@ export class DockerManager {
      */
     async deleteDataset(
         container: string,
-        datasetType: 'raw' | 'sft' | 'dpo',
+        datasetType: DatasetType,
         datasetName: string,
     ): Promise<{ success: boolean; message: string }> {
         try {
@@ -1927,7 +1953,7 @@ export class DockerManager {
      */
     async deleteModel(
         container: string,
-        modelType: 'base_train' | 'batch_trained' | 'daily_trained' | 'inference',
+        modelType: 'base_train' | 'batch_trained' | 'pretrain' | 'daily_trained' | 'inference',
         modelName: string,
         modelPath?: string,
     ): Promise<{ success: boolean; message: string }> {

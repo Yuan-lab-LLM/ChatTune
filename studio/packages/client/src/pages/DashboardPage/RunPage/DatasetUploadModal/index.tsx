@@ -5,12 +5,14 @@ import { InboxOutlined, FileOutlined } from '@ant-design/icons';
 import type { UploadFile, UploadProps } from 'antd/es/upload/interface';
 import { useEnvironmentConfig } from '@/hooks/useEnvironmentConfig';
 
+type DatasetType = 'raw' | 'sft' | 'dpo' | 'pt';
+
 interface Props {
     open: boolean;
     onCancel: () => void;
     onUpload: (params: {
         containerName: string;
-        datasetType: 'raw' | 'sft' | 'dpo';
+        datasetType: DatasetType;
         datasetName: string;
         file: File;
     }) => Promise<void>;
@@ -38,12 +40,12 @@ const DatasetUploadModal = ({ open, onCancel, onUpload, isUploading, uploadProgr
     const { t } = useTranslation();
     const [form] = Form.useForm();
     const [fileList, setFileList] = useState<UploadFile[]>([]);
-    const [datasetType, setDatasetType] = useState<'raw' | 'sft' | 'dpo'>('raw');
+    const [datasetType, setDatasetType] = useState<DatasetType>('raw');
     const [errorMsg, setErrorMsg] = useState<string>('');
     const { defaultContainerName } = useEnvironmentConfig();
 
     const handleTypeChange = (key: string) => {
-        setDatasetType(key as 'raw' | 'sft' | 'dpo');
+        setDatasetType(key as DatasetType);
         form.setFieldsValue({ datasetType: key });
     };
 
@@ -167,6 +169,10 @@ const DatasetUploadModal = ({ open, onCancel, onUpload, isUploading, uploadProgr
         {
             key: 'dpo',
             label: t('dataset.type.dpo') || 'DPO 数据',
+        },
+        {
+            key: 'pt',
+            label: t('dataset.type.pt') || '预训练文本数据',
         },
     ];
 

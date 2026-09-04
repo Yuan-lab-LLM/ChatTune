@@ -1,5 +1,6 @@
 import importlib
 import sys
+import textwrap
 import types
 import unittest
 from pathlib import Path
@@ -10,24 +11,46 @@ if str(AGENT_ROOT) not in sys.path:
 
 if "agentscope" not in sys.modules:
     agentscope = types.ModuleType("agentscope")
+    credential = types.ModuleType("agentscope.credential")
     tool = types.ModuleType("agentscope.tool")
     message = types.ModuleType("agentscope.message")
+    model = types.ModuleType("agentscope.model")
+
+    class OpenAICredential:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
 
     class ToolResponse:
         def __init__(self, content=None, metadata=None):
             self.content = content or []
             self.metadata = metadata or {}
 
+    class Msg:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
     class TextBlock:
         def __init__(self, type="text", text=""):
             self.type = type
             self.text = text
 
+    class OpenAIChatModel:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+    credential.OpenAICredential = OpenAICredential
     tool.ToolResponse = ToolResponse
+    message.Msg = Msg
     message.TextBlock = TextBlock
+    model.OpenAIChatModel = OpenAIChatModel
     sys.modules["agentscope"] = agentscope
+    sys.modules["agentscope.credential"] = credential
     sys.modules["agentscope.tool"] = tool
     sys.modules["agentscope.message"] = message
+    sys.modules["agentscope.model"] = model
 
 pkg = types.ModuleType("medflow_agent_tools")
 pkg.__path__ = [str(AGENT_ROOT / "medflow_agent_tools")]
@@ -35,6 +58,7 @@ sys.modules.setdefault("medflow_agent_tools", pkg)
 
 runlocal_data = importlib.import_module("medflow_agent_tools.runlocal_data")
 runlocal_train = importlib.import_module("medflow_agent_tools.runlocal_train")
+runlocal_monitor = importlib.import_module("medflow_agent_tools.runlocal_monitor")
 is_supported_template = importlib.import_module("medflow_agent_tools._template_policy").is_supported_template
 
 
@@ -315,5 +339,121 @@ class RuntimePreprocessRuleTests(unittest.TestCase):
         self.assertIn("通用格式只问 `data_type`", config)
         self.assertIn("raw 才问 `data_type` 和 `strategy`", config)
         self.assertNotIn("只有在用户已经明确提供 `data_type` 和 `strategy` 后，才能开始执行数据预处理", config)
+
+
+class TrainingMonitorFriendlyErrorTests(unittest.TestCase):
+    def test_summarizes_cuda_oom_from_launch_log(self):
+        summary = runlocal_monitor._summarize_training_error_from_logs(
+            "RuntimeError: CUDA out of memory. Tried to allocate 1.00 GiB"
+        )
+        self.assertIn("显存不足", summary)
+        self.assertIn("CUDA OOM", summary)
+
+    def test_summarizes_disk_warning_from_log(self):
+        summary = runlocal_monitor._summarize_training_error_from_logs(
+            "/tmp/ray is over 95% full, available space: 128 MiB; capacity: 100 GiB."
+        )
+        self.assertIn("磁盘空间不足", summary)
+
+    def test_summarizes_missing_checkpoint_from_log(self):
+        summary = runlocal_monitor._summarize_training_error_from_logs(
+            "ValueError: no checkpoint found under /home/workspace/model"
+        )
+        self.assertIn("找不到模型或 checkpoint", summary)
+
+    def test_summarizes_insufficient_samples_before_model_path(self):
+        summary = runlocal_monitor._summarize_training_error_from_logs(
+            """
+            [rank0]: RuntimeError: Cannot find sufficient samples, consider increasing dataset size.
+            ['/usr/local/insinfersystem/train', '--model_name_or_path', '/home/workspace/models/base/Qwen3.6-27B'] exits with return code = 1
+            """
+        )
+        self.assertIn("可用训练样本不足", summary)
+        self.assertNotIn("模型或 checkpoint", summary)
+
+    def test_monitor_protocol_hint_exposes_error_summary(self):
+        payload = {
+            "status": "interrupted",
+            "metrics": {
+                "container_name": "qingnang_train",
+                "pid": "19748",
+                "error_reason": "pid_ended_no_wandb",
+                "error_summary": "显存不足，训练进程被 CUDA OOM 中断。",
+            },
+        }
+        protocol = runlocal_monitor._monitor_protocol_hint(payload)
+        self.assertEqual(protocol["status"], "interrupted")
+        self.assertEqual(protocol["errorReason"], "pid_ended_no_wandb")
+        self.assertIn("显存不足", protocol["errorSummary"])
+
+    def test_runtime_formats_interrupted_and_user_friendly_reason(self):
+        source = (AGENT_ROOT / "runtime_agent.py").read_text(encoding="utf-8")
+        self.assertIn('"interrupted": "已中断"', source)
+        self.assertIn("errorSummary", source)
+        self.assertIn("pid_ended_no_wandb", source)
+        self.assertIn("训练进程已结束，但没有找到本次训练的指标或完成记录", source)
+
+
+class RuntimeTrainingNormalizationTests(unittest.TestCase):
+    def _runtime_batch_train_args(self, message):
+        source = (AGENT_ROOT / "runtime_agent.py").read_text(encoding="utf-8")
+        start = source.index("    def _workflow_batch_train_args")
+        end = source.index("    def _workflow_trainer_result", start)
+        namespace = {"re": importlib.import_module("re"), "Dict": dict}
+        exec(textwrap.dedent(source[start:end]), namespace)
+        return namespace["_workflow_batch_train_args"](object(), message)
+
+    def test_batch_train_args_extracts_mixed_multiple_params(self):
+        args = self._runtime_batch_train_args(
+            "训练类型=pretrain_lora，数据类型=PT/text，"
+            "dataset_dir=/home/workspace/dataset_pretrain/20260903 "
+            "tem=qwen3_6 学习率是5e-4"
+        )
+        self.assertEqual(args["DATASET_DIR"], "/home/workspace/dataset_pretrain/20260903")
+        self.assertEqual(args["TEM"], "qwen3_6")
+        self.assertEqual(args["LR"], "5e-4")
+        self.assertNotIn("data_type", args)
+
+    def test_batch_train_args_accepts_template_aliases(self):
+        cases = [
+            ("tem=qwen3_6", "qwen3_6"),
+            ("TEM=qwen3_6", "qwen3_6"),
+            ("模型模板=qwen3_6", "qwen3_6"),
+        ]
+        for message, expected in cases:
+            with self.subTest(message=message):
+                self.assertEqual(self._runtime_batch_train_args(message)["TEM"], expected)
+
+    def test_batch_train_args_accepts_learning_rate_aliases(self):
+        cases = [
+            ("学习率=5e-4", "5e-4"),
+            ("learning_rate=5e-4", "5e-4"),
+            ("LR=5e-4", "5e-4"),
+        ]
+        for message, expected in cases:
+            with self.subTest(message=message):
+                self.assertEqual(self._runtime_batch_train_args(message)["LR"], expected)
+
+    def test_pretrain_normalization_preserves_explicit_template_arg(self):
+        source = (AGENT_ROOT / "runtime_agent.py").read_text(encoding="utf-8")
+        pretrain_branch = source[
+            source.index('mode_text = "全参预训练" if requested_train_type == "pretrain_full" else "LoRA预训练"'):
+            source.index('logger.info(f"[Orchestrator] 训练请求已归一化为 PT预训练: {dataset_ref}")')
+        ]
+        self.assertIn("train_args = self._workflow_batch_train_args(task_description)", pretrain_branch)
+        self.assertIn("explicit_arg_text", pretrain_branch)
+        self.assertIn("explicit_arg_lines", pretrain_branch)
+        self.assertIn("f\"\\n{key}={value}\"", pretrain_branch)
+
+    def test_batch_normalization_preserves_explicit_template_arg(self):
+        source = (AGENT_ROOT / "runtime_agent.py").read_text(encoding="utf-8")
+        batch_branch = source[
+            source.index('if requested_train_type == "full":'):
+            source.index('if is_multinode:', source.index('logger.info(f"[Orchestrator] 训练请求已归一化为 LoRA: {dataset_ref}")') - 500)
+        ]
+        self.assertIn("train_args = self._workflow_batch_train_args(task_description)", batch_branch)
+        self.assertIn("explicit_arg_text", batch_branch)
+        self.assertIn("explicit_arg_lines", batch_branch)
+        self.assertIn("f\"\\n{key}={value}\"", batch_branch)
 if __name__ == "__main__":
     unittest.main()

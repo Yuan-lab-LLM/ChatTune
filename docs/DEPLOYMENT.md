@@ -27,8 +27,10 @@ Future training image updates will be released as patch packages. Download the c
 
 | Resource | Link | Notes |
 | --- | --- | --- |
-| Training image patch package-0813 | https://pan.quark.cn/s/db69395cbde7 | Extraction code: 6K2h |
-| Training image patch package-0820 | https://pan.quark.cn/s/609582f1f4c9 | Extraction code: 68uc |
+| Training image patch package-0813 | https://pan.quark.cn/s/db69395cbde7 | Extraction code: 6K2h; LLaMA-Factory updated to 0.9.5 |
+| Training image patch package-0820 | https://pan.quark.cn/s/609582f1f4c9 | Extraction code: 68uc; supports multi-node training |
+| Training image patch package-0904 | https://pan.quark.cn/s/ab6dfd3a721a | Extraction code: 97TB; supports pretrain |
+
 
 ## Container Types
 
@@ -63,18 +65,21 @@ When creating the container, the host directory mounted through `HOST_WORKSPACE`
 ├── models
 │   ├── base                        # base weights prepared for training
 │   ├── batch_train                 # batch-training output weights
+│   ├── pretrain                    # PT pretraining output weights
 │   └── dpo_train                   # enhanced-training output weights
 ├── dataset_daily_train             # DPO/enhanced-training datasets prepared for training
 ├── dataset_batch_train             # SFT/batch-training datasets prepared for training
+├── dataset_pretrain                # PT/text pretraining datasets prepared for training
 ├── eval                            # generated evaluation results
 └── log                             # generated log files
     ├── batch_train
+    ├── pretrain
     └── dpo_train
 ```
 
 ### Training Data Format
 
-The general training container uses the LLaMA-Factory training workflow. Put SFT/batch-training data under `dataset_batch_train`; Alpaca or ShareGPT format can be used. Put DPO/enhanced-training data under `dataset_daily_train`; it uses preference data format and must include chosen and rejected responses.
+The general training container uses the LLaMA-Factory training workflow. Put SFT/batch-training data under `dataset_batch_train`; Alpaca or ShareGPT format can be used. Put PT/text pretraining data under `dataset_pretrain`. Put DPO/enhanced-training data under `dataset_daily_train`; it uses preference data format and must include chosen and rejected responses.
 
 ## GRPO/verl Container Mounts
 

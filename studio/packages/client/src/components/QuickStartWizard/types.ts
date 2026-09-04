@@ -7,7 +7,7 @@ import type { DatasetInfo, InputRequestData } from '@shared/types/trpc';
 export interface DemoDataset {
   id: string;
   name: string;
-  type: 'raw' | 'sft' | 'dpo';
+  type: 'raw' | 'sft' | 'dpo' | 'pt';
   description: string;
   path: string;
   format: string;

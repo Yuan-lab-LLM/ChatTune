@@ -34,11 +34,12 @@ import ManagerSectionHeader from "../ManagerSectionHeader";
 const tagSelectClassName =
   "w-[84px] [&_.ant-select-selector]:!h-8 [&_.ant-select-selector]:!rounded-lg [&_.ant-select-selector]:!border-border/40 [&_.ant-select-selector]:!bg-muted/35 [&_.ant-select-selection-item]:!text-xs [&_.ant-select-selection-item]:!font-medium [&_.ant-select-selection-item]:!leading-[30px] [&_.ant-select-arrow]:!text-muted-foreground";
 const dockerSelectClassName = "min-w-[128px]";
-const MODEL_TAG_ORDER = ["base", "sft", "dpo", "inference"];
+const MODEL_TAG_ORDER = ["base", "sft", "pt", "dpo", "inference"];
 
 const MODEL_TYPE_TAG_MAP: Record<string, string> = {
   base_train: "base",
   batch_trained: "sft",
+  pretrain: "pt",
   daily_trained: "dpo",
   inference: "inference",
 };
@@ -52,6 +53,13 @@ const getModelTags = (model: ModelInfo) => {
     tags.add(MODEL_TYPE_TAG_MAP[model.type] || model.type);
   }
   if (normalizedText.includes("sft")) tags.add("sft");
+  if (
+    normalizedText.includes("pretrain") ||
+    normalizedText.includes("model_pretrain") ||
+    normalizedText.includes("/models/pretrain")
+  ) {
+    tags.add("pt");
+  }
   if (normalizedText.includes("dpo")) tags.add("dpo");
 
   return Array.from(tags);
@@ -101,8 +109,9 @@ const ModelManager = ({
     `   - ${t("model.guide.section1.item2") || "可查询以下四种类型的模型："}`,
     `     • ${t("model.guide.section1.item3") || "Base Train：基础训练模型"}`,
     `     • ${t("model.guide.section1.item4") || "Batch Trained：批量训练模型"}`,
-    `     • ${t("model.guide.section1.item5") || "DPO：增强训练模型"}`,
-    `     • ${t("model.guide.section1.item6") || "Inference：推理部署模型"}`,
+    `     • ${t("model.guide.section1.item5") || "PT：预训练模型"}`,
+    `     • ${t("model.guide.section1.item6") || "DPO：增强训练模型"}`,
+    `     • ${t("model.guide.section1.item7") || "Inference：推理部署模型"}`,
     "",
     `2. ${t("model.guide.section2.title") || "合并状态说明"}`,
     `   - ${t("model.guide.section2.item1") || "Training Complete：模型已完成合并，可直接使用"}`,
@@ -663,8 +672,8 @@ const ModelManager = ({
                             {model.containerName}
                           </span>
                         )}
-                        {/* 显示 merged 状态 - 只有 batch_trained 和 daily_trained 需要判断 */}
-                        {["batch_trained", "daily_trained"].includes(
+                        {/* 显示 merged 状态 - 训练产物需要判断 */}
+                        {["batch_trained", "pretrain", "daily_trained"].includes(
                           model.type || "",
                         ) &&
                           "merged" in model && (

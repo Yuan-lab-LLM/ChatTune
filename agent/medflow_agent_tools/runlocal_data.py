@@ -80,6 +80,8 @@ def _data_protocol_hint(
             fields.setdefault("kind", "input_folder")
         elif script_name == "data_preprocessing" or set(required_params) & {"data_type", "strategy"}:
             fields.setdefault("kind", "data_preprocess_params")
+            if "data_type" in required_params:
+                fields.setdefault("options", ["SFT", "DPO", "PT"])
         else:
             fields.setdefault("kind", "data_params")
     elif protocol_type == "job_started":
@@ -237,7 +239,7 @@ class ScriptManager:
             "data_preprocessing": {
                 "path": "data_preprocessing",
                 "description": "数据预处理工具，用于对数据进行清洗、标注和格式化，以便于模型训练。",
-                "aliases": ["数据预处理","预处理", "preprocess", "preprocessing","preprocess_sft_diagnosis"," data_transform","preprocess_data","data_preprocess"],
+                "aliases": ["数据预处理","预处理", "preprocess", "preprocessing","preprocess_sft_diagnosis","preprocess_pt","preprocess_text"," data_transform","preprocess_data","data_preprocess"],
                 "supports_background": False,
                 "long_running": False,
                 "default_env": {
@@ -253,16 +255,20 @@ class ScriptManager:
                     "base_url": DEFAULT_MODEL_BASE_URL
                     },
                 "required_cli_params": ["data_type", "strategy"],  # 新增：必需的命令行参数
-                "supported_cli_params": ["input_folder","data_type","strategy","model_name","api_key","base_url"],  # 新增：支持的命令行参数
+                "supported_cli_params": ["input_folder","data_type","strategy","model_name","api_key","base_url","output_folder"],  # 新增：支持的命令行参数
                 "validate_existing_dirs": ["input_folder"],
                 "container_relative_path_base": "/home/workspace",
                 "param_mapping": {  # 新增：命令行参数的中文映射
                     "数据预处理输入路径": "input_folder",
                     "预处理数据类型": "data_type",
+                    "数据类型": "data_type",
                     "预处理数据格式":"strategy",
+                    "输出路径": "output_folder",
+                    "输出目录": "output_folder",
                     "--input_folder": "input_folder",
                     "--data_type": "data_type",
                     "--strategy":"strategy",
+                    "--output_folder": "output_folder",
                     "dpo处理模型名称":"model_name",
                     "dpo处理模型apikey":"api_key",
                     "dpo处理模型地址":"base_url",
@@ -283,7 +289,7 @@ class ScriptManager:
             },
              "score_based_filtering": {
                 "path": "score_based_filtering",
-                "description": "数据高级筛选工具，用于对预处理完成的数据进行进一步的打分筛选，从而获得更高质量的模型训练数据",
+                "description": "数据高级筛选工具，支持 SFT、DPO、PT/text 数据；可对预处理完成的数据进一步打分筛选，其中 PT/text 支持 .json、.jsonl、.txt 输入并输出可训练的 text 数据",
                 "aliases": ["数据高级筛选"],
                 "supports_background": True,
                 "long_running": True,
@@ -647,7 +653,7 @@ def run_local_script(
         ])
 
 
-GENERAL_DATA_PREPROCESSING_FORMATS = {"openai", "sharegpt", "sft", "dpo", "text"}
+GENERAL_DATA_PREPROCESSING_FORMATS = {"openai", "sharegpt", "sft", "dpo", "text", "pt"}
 RAW_DATA_PREPROCESSING_FORMATS = {"raw", "unknown", ""}
 
 
@@ -733,7 +739,7 @@ def detect_data_preprocessing_text_format(text: str) -> str:
         detected = _detect_json_prefix_item_format(text)
         if detected != "unknown":
             return detected
-        return "unknown"
+        return "text"
 
     for item in _iter_sample_json_items(payload):
         detected = detect_data_preprocessing_item_format(item)
@@ -752,7 +758,7 @@ def detect_data_preprocessing_dir_format_in_container(
         return "unknown"
     find_command = (
         f"find {shlex.quote(container_path)} -maxdepth 1 -type f "
-        "\\( -name '*.json' -o -name '*.jsonl' \\) "
+        "\\( -name '*.json' -o -name '*.jsonl' -o -name '*.txt' \\) "
         "! -name 'dataset_info.json' "
         "! -name 'preprocessing_audit.json' "
         "! -name 'preprocessing_summary.json' "
@@ -810,7 +816,7 @@ def effective_data_preprocessing_required_params(
     data_type = str(cli_args.get("data_type") or "").strip().lower()
     detected_format = str(detected_format or "").strip().lower()
     if detected_format in GENERAL_DATA_PREPROCESSING_FORMATS:
-        if data_type in {"sft", "dpo"}:
+        if data_type in {"sft", "dpo", "pt", "text"}:
             return []
         return ["data_type"]
     if detected_format == "unknown":
@@ -832,7 +838,7 @@ def cleanup_data_preprocessing_cli_args(
 
     if (
         detected_format in GENERAL_DATA_PREPROCESSING_FORMATS
-        and data_type in {"sft", "dpo"}
+        and data_type in {"sft", "dpo", "pt", "text"}
         and not str(cli_args.get("strategy") or "").strip()
     ):
         cli_args.pop("strategy", None)
@@ -950,7 +956,7 @@ def validate_cli_param_values(
             invalid.append(f"{param}={value!r}")
     if "data_type" in cli_args and str(cli_args.get("data_type") or "").strip():
         data_type = str(cli_args.get("data_type") or "").strip().lower()
-        if data_type not in {"sft", "dpo"}:
+        if data_type not in {"sft", "dpo", "pt", "text"}:
             invalid.append(f"data_type={cli_args.get('data_type')!r}")
     return invalid
 
@@ -1026,7 +1032,7 @@ def validate_docker_dir_params(
             def candidate_file_check() -> Optional[ToolResponse]:
                 find_command = (
                     f"find {shlex.quote(container_path)} -maxdepth 1 -type f "
-                    "\\( -name '*.json' -o -name '*.jsonl' \\) "
+                    "\\( -name '*.json' -o -name '*.jsonl' -o -name '*.txt' \\) "
                     "! -name 'dataset_info.json' "
                     "! -name 'preprocessing_audit.json' "
                     "! -name 'preprocessing_summary.json' "
@@ -1045,7 +1051,7 @@ def validate_docker_dir_params(
                         f"错误！脚本 '{script_name}' 启动前检查未通过，已阻止执行。\n"
                         f"- 参数 {param_name} 指向的目录没有可处理的数据文件: {raw_path}\n"
                         f"- 容器内解析路径: {container_path}\n"
-                        "请提供包含真实 .json/.jsonl 数据文件的输入目录。"
+                        "请提供包含真实 .json/.jsonl/.txt 数据文件的输入目录。"
                     )
                     return _data_error_response(
                         script_name,
@@ -1180,6 +1186,8 @@ def infer_data_preprocessing_cli_args(script_query: str, script_name: str) -> Di
         inferred["data_type"] = "sft"
     elif "dpo" in query:
         inferred["data_type"] = "dpo"
+    elif "pt" in query or "text" in query or "预训练" in query:
+        inferred["data_type"] = "pt"
 
     for strategy in ("inspection", "diagnosis", "prescription"):
         if strategy in query:
@@ -1639,12 +1647,12 @@ def run_script_by_name_data(
                     message = (
                         "已检查默认输入目录 /home/workspace/dataset 下最新数据集，"
                         f"但无法识别其数据格式：{input_container_path}。"
-                        "请指定一个包含 OpenAI、ShareGPT、SFT、DPO、text 或医疗 raw 格式数据的 input_folder。"
+                        "请指定一个包含 OpenAI、ShareGPT、SFT、DPO、PT/text 或医疗 raw 格式数据的 input_folder。"
                     )
                 else:
                     message = (
                         f"无法识别输入目录的数据格式：{input_container_path}。"
-                        "请改用包含 OpenAI、ShareGPT、SFT、DPO、text 或医疗 raw 格式数据的 input_folder。"
+                        "请改用包含 OpenAI、ShareGPT、SFT、DPO、PT/text 或医疗 raw 格式数据的 input_folder。"
                     )
                 current_args = {
                     "additional_args": additional_args or {},

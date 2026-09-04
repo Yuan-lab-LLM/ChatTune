@@ -80,6 +80,8 @@ const normalizedTaskType = (value?: string | null) => {
   if (["单模型评估", "单模型评测"].includes(raw) || lower.includes("single_model")) return "single_model_evaluation";
   if (raw.includes("双模型") || lower.includes("compare_between_models")) return "compare_between_models";
   if (raw.includes("checkpoint") || raw.includes("检查点") || lower.includes("ckpt_eval") || lower.includes("checkpoint")) return "ckpt_eval";
+  if (lower.includes("pretrain_lora") || lower.includes("batch_train_pretrain_lora") || lower.includes("lora pt") || raw.includes("LoRA PT") || raw.includes("LoRA预训练")) return "pretrain_lora";
+  if (lower.includes("pretrain_full") || lower.includes("batch_train_pretrain_full") || lower.includes("full pt") || raw.includes("全参PT") || raw.includes("全参预训练")) return "pretrain_full";
   if (lower === "lora" || lower === "lora sft") return "lora";
   if (raw.includes("全参") || lower.includes("full")) return "full";
   if (raw.includes("增强") || lower.includes("enhanced") || lower.includes("dpo")) return "enhanced";

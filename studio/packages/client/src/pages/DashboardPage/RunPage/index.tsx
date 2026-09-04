@@ -120,8 +120,31 @@ const HIDDEN_DATASET_FILES = new Set([
   "score_summary.json",
 ]);
 
+type DatasetType = "raw" | "sft" | "dpo" | "pt";
+type DatasetTrainingType =
+  | "lora"
+  | "full"
+  | "enhanced"
+  | "pretrain_lora"
+  | "pretrain_full";
+
 const isVisibleDatasetFile = (filename: string) =>
   !HIDDEN_DATASET_FILES.has(filename.toLowerCase());
+
+const isDatasetDataFile = (
+  filename: string,
+  datasetType: string | undefined | null,
+): boolean => {
+  const lowerName = filename.toLowerCase();
+  if ((datasetType || "").toLowerCase() === "pt") {
+    return (
+      lowerName.endsWith(".json") ||
+      lowerName.endsWith(".jsonl") ||
+      lowerName.endsWith(".txt")
+    );
+  }
+  return lowerName.endsWith(".json");
+};
 
 const loadCachedMeta = (key: string): ManagementCacheMeta | null => {
   const cached = localStorage.getItem(key);
@@ -733,6 +756,10 @@ interface TrainingJobProtocol {
   agent?: string;
   message?: string;
   errorReason?: string;
+  errorSummary?: string;
+  errorDetail?: string;
+  error_summary?: string;
+  error_detail?: string;
   errorRecoverable?: boolean;
   action?: string;
   benchmark_stop?: BenchmarkStopPayload;
@@ -892,6 +919,79 @@ const isTrainingJobProtocol = (
   return typeof protocol.type === "string";
 };
 
+const friendlyTrainingMonitorErrorReason = (
+  reason: string | undefined,
+): string => {
+  const normalized = (reason || "").trim();
+  if (!normalized) {
+    return "";
+  }
+  if (normalized.startsWith("wandb_exitcode_")) {
+    return `训练进程返回非零退出码 ${normalized.replace("wandb_exitcode_", "")}，未能正常完成。`;
+  }
+  return {
+    pid_ended_no_wandb:
+      "训练进程已结束，但没有找到本次训练的指标或完成记录，可能是启动失败、手动停止或进程提前退出。",
+    process_ended_without_success_marker:
+      "训练进程已结束，但没有检测到正常完成标记。",
+    training_process_not_found:
+      "没有找到训练进程，可能是进程已退出或容器内训练没有成功启动。",
+    output_log_error: "训练日志中发现错误，训练未能正常完成。",
+    wandb_exitcode_nonzero: "训练进程返回非零退出码，未能正常完成。",
+    wandb_run_not_found:
+      "暂时没有找到本次训练的指标记录，可能仍在启动或日志尚未写入。",
+    wandb_no_metrics: "已找到训练记录，但指标数据尚未写入。",
+    output_dir_missing: "没有找到训练输出目录，请检查输出路径或启动参数。",
+    merge_failed: "模型合并或导出失败。",
+    metrics_stale: "训练指标长时间没有更新，进程可能已经卡住或退出。",
+    loss_not_finite: "训练指标出现 NaN 或 Inf，训练未能稳定继续。",
+    pid_invalid: "PID 格式不正确，请重新输入正确的进程号。",
+    pid_not_found: "没有找到对应训练进程，请确认 PID 是否正确。",
+    pid_wandb_not_found: "没有找到该 PID 对应的训练记录，请确认 PID 是否正确。",
+    container_required: "需要确认要查询的训练容器。",
+    container_unknown: "无法确定训练容器，请提供容器名称。",
+    multiple_containers: "检测到多个运行容器，请指定要查询的训练容器。",
+    assigned_gpu_preflight_failed:
+      "训练启动前的 GPU 检查未通过，请检查 GPU 分配或资源占用。",
+    unknown: "训练未正常完成，暂时无法从日志判断具体原因。",
+  }[normalized] || "训练未正常完成，暂时无法从日志判断具体原因。";
+};
+
+const withFriendlyTrainingMonitorMessage = (
+  protocol: TrainingJobProtocol,
+): TrainingJobProtocol => {
+  if (protocol.type !== "monitor_status" || protocol.jobType !== "train") {
+    return protocol;
+  }
+  const status = String(protocol.status || "").trim().toLowerCase();
+  if (!["failed", "interrupted", "unknown", "stopped"].includes(status)) {
+    return protocol;
+  }
+  const existingSummary =
+    protocol.errorSummary ||
+    protocol.error_summary ||
+    protocol.errorDetail ||
+    protocol.error_detail;
+  if (existingSummary) {
+    return { ...protocol, errorSummary: String(existingSummary) };
+  }
+  const fallbackSummary = friendlyTrainingMonitorErrorReason(
+    protocol.errorReason,
+  );
+  if (!fallbackSummary) {
+    return protocol;
+  }
+  const message = protocol.message || "";
+  return {
+    ...protocol,
+    errorSummary: fallbackSummary,
+    message:
+      message && /原因[:：]/.test(message)
+        ? message
+        : `${message || "训练未正常完成。"}\n原因：${fallbackSummary}`,
+  };
+};
+
 const parseProtocolLikeValue = (value: unknown): TrainingJobProtocol | null => {
   if (typeof value === "string") {
     try {
@@ -901,18 +1001,20 @@ const parseProtocolLikeValue = (value: unknown): TrainingJobProtocol | null => {
     }
   }
   if (isTrainingJobProtocol(value)) {
-    return value;
+    return withFriendlyTrainingMonitorMessage(value);
   }
   if (!value || typeof value !== "object") {
     return null;
   }
   const protocol = (value as { protocol?: unknown }).protocol;
   if (isTrainingJobProtocol(protocol)) {
-    return protocol;
+    return withFriendlyTrainingMonitorMessage(protocol);
   }
   const dataProtocol = (value as { data?: { protocol?: unknown } }).data
     ?.protocol;
-  return isTrainingJobProtocol(dataProtocol) ? dataProtocol : null;
+  return isTrainingJobProtocol(dataProtocol)
+    ? withFriendlyTrainingMonitorMessage(dataProtocol)
+    : null;
 };
 
 const extractProtocolFromMetadata = (
@@ -1668,7 +1770,7 @@ const parseTrainingTaskSummary = (text: string): TrainingTaskSummary | null => {
     /(?:PID|进程ID\s*(?:\(\s*PID\s*\))?)\s*[:：]\s*`?([0-9]+)/i,
   )?.[1];
   const trainTypeText = text.match(
-    /(双机\s*LoRA\s*SFT|多机\s*LoRA\s*SFT|LoRA\s*SFT|全参\s*SFT|多机lora批量训练|lora批量训练|全参批量训练|双机增强训练|多机增强训练|增强训练|grpo训练|multinode_lora_sft|multinode_enhanced)/i,
+    /(双机\s*LoRA\s*SFT|多机\s*LoRA\s*SFT|LoRA\s*SFT|全参\s*SFT|LoRA\s*PT|全参\s*PT|LoRA\s*预训练|全参\s*预训练|PT\s*训练|继续预训练|预训练|多机lora批量训练|lora批量训练|全参批量训练|双机增强训练|多机增强训练|增强训练|grpo训练|pretrain_lora|pretrain_full|batch_train_pretrain_lora|batch_train_pretrain_full|multinode_lora_sft|multinode_enhanced)/i,
   )?.[1];
   const normalizedTrainType = trainTypeText
     ? trainTypeText.replace(/\s+/g, "").toLowerCase()
@@ -1678,12 +1780,30 @@ const parseTrainingTaskSummary = (text: string): TrainingTaskSummary | null => {
       ? "lora"
       : normalizedTrainType === "全参sft"
         ? "full"
-        : trainTypeText;
+        : /^(lorapt|lora预训练|pretrain_lora|batch_train_pretrain_lora|pt训练|继续预训练|预训练)$/i.test(
+              normalizedTrainType,
+            )
+          ? "pretrain_lora"
+          : /^(全参pt|全参预训练|pretrain_full|batch_train_pretrain_full)$/i.test(
+                normalizedTrainType,
+              )
+            ? "pretrain_full"
+            : trainTypeText;
   const scriptName =
     text.match(/脚本(?:名称)?\s*[:：]\s*`?([^\s`\n，,]+)/)?.[1] || "";
+  const scriptTrainType = /batch_train_pretrain_full/i.test(scriptName)
+    ? "pretrain_full"
+    : /batch_train_pretrain_lora/i.test(scriptName)
+      ? "pretrain_lora"
+      : /batch_train_full/i.test(scriptName)
+        ? "full"
+        : /batch_train_lora/i.test(scriptName)
+          ? "lora"
+          : undefined;
   const hasTrainingSignal =
     Boolean(trainType) ||
-    /(?:train|training|finetune|lora|grpo)/i.test(scriptName) ||
+    Boolean(scriptTrainType) ||
+    /(?:train|training|finetune|pretrain|lora|grpo)/i.test(scriptName) ||
     /训练任务监控结果/.test(text) ||
     /当前训练任务.{0,80}状态为\s*[:：]?\s*\*{0,2}(?:启动中|运行中|starting|running|interrupted|stopped|finished|completed|failed|error|中断|停止|完成|失败)/i.test(text) ||
     /当前状态\*{0,2}\s*[:：]\s*\*{0,2}(?:启动中|运行中|starting|running|interrupted|stopped|finished|completed|failed|error|中断|停止|完成|失败)/i.test(text) ||
@@ -1696,7 +1816,7 @@ const parseTrainingTaskSummary = (text: string): TrainingTaskSummary | null => {
   return {
     container,
     pid,
-    trainType,
+    trainType: trainType || scriptTrainType,
     status: parsedStatus,
     launchMode:
       scriptName.startsWith("train_multinode_") ||
@@ -2318,7 +2438,7 @@ const isUserRole = (role: string | undefined | null): boolean => {
 
 const TRAINABLE_DATASET_TYPE_CONFIG: Record<
   string,
-  { datasetDir: string; trainType: "lora" | "enhanced"; label: string }
+  { datasetDir: string; trainType: DatasetTrainingType; label: string }
 > = {
   sft: {
     datasetDir: "/home/workspace/dataset_batch_train",
@@ -2329,6 +2449,11 @@ const TRAINABLE_DATASET_TYPE_CONFIG: Record<
     datasetDir: "/home/workspace/dataset_daily_train",
     trainType: "enhanced",
     label: "DPO",
+  },
+  pt: {
+    datasetDir: "/home/workspace/dataset_pretrain",
+    trainType: "pretrain_lora",
+    label: "PT/text",
   },
 };
 
@@ -2354,6 +2479,7 @@ const resolveTrainableDatasetDir = (
 const buildOneClickWorkflowCommand = (
   dataset: DatasetInfo | string,
   evaluationName?: string,
+  trainTypeOverride?: DatasetTrainingType,
 ) => {
   const datasetName = typeof dataset === "string" ? dataset : dataset.name;
   const datasetType =
@@ -2366,7 +2492,7 @@ const buildOneClickWorkflowCommand = (
         ? resolveTrainableDatasetDir(dataset, config)
         : dataset.path?.trim();
   const trainingHint = config
-    ? `，训练类型=${config.trainType}，数据类型=${config.label}${datasetDir ? `，dataset_dir=${datasetDir}` : ""}`
+    ? `，训练类型=${trainTypeOverride || config.trainType}，数据类型=${config.label}${datasetDir ? `，dataset_dir=${datasetDir}` : ""}`
     : "";
   const baseCommand = `我想用${datasetName}这个数据一键训练、部署并评测模型${trainingHint}`;
   return evaluationName
@@ -2374,7 +2500,10 @@ const buildOneClickWorkflowCommand = (
     : baseCommand;
 };
 
-const buildDatasetTrainingCommand = (dataset: DatasetInfo): string => {
+const buildDatasetTrainingCommand = (
+  dataset: DatasetInfo,
+  trainTypeOverride?: DatasetTrainingType,
+): string => {
   const datasetType = (dataset.type || "").toLowerCase();
   const config = TRAINABLE_DATASET_TYPE_CONFIG[datasetType];
   const baseCommand = `我想用${dataset.name}这个数据训练模型`;
@@ -2384,7 +2513,7 @@ const buildDatasetTrainingCommand = (dataset: DatasetInfo): string => {
   }
 
   const datasetDir = resolveTrainableDatasetDir(dataset, config);
-  return `${baseCommand}，训练类型=${config.trainType}，数据类型=${config.label}，dataset_dir=${datasetDir}`;
+  return `${baseCommand}，训练类型=${trainTypeOverride || config.trainType}，数据类型=${config.label}，dataset_dir=${datasetDir}`;
 };
 
 const resolveRawDatasetPath = (dataset: DatasetInfo): string => {
@@ -2443,7 +2572,10 @@ interface RunContentPageProps {
   onQueryTests: () => Promise<MedicalTestFile[]>;
   onRefreshTests: () => Promise<MedicalTestFile[]>;
   onDownloadDataset: (name: string) => Promise<void>;
-  onUseDatasetForTraining: (dataset: DatasetInfo) => void;
+  onUseDatasetForTraining: (
+    dataset: DatasetInfo,
+    trainType?: DatasetTrainingType,
+  ) => void;
   onUseEvaluationForBenchmark: (testName: string) => void;
   onDownloadTest: (name: string, test?: MedicalTestFile) => Promise<void>;
   onUpload: () => void;
@@ -3146,6 +3278,21 @@ const RunContentPage = ({
         fullparambatchtrain: "fullParamBatchTraining",
         fullparambatchtraining: "fullParamBatchTraining",
         fullparameterbatchtraining: "fullParamBatchTraining",
+        pretrainlora: "pretrainLoraTraining",
+        pretrainlora训练: "pretrainLoraTraining",
+        batchtrainpretrainlora: "pretrainLoraTraining",
+        lorapt: "pretrainLoraTraining",
+        lora预训练: "pretrainLoraTraining",
+        pt: "pretrainLoraTraining",
+        pt训练: "pretrainLoraTraining",
+        继续预训练: "pretrainLoraTraining",
+        预训练: "pretrainLoraTraining",
+        pretrainfull: "pretrainFullTraining",
+        pretrainfull训练: "pretrainFullTraining",
+        batchtrainpretrainfull: "pretrainFullTraining",
+        fullpt: "pretrainFullTraining",
+        全参pt: "pretrainFullTraining",
+        全参预训练: "pretrainFullTraining",
         enhanced: "enhancedTraining",
         dpo: "enhancedTraining",
         增强训练: "enhancedTraining",
@@ -7908,7 +8055,10 @@ interface RunPageWithMetricsProps {
   onUpload: () => void;
   onDownload: (dataset: DatasetInfo) => void;
   onDeleteDataset: (dataset: DatasetInfo) => Promise<void>;
-  onUseDatasetForTraining: (dataset: DatasetInfo) => void;
+  onUseDatasetForTraining: (
+    dataset: DatasetInfo,
+    trainType?: DatasetTrainingType,
+  ) => void;
   onUseDatasetForPreprocess: (dataset: DatasetInfo) => void;
   onUseEvaluationForBenchmark: (testName: string) => void;
   onLoadDatasetPreviews: (dataset: DatasetInfo) => Promise<void>;
@@ -7971,7 +8121,7 @@ interface RunPageWithMetricsProps {
   setUploadModalOpen: (open: boolean) => void;
   handleUpload: (params: {
     containerName: string;
-    datasetType: "raw" | "sft" | "dpo";
+    datasetType: DatasetType;
     datasetName: string;
     file: File;
   }) => Promise<void>;
@@ -8234,7 +8384,7 @@ const RunPageWithMetrics = ({
   );
 
   const guardedUseDatasetForTraining = useCallback(
-    (dataset: DatasetInfo) => {
+    (dataset: DatasetInfo, trainType?: DatasetTrainingType) => {
       const datasetNodeId = dataset.nodeId?.trim();
       const runNodeId = runData?.nodeId?.trim();
       const fallbackNodeId =
@@ -8331,7 +8481,7 @@ const RunPageWithMetrics = ({
         return;
       }
 
-      onUseDatasetForTraining(dataset);
+      onUseDatasetForTraining(dataset, trainType);
     },
     [
       defaultContainerName,
@@ -8349,7 +8499,7 @@ const RunPageWithMetrics = ({
   );
 
   const guardedUseDatasetForPreprocess = useCallback(
-    (dataset: DatasetInfo) => {
+    (dataset: DatasetInfo, trainType?: DatasetTrainingType) => {
       const datasetNodeId = dataset.nodeId?.trim();
       const runNodeId = runData?.nodeId?.trim();
       const fallbackNodeId =
@@ -8924,10 +9074,8 @@ const RunPage = () => {
   }, [chatSessionId, chatSessionQuery.data?.data?.clearedAt, user]);
 
   const handleUseDatasetForTraining = useCallback(
-    (dataset: DatasetInfo) => {
-      const command = buildDatasetTrainingCommand(dataset);
-      const datasetType = (dataset.type || "").toLowerCase();
-      const trainConfig = TRAINABLE_DATASET_TYPE_CONFIG[datasetType];
+    (dataset: DatasetInfo, trainType?: DatasetTrainingType) => {
+      const command = buildDatasetTrainingCommand(dataset, trainType);
 
       if (setInputTextRef.current) {
         setInputTextRef.current(
@@ -9545,7 +9693,7 @@ const RunPage = () => {
       const jsonFileCount = (dataset.files || []).filter(
         (file) =>
           isVisibleDatasetFile(file) &&
-          file.endsWith(".json"),
+          isDatasetDataFile(file, dataset.type),
       ).length;
       if ((dataset.filePreviews || []).length >= jsonFileCount) {
         return;
@@ -9554,7 +9702,7 @@ const RunPage = () => {
       const response = await getDatasetFilePreviewsMutation.mutateAsync({
         nodeId: dataset.nodeId || resourceNodeId,
         container: dataset.containerName || defaultContainerName,
-        datasetType: dataset.type as "raw" | "sft" | "dpo",
+        datasetType: dataset.type as DatasetType,
         datasetName: dataset.name,
       });
 
@@ -9893,7 +10041,7 @@ const RunPage = () => {
   const handleUpload = useCallback(
     async (params: {
       containerName: string;
-      datasetType: "raw" | "sft" | "dpo";
+      datasetType: DatasetType;
       datasetName: string;
       file: File;
     }) => {
@@ -10004,7 +10152,7 @@ const RunPage = () => {
         const response = await downloadDatasetMutation.mutateAsync({
           nodeId: dataset.nodeId || resourceNodeId,
           container: containerName,
-          datasetType: dataset.type as "raw" | "sft" | "dpo",
+          datasetType: dataset.type as DatasetType,
           datasetName: dataset.name,
         });
 
@@ -10112,7 +10260,7 @@ const RunPage = () => {
         const response = await deleteDatasetMutation.mutateAsync({
           nodeId: dataset.nodeId || resourceNodeId,
           container: dataset.containerName || defaultContainerName,
-          datasetType: dataset.type as "raw" | "sft" | "dpo",
+          datasetType: dataset.type as DatasetType,
           datasetName: dataset.name,
         });
 
@@ -10153,6 +10301,7 @@ const RunPage = () => {
           modelType: model.type as
             | "base_train"
             | "batch_trained"
+            | "pretrain"
             | "daily_trained"
             | "inference",
           modelName: model.name,

@@ -27,8 +27,9 @@
 
 | 资源 | 链接 | 备注 |
 | --- | --- | --- |
-| 训练镜像补丁包-0813 | https://pan.quark.cn/s/db69395cbde7 | 提取码：6K2h |
-| 训练镜像补丁包-0820 | https://pan.quark.cn/s/609582f1f4c9 | 提取码：68uc |
+| 训练镜像补丁包-0813 | https://pan.quark.cn/s/db69395cbde7 | 提取码：6K2h llamafactory版本更新至0.9.5 |
+| 训练镜像补丁包-0820 | https://pan.quark.cn/s/609582f1f4c9 | 提取码：68uc 支持多机训练 |
+| 训练镜像补丁包-0904 | https://pan.quark.cn/s/ab6dfd3a721a | 提取码：97TB 支持预训练 |
 
 ## 容器类型 
 
@@ -63,18 +64,21 @@
 ├── models
 │   ├── base                        # 准备训练的基础权重文件
 │   ├── batch_train                 # 存放批量训练完成的权重文件
+│   ├── pretrain                    # 存放 PT 预训练完成的权重文件
 │   └── dpo_train                   # 存放增强训练完成的权重文件
 ├── dataset_daily_train             # 准备训练的DPO/增强训练数据集
 ├── dataset_batch_train             # 准备训练的SFT/批量训练数据集
+├── dataset_pretrain                # 准备训练的 PT/text 预训练数据集
 ├── eval                            # 存放生成的评测结果
 └── log                             # 存放生成的日志文件
     ├── batch_train
+    ├── pretrain
     └── dpo_train
 ```
 
 ### 训练数据格式
 
-通用训练容器使用 LLaMA-Factory 训练流程。SFT/批量训练数据放在 `dataset_batch_train` 下，可使用 Alpaca 或 ShareGPT 格式。DPO/增强训练数据放在 `dataset_daily_train` 下，使用偏好数据格式，必须包含被选择回答和被拒绝回答。
+通用训练容器使用 LLaMA-Factory 训练流程。SFT/批量训练数据放在 `dataset_batch_train` 下，可使用 Alpaca 或 ShareGPT 格式。PT/text 预训练数据放在 `dataset_pretrain` 下。DPO/增强训练数据放在 `dataset_daily_train` 下，使用偏好数据格式，必须包含被选择回答和被拒绝回答。
 
 ## GRPO/verl 容器挂载
 

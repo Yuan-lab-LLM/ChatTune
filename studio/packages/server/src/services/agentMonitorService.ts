@@ -62,6 +62,30 @@ const normalizeTrainType = (trainType?: string): string | undefined => {
         return undefined;
     }
 
+    if (
+        value.includes('batch_train_pretrain_full') ||
+        value.includes('pretrain_full') ||
+        value.includes('full_pt') ||
+        value.includes('full pt') ||
+        value.includes('全参pt') ||
+        value.includes('全参预训练')
+    ) {
+        return 'pretrain_full';
+    }
+    if (
+        value.includes('batch_train_pretrain_lora') ||
+        value.includes('pretrain_lora') ||
+        value.includes('lora_pt') ||
+        value.includes('lora pt') ||
+        value.includes('lorapt') ||
+        value.includes('lora预训练') ||
+        value.includes('pt训练') ||
+        value.includes('继续预训练') ||
+        value === 'pt' ||
+        value === '预训练'
+    ) {
+        return 'pretrain_lora';
+    }
     if (value.includes('grpo')) {
         return 'grpo';
     }
@@ -355,7 +379,7 @@ export async function queryAgentWorkflowStatus(params: AgentWorkflowStatusParams
         '            public["metrics"] = public_metrics',
         '    public_stages[name] = public',
         'train_type = context.get("train_type")',
-        'train_type_text = {"lora": "lora批量训练", "full": "全参批量训练", "enhanced": "增强训练", "grpo": "grpo训练"}.get(train_type, train_type)',
+        'train_type_text = {"lora": "lora批量训练", "full": "全参批量训练", "pretrain_lora": "LoRA PT", "pretrain_full": "全参 PT", "enhanced": "增强训练", "grpo": "grpo训练"}.get(train_type, train_type)',
         'benchmark_entry = context.get("benchmark") or "2024"',
         'protocol = {',
         '    "version": "1.0",',

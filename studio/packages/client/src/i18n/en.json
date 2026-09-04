@@ -584,6 +584,10 @@
   "lora-batch-trainingDesc": "Batch execute LoRA training tasks",
   "full-param-batch-training": "Full Parameter Batch Training",
   "full-param-batch-trainingDesc": "Batch execute full parameter training",
+  "pretrain-lora-train": "LoRA PT Pretraining",
+  "pretrain-lora-trainingDesc": "Run LoRA PT pretraining task",
+  "pretrain-full-train": "Full-Parameter PT Pretraining",
+  "pretrain-full-trainingDesc": "Run full-parameter PT pretraining task",
   "grpo-trainingDesc": "Start GRPO training with the specified model, train file, validation file, and GPU IDs",
   "dual-model-assessment": "Dual Model Assessment",
   "dual-model-assessmentDesc": "Compare and assess two models",
@@ -620,7 +624,7 @@
   "data-preprocessing": "Data Preprocessing",
   "data-preprocessingDesc": "Preprocess and clean data",
   "data-advanced-filtering": "Data Advanced Filtering",
-  "data-advanced-filteringDesc": "Apply advanced filtering conditions",
+  "data-advanced-filteringDesc": "Filter SFT, DPO, or PT text training data",
   "mgmt-studio-help": "Studio Command Help",
   "mgmt-studio-helpDesc": "Show Studio frontend management command help",
   "mgmt-dataset-view": "Switch Dataset List",
@@ -1504,6 +1508,8 @@
         "loraBatchTraining": "LoRA Batch Training",
         "multinodeLoraBatchTraining": "Dual-node LoRA SFT",
         "fullParamBatchTraining": "Full-Parameter Batch Training",
+        "pretrainLoraTraining": "LoRA PT",
+        "pretrainFullTraining": "Full-Parameter PT",
         "enhancedTraining": "Enhanced Training",
         "multinodeEnhancedTraining": "Dual-node Enhanced Training",
         "grpoTraining": "GRPO Training",
@@ -1621,12 +1627,14 @@
       "label": "Dataset Type",
       "raw": "Raw Data",
       "sft": "SFT Data",
-      "dpo": "DPO Data"
+      "dpo": "DPO Data",
+      "pt": "Pretraining Text Data"
     },
     "typeHelp": {
       "raw": "Raw dataset. Preprocess it before training.",
       "sft": "Supervised fine-tuning dataset. Ready for SFT training.",
-      "dpo": "Preference optimization dataset. Ready for DPO training."
+      "dpo": "Preference optimization dataset. Ready for DPO training.",
+      "pt": "Pretraining text data. Ready for LoRA PT or full-parameter PT."
     },
     "path": "Path",
     "no-data-title": "Dataset Management",
@@ -1640,6 +1648,7 @@
     "preview-load-failed": "Failed to load preview",
     "train": {
       "button": "Train with this",
+      "pt-button": "Train with this",
       "rawHint": "Preprocess this dataset before training",
       "inputHint": "Training command filled in. Click the send button in the lower right to start",
       "missingNode": "This dataset is missing node information. Refresh the dataset list and try again.",
@@ -1735,12 +1744,14 @@
     "typeLabel": {
       "base_train": "BASE",
       "batch_trained": "SFT",
+      "pretrain": "PT",
       "daily_trained": "DPO",
       "inference": "INFER"
     },
     "typeHelp": {
       "base_train": "Base foundation model",
       "batch_trained": "Batch-trained output",
+      "pretrain": "PT pretraining output",
       "daily_trained": "DPO training output",
       "inference": "Inference deployment model"
     },
@@ -1765,11 +1776,12 @@
       "section1": {
         "title": "Query Models",
         "item1": "Enter a Docker container name to query available models",
-        "item2": "You can query the following four model types:",
+        "item2": "You can query the following five model types:",
         "item3": "Base Train: base training models",
         "item4": "Batch Trained: batch training models",
-        "item5": "DPO: enhanced training models",
-        "item6": "Inference: deployed inference models"
+        "item5": "PT: pretraining models",
+        "item6": "DPO: enhanced training models",
+        "item7": "Inference: deployed inference models"
       },
       "section2": {
         "title": "Training Status",

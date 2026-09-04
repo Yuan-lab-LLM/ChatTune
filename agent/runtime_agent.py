@@ -358,7 +358,7 @@ class Toolkit(AgentScopeToolkit):
             "_stop_task": "Use when the user asks to stop, cancel, terminate, or end a running MedFlow task.",
             "_call_datacollector": "Use when the user asks for data collection or data preparation.",
             "_call_dataprocessor": "Use when the user asks for data preprocessing or advanced data filtering.",
-            "_call_trainer": "Use when the user asks to start or schedule model training, including LoRA SFT, full SFT, enhanced training, GRPO, or multinode training.",
+            "_call_trainer": "Use when the user asks to start or schedule model training, including LoRA SFT, full SFT, LoRA PT, full PT, enhanced training, GRPO, or multinode training.",
             "_call_evaluator": "Use when the user asks for model evaluation, single-model evaluation, dual-model evaluation, checkpoint evaluation, or benchmark-style assessment.",
             "_call_inference": "Use when the user asks about inference service operations, inference configuration, node operations, function tests, or inference benchmarks.",
             "_call_monitor": "Use when the user asks for training, evaluation, or process monitoring/status.",
@@ -1417,7 +1417,7 @@ def _workflow_train_rebound_matches_workflow(
 
     train_type = (workflow.get("context") or {}).get("train_type") or "lora"
     dataset_ref = str(workflow.get("dataset_ref") or "").strip()
-    if train_type in {"lora", "full"} and dataset_ref:
+    if train_type in {"lora", "full", "pretrain_lora", "pretrain_full"} and dataset_ref:
         return os.path.basename(output_dir.rstrip("/")) in _workflow_expected_batch_output_model_names(train_type, dataset_ref)
 
     return True
@@ -1445,10 +1445,21 @@ def _workflow_start_train(workflow: Dict[str, Any]) -> Dict[str, Any]:
             }
         additional_args.update(train_args)
     else:
-        script_query = "多机lora批量训练" if launch_mode == "multinode" else "lora批量训练"
+        if train_type == "full":
+            script_query = "全参批量训练"
+            dataset_root = "/home/workspace/dataset_batch_train"
+        elif train_type == "pretrain_full":
+            script_query = "全参预训练"
+            dataset_root = "/home/workspace/dataset_pretrain"
+        elif train_type == "pretrain_lora":
+            script_query = "LoRA预训练"
+            dataset_root = "/home/workspace/dataset_pretrain"
+        else:
+            script_query = "多机lora批量训练" if launch_mode == "multinode" else "lora批量训练"
+            dataset_root = "/home/workspace/dataset_batch_train"
         additional_args = {
             "data_identifier": dataset_ref,
-            "data_dir": f"/home/workspace/dataset_batch_train/{dataset_ref}",
+            "data_dir": f"{dataset_root}/{dataset_ref}",
         }
         additional_args.update(context.get("train_args") or {})
     additional_args["container"] = _workflow_training_container(workflow)
@@ -1528,14 +1539,18 @@ def _workflow_find_dpo_model_candidates(
     export_root = "/home/workspace/models/dpo_train/internal/export"
     save_name = os.path.basename(str(output_dir or "").rstrip("/"))
     if save_name:
-        expected_export = f"{export_root}/model_medical_{save_name}"
-        if _workflow_docker_model_dir_complete(workflow, expected_export):
-            return [expected_export]
+        expected_exports = [
+            f"{export_root}/model_dpo_{save_name}",
+            f"{export_root}/model_medical_{save_name}",
+        ]
+        for expected_export in expected_exports:
+            if _workflow_docker_model_dir_complete(workflow, expected_export):
+                return [expected_export]
         return []
 
     export_script = (
         f"find {shlex.quote(export_root)} -mindepth 1 -maxdepth 1 -type d "
-        f"-name 'model_medical_*' -newermt '@{started_at}' -print"
+        f"\\( -name 'model_dpo_*' -o -name 'model_medical_*' \\) -newermt '@{started_at}' -print"
     )
     process = subprocess.run(
         ["docker", "exec", _workflow_training_container(workflow), "sh", "-c", export_script],
@@ -1588,7 +1603,11 @@ def _workflow_find_batch_model_candidates(
     train_type: str,
     output_dir: Optional[str] = None,
 ) -> List[str]:
-    root = "/home/workspace/models/batch_train"
+    root = (
+        "/home/workspace/models/pretrain"
+        if train_type in {"pretrain_lora", "pretrain_full"}
+        else "/home/workspace/models/batch_train"
+    )
     dataset_ref = str(workflow.get("dataset_ref") or (workflow.get("context") or {}).get("dataset_ref") or "").strip()
     expected_paths: List[str] = []
     output_dir = str(output_dir or "").strip().rstrip("/")
@@ -1627,11 +1646,19 @@ def _workflow_expected_batch_output_model_names(train_type: str, dataset_ref: st
     dataset_ref = str(dataset_ref or "").strip()
     if not dataset_ref:
         return []
-    prefix = "model_medical_full" if train_type == "full" else "model_medical_lora"
-    return [
-        f"{prefix}_{dataset_ref}",
-        f"{prefix}_{dataset_ref}_merged",
-    ]
+    prefixes_by_type = {
+        "full": ["model_full", "model_medical_full"],
+        "pretrain_lora": ["model_pretrain_lora"],
+        "pretrain_full": ["model_pretrain_full"],
+    }
+    prefixes = prefixes_by_type.get(train_type, ["model_lora", "model_medical_lora"])
+    names: List[str] = []
+    for prefix in prefixes:
+        names.extend([
+            f"{prefix}_{dataset_ref}",
+            f"{prefix}_{dataset_ref}_merged",
+        ])
+    return names
 
 
 def _workflow_expected_batch_merged_model_names(train_type: str, dataset_ref: str) -> List[str]:
@@ -1654,13 +1681,22 @@ def _workflow_find_existing_trained_model(workflow: Dict[str, Any]) -> Optional[
         output_dir = ((workflow.get("stages") or {}).get("train", {}).get("metrics") or {}).get("output_dir")
         save_name = os.path.basename(str(output_dir or "").rstrip("/"))
         if save_name:
-            export_path = f"/home/workspace/models/dpo_train/internal/export/model_medical_{save_name}"
-            return export_path if _workflow_docker_model_dir_complete(workflow, export_path) else None
+            export_paths = [
+                f"/home/workspace/models/dpo_train/internal/export/model_dpo_{save_name}",
+                f"/home/workspace/models/dpo_train/internal/export/model_medical_{save_name}",
+            ]
+            for export_path in export_paths:
+                if _workflow_docker_model_dir_complete(workflow, export_path):
+                    return export_path
         return None
     if _workflow_docker_dir_exists(workflow, existing):
         return str(existing)
     dataset_ref = str(workflow.get("dataset_ref") or context.get("dataset_ref") or "").strip()
-    root = "/home/workspace/models/batch_train"
+    root = (
+        "/home/workspace/models/pretrain"
+        if train_type in {"pretrain_lora", "pretrain_full"}
+        else "/home/workspace/models/batch_train"
+    )
     process = subprocess.run(
         [
             "docker",
@@ -1701,14 +1737,16 @@ def _workflow_checkpoint_search_roots(workflow: Dict[str, Any]) -> List[str]:
         dataset_ref = str(workflow.get("dataset_ref") or context.get("dataset_ref") or "").strip()
         train_type = str(context.get("train_type") or "lora").strip().lower()
         dataset_name = str(context.get("dataset_name") or "").strip()
-        search_roots = (
-            ["/home/workspace/models/dpo_train/internal/saves"]
-            if train_type == "enhanced"
-            else ["/home/workspace/models/batch_train"]
-        )
-        if train_type not in {"enhanced", "lora"}:
+        if train_type == "enhanced":
+            search_roots = ["/home/workspace/models/dpo_train/internal/saves"]
+        elif train_type in {"pretrain_lora", "pretrain_full"}:
+            search_roots = ["/home/workspace/models/pretrain"]
+        else:
+            search_roots = ["/home/workspace/models/batch_train"]
+        if train_type not in {"enhanced", "lora", "full", "pretrain_lora", "pretrain_full"}:
             search_roots = [
                 "/home/workspace/models/batch_train",
+                "/home/workspace/models/pretrain",
                 "/home/workspace/models/dpo_train/internal/saves",
             ]
         for root in search_roots:
@@ -3965,9 +4003,11 @@ class OrchestratorSystem:
 
     def _schema_options_for_kind(self, agent_name: str, kind: str) -> List[str]:
         if kind == "training_type":
-            return ["LoRA SFT", "全参 SFT", "增强训练", "GRPO", "双机 LoRA SFT", "双机增强训练"]
+            return ["LoRA SFT", "全参 SFT", "LoRA PT", "全参 PT", "增强训练", "GRPO", "双机 LoRA SFT", "双机增强训练"]
         if kind in {"assessment_type", "evaluation_type"}:
             return ["双模型", "单模型", "ckpt评估"]
+        if kind == "data_preprocess_params" and agent_name == "dataprocessor":
+            return ["SFT", "DPO", "PT"]
         if kind == "advanced_filter_choice" and agent_name == "dataprocessor":
             return ["是", "否"]
         return []
@@ -4176,8 +4216,6 @@ class OrchestratorSystem:
             "skip-preflight",
             "skip-data-analysis",
             "skip-merge",
-            "replace-tokenizer-before-merge",
-            "replace-tokenizer-after-merge",
         }
         for match in re.finditer(
             r"--([A-Za-z0-9][A-Za-z0-9_-]*)\s+(?:\"([^\"]*)\"|'([^']*)'|((?!--)[^\\\s]+))",
@@ -4233,7 +4271,7 @@ class OrchestratorSystem:
     def _infer_train_type(self, text: str) -> Optional[str]:
         content = (text or "").lower()
         explicit_type_match = re.search(
-            r"(?:训练类型|train_type|training_type|trainType)\s*(?:是|为|=|:|：)?\s*([A-Za-z0-9_\-]+|双机增强训练|双机\s*LoRA\s*SFT|增强训练|全参\s*SFT|全参训练|全参批量训练|定时训练|日常训练|LoRA\s*SFT|lora训练|lora批量训练)",
+            r"(?:训练类型|train_type|training_type|trainType)\s*(?:是|为|=|:|：)?\s*([A-Za-z0-9_\-]+|双机增强训练|双机\s*LoRA\s*SFT|增强训练|全参\s*PT|全参预训练|LoRA\s*PT|LoRA预训练|继续预训练|预训练|全参\s*SFT|全参训练|全参批量训练|定时训练|日常训练|LoRA\s*SFT|lora训练|lora批量训练)",
             text or "",
             re.IGNORECASE,
         )
@@ -4256,6 +4294,21 @@ class OrchestratorSystem:
                 "全参": "full",
                 "全参训练": "full",
                 "全参批量训练": "full",
+                "pretrain_full": "pretrain_full",
+                "pretrainfull": "pretrain_full",
+                "full_pt": "pretrain_full",
+                "fullpt": "pretrain_full",
+                "全参pt": "pretrain_full",
+                "全参预训练": "pretrain_full",
+                "pretrain_lora": "pretrain_lora",
+                "pretrainlora": "pretrain_lora",
+                "lora_pt": "pretrain_lora",
+                "lorapt": "pretrain_lora",
+                "lora预训练": "pretrain_lora",
+                "继续预训练": "pretrain_lora",
+                "预训练": "pretrain_lora",
+                "pt": "pretrain_lora",
+                "pt训练": "pretrain_lora",
                 "enhanced": "enhanced",
                 "dpo": "enhanced",
                 "增强": "enhanced",
@@ -4286,6 +4339,10 @@ class OrchestratorSystem:
         if "train_multinode_dpo_pipeline" in content or "双机增强训练" in content or "双机dpo" in content or "多机增强训练" in content or "多机dpo" in content:
             return "enhanced"
 
+        if "batch_train_pretrain_full" in content or "pretrain_full" in content or "full_pt" in content or "全参pt" in content or "全参预训练" in text:
+            return "pretrain_full"
+        if "batch_train_pretrain_lora" in content or "pretrain_lora" in content or "lora_pt" in content or "lora pt" in content or "lora预训练" in text or "继续预训练" in text or "pt训练" in text or "预训练" in text:
+            return "pretrain_lora"
         if "batch_train_lora" in content or "lora_sft" in content or "lora sft" in content or "lora批量训练" in text or "lora训练" in text:
             return "lora"
         if "batch_train_full" in content or "full_sft" in content or "full sft" in content or "全参 SFT" in text or "全参SFT" in text or "全参批量训练" in text or "全参训练" in text:
@@ -4311,6 +4368,21 @@ class OrchestratorSystem:
             "full_sft": "full",
             "fullsft": "full",
             "全参sft": "full",
+            "pretrain_full": "pretrain_full",
+            "pretrainfull": "pretrain_full",
+            "full_pt": "pretrain_full",
+            "fullpt": "pretrain_full",
+            "全参pt": "pretrain_full",
+            "全参预训练": "pretrain_full",
+            "pretrain_lora": "pretrain_lora",
+            "pretrainlora": "pretrain_lora",
+            "lora_pt": "pretrain_lora",
+            "lorapt": "pretrain_lora",
+            "lora预训练": "pretrain_lora",
+            "继续预训练": "pretrain_lora",
+            "预训练": "pretrain_lora",
+            "pt": "pretrain_lora",
+            "pt训练": "pretrain_lora",
             "lora": "lora",
             "lora_train": "lora",
             "lora_sft": "lora",
@@ -4340,6 +4412,8 @@ class OrchestratorSystem:
         return {
             "lora": "LoRA SFT",
             "full": "全参 SFT",
+            "pretrain_lora": "LoRA PT",
+            "pretrain_full": "全参 PT",
             "scheduled": "定时训练",
             "enhanced": "增强训练",
             "grpo": "GRPO",
@@ -6072,6 +6146,7 @@ class OrchestratorSystem:
             "finished": "已完成",
             "completed": "已完成",
             "failed": "失败",
+            "interrupted": "已中断",
             "stopped": "已停止",
             "unknown": "未知",
         }
@@ -6080,6 +6155,8 @@ class OrchestratorSystem:
             "lora_sft": "LoRA SFT",
             "full": "全参 SFT",
             "full_sft": "全参 SFT",
+            "pretrain_lora": "LoRA PT",
+            "pretrain_full": "全参 PT",
             "enhanced": "增强训练",
             "grpo": "GRPO",
             "multinode_lora_sft": "双机 LoRA SFT",
@@ -6228,6 +6305,42 @@ class OrchestratorSystem:
                 report_lines.append("```")
             return report_lines
 
+        def _monitor_error_reason_text(reason: str) -> str:
+            return {
+                "pid_ended_no_wandb": "训练进程已结束，但没有找到本次训练的指标或完成记录，可能是启动失败、手动停止或进程提前退出。",
+                "process_ended_without_success_marker": "训练进程已结束，但没有检测到正常完成标记。",
+                "training_process_not_found": "没有找到训练进程，可能是进程已退出或容器内训练没有成功启动。",
+                "output_log_error": "训练日志中发现错误，训练未能正常完成。",
+                "wandb_exitcode_nonzero": "训练进程返回非零退出码，未能正常完成。",
+                "wandb_run_not_found": "暂时没有找到本次训练的指标记录，可能仍在启动或日志尚未写入。",
+                "wandb_no_metrics": "已找到训练记录，但指标数据尚未写入。",
+                "output_dir_missing": "没有找到训练输出目录，请检查输出路径或启动参数。",
+                "merge_failed": "模型合并或导出失败。",
+                "metrics_stale": "训练指标长时间没有更新，进程可能已经卡住或退出。",
+                "loss_not_finite": "训练指标出现 NaN 或 Inf，训练未能稳定继续。",
+                "pid_invalid": "PID 格式不正确，请重新输入正确的进程号。",
+                "pid_not_found": "没有找到对应训练进程，请确认 PID 是否正确。",
+                "pid_wandb_not_found": "没有找到该 PID 对应的训练记录，请确认 PID 是否正确。",
+                "container_required": "需要确认要查询的训练容器。",
+                "container_unknown": "无法确定训练容器，请提供容器名称。",
+                "multiple_containers": "检测到多个运行容器，请指定要查询的训练容器。",
+                "assigned_gpu_preflight_failed": "训练启动前的 GPU 检查未通过，请检查 GPU 分配或资源占用。",
+                "unknown": "训练未正常完成，暂时无法从日志判断具体原因。",
+            }.get(reason, "")
+
+        def _monitor_error_summary() -> str:
+            for key in ("errorSummary", "error_summary"):
+                text = _as_non_empty_text(protocol.get(key))
+                if text:
+                    return text
+            reason = _as_non_empty_text(protocol.get("errorReason") or protocol.get("error_reason"))
+            if reason.startswith("wandb_exitcode_"):
+                exit_code = reason.removeprefix("wandb_exitcode_")
+                return f"训练进程返回非零退出码 {exit_code}，未能正常完成。"
+            if reason:
+                return _monitor_error_reason_text(reason) or "训练未正常完成，暂时无法从日志判断具体原因。"
+            return ""
+
         running_detail = _first_mapping(protocol.get("currentStageDetails"))
         progress_summary = running_detail.get("progress_summary") if isinstance(running_detail.get("progress_summary"), dict) else {}
         is_assessment_finished = is_assessment and status_raw in {"finished", "completed"}
@@ -6290,6 +6403,10 @@ class OrchestratorSystem:
         wandb_text = self._monitor_wandb_display_text(protocol)
         if wandb_text:
             detail_lines.append(f"- **WandB**：{wandb_text}")
+
+        error_summary = _monitor_error_summary()
+        if error_summary and status_raw in {"failed", "interrupted", "unknown", "stopped"}:
+            lines.append(f"\n原因：{error_summary}")
 
         if detail_lines:
             lines.append("\n**详细信息：**")
@@ -6985,8 +7102,8 @@ class OrchestratorSystem:
         normalized = text.replace("：", ":")
         dataset_patterns = [
             r"(?:data_identifier|dataset_id|dataset_date|data_date|数据标识|数据日期|训练日期)\s*(?:是|为|=|:)?\s*(20\d{6}(?:_[A-Za-z0-9][A-Za-z0-9_.-]*)?)",
-            r"(?:dataset_dir|data_dir|数据集路径|数据路径|数据集目录|数据目录|数据集位置|数据位置)\s*(?:是|为|=|:)?\s*/[^\s,，;；]*(?:dataset_batch_train|dataset_daily_train)/([A-Za-z0-9_.-]+)",
-            r"/[^\s,，;；]*(?:dataset_batch_train|dataset_daily_train)/(20\d{6}(?:_[A-Za-z0-9][A-Za-z0-9_.-]*)?)",
+            r"(?:dataset_dir|data_dir|数据集路径|数据路径|数据集目录|数据目录|数据集位置|数据位置)\s*(?:是|为|=|:)?\s*/[^\s,，;；]*(?:dataset_batch_train|dataset_daily_train|dataset_pretrain)/([A-Za-z0-9_.-]+)",
+            r"/[^\s,，;；]*(?:dataset_batch_train|dataset_daily_train|dataset_pretrain)/(20\d{6}(?:_[A-Za-z0-9][A-Za-z0-9_.-]*)?)",
             r"(?:用|使用|拿)\s*(20\d{6}(?:_[A-Za-z0-9][A-Za-z0-9_.-]*)?)\s*(?:这个|这份)?(?:数据|数据集)",
             r"(20\d{6}(?:_[A-Za-z0-9][A-Za-z0-9_.-]*)?)\s*(?:这个|这份)?(?:数据|数据集)",
         ]
@@ -6996,7 +7113,7 @@ class OrchestratorSystem:
                 return match.group(1).strip().rstrip("/")
 
         scrubbed = re.sub(r"/[^\s,，;；]*(?:models|medical_models)/[^\s,，;；]*", " ", normalized)
-        scrubbed = re.sub(r"\bmodel_medical_(?:lora|full)_20\d{6}(?:_[A-Za-z0-9][A-Za-z0-9_.-]*)?\b", " ", scrubbed)
+        scrubbed = re.sub(r"\bmodel_(?:lora|full|dpo|medical(?:_(?:lora|full))?|pretrain_(?:lora|full))_20\d{6}(?:_[A-Za-z0-9][A-Za-z0-9_.-]*)?\b", " ", scrubbed)
         ref_match = re.search(r"(?<![A-Za-z0-9_.-])(20\d{6}(?:_[A-Za-z0-9][A-Za-z0-9_.-]*)?)(?![A-Za-z0-9_.-])", scrubbed)
         if ref_match:
             return ref_match.group(1)
@@ -7029,9 +7146,9 @@ class OrchestratorSystem:
         if self._infer_multinode_train_family(text):
             return True 
         keywords = [
-            "lora", "LoRA", "sft", "SFT", "全参", "定时", "增强", "dpo", "DPO",
+            "lora", "LoRA", "sft", "SFT", "全参", "定时", "增强", "dpo", "DPO", "预训练", "pt", "PT",
             "grpo", "GRPO", "grpo_train",
-            "batch_train_lora", "batch_train_full", "dpo_train_launcher",
+            "batch_train_lora", "batch_train_full", "batch_train_pretrain_lora", "batch_train_pretrain_full", "dpo_train_launcher",
         ]
         return any(keyword in (text or "") for keyword in keywords)
 
@@ -7050,6 +7167,16 @@ class OrchestratorSystem:
             hints.append(
                 "- 本次训练类型明确为 grpo；只使用 model_path、train_files、val_files，"
                 "禁止改判为增强训练或多机增强训练。"
+            )
+        elif requested_train_type == "pretrain_full":
+            hints.append(
+                "- 本次训练类型明确为 全参 PT；应调用 run_script_by_name_train，script_query 使用 全参预训练，"
+                "训练数据必须来自 /home/workspace/dataset_pretrain 下的 text/PT 数据目录。"
+            )
+        elif requested_train_type == "pretrain_lora":
+            hints.append(
+                "- 本次训练类型明确为 LoRA PT；应调用 run_script_by_name_train，script_query 使用 LoRA预训练，"
+                "训练数据必须来自 /home/workspace/dataset_pretrain 下的 text/PT 数据目录。"
             )
         else:
             hints.append(
@@ -7079,10 +7206,12 @@ class OrchestratorSystem:
         container = self._training_container_for_request(task_description)
         batch_path = f"/home/workspace/dataset_batch_train/{dataset_ref}"
         daily_path = f"/home/workspace/dataset_daily_train/{dataset_ref}"
+        pretrain_path = f"/home/workspace/dataset_pretrain/{dataset_ref}"
         raw_path = f"/home/workspace/dataset/{dataset_ref}"
 
         batch_exists = self._docker_path_exists(container, batch_path)
         daily_exists = self._docker_path_exists(container, daily_path)
+        pretrain_exists = self._docker_path_exists(container, pretrain_path)
         raw_exists = self._docker_path_exists(container, raw_path)
 
         hints.append(f"- 识别到数据标识：{dataset_ref}。")
@@ -7100,6 +7229,13 @@ class OrchestratorSystem:
         else:
             hints.append(f"- DPO候选数据目录：{daily_path}（当前无法自动确认是否存在）。")
 
+        if pretrain_exists is True:
+            hints.append(f"- PT/text候选数据目录存在：{pretrain_path}。适合 LoRA PT 或 全参 PT。")
+        elif pretrain_exists is False:
+            hints.append(f"- PT/text候选数据目录未检测到：{pretrain_path}。")
+        else:
+            hints.append(f"- PT/text候选数据目录：{pretrain_path}（当前无法自动确认是否存在）。")
+
         if raw_exists is True:
             hints.append(f"- 原始数据目录存在：{raw_path}；如果用户要直接训练，应先进行数据处理。")
 
@@ -7112,7 +7248,7 @@ class OrchestratorSystem:
             hints.append(f"- DPO数据目录下存在多个数据文件候选：{', '.join(daily_candidates[:8])}。不能直接猜测 dataset_name。")
 
         has_training_type = self._has_training_type(task_description)
-        if not has_training_type and daily_exists is True and batch_exists is not True:
+        if not has_training_type and daily_exists is True and batch_exists is not True and pretrain_exists is not True:
             default_mode = "多机增强训练" if is_multinode else "增强训练"
             hints.append(
                 f"- 用户未指定训练类型，但仅检测到DPO数据目录；按新手默认执行 {default_mode}，"
@@ -7157,6 +7293,9 @@ class OrchestratorSystem:
                 default_mode = "多机lora批量训练" if is_multinode else "lora批量训练"
                 hints.append(f"- 用户未指定训练类型，且检测到SFT数据目录；默认执行 {default_mode}，不要再次询问训练类型。")
 
+            elif pretrain_exists is True:
+                hints.append("- 用户未指定训练类型，且只检测到PT/text数据目录；默认执行 LoRA预训练，不要再次询问训练类型。")
+
             elif raw_exists is True:
                 hints.append("- 用户未指定训练类型，且只检测到原始数据目录；训练前必须先调用 dataprocessor 做数据预处理，不要直接启动训练。")
             else:
@@ -7177,6 +7316,7 @@ class OrchestratorSystem:
         has_training_dataset_path = (
             "/home/workspace/dataset_batch_train/" in text
             or "/home/workspace/dataset_daily_train/" in text
+            or "/home/workspace/dataset_pretrain/" in text
         )
         if not has_training_keyword and not has_training_dataset_path:
             return None
@@ -7190,10 +7330,12 @@ class OrchestratorSystem:
 
         batch_path = f"/home/workspace/dataset_batch_train/{dataset_ref}"
         daily_path = f"/home/workspace/dataset_daily_train/{dataset_ref}"
+        pretrain_path = f"/home/workspace/dataset_pretrain/{dataset_ref}"
         raw_path = f"/home/workspace/dataset/{dataset_ref}"
 
         batch_exists = self._docker_path_exists(container, batch_path)
         daily_exists = self._docker_path_exists(container, daily_path)
+        pretrain_exists = self._docker_path_exists(container, pretrain_path)
         raw_exists = self._docker_path_exists(container, raw_path)
         requested_train_type = self._normalize_train_type(self._infer_train_type(text))
         has_training_type = self._has_training_type(text)
@@ -7216,10 +7358,15 @@ class OrchestratorSystem:
             path == batch_path or path.startswith(f"{batch_path}/")
             for path in explicit_paths
         )
+        explicit_pretrain_path = any(
+            path == pretrain_path or path.startswith(f"{pretrain_path}/")
+            for path in explicit_paths
+        )
 
         if (
             batch_exists is True
             and daily_exists is True
+            and pretrain_exists is not True
             and not has_training_type
             and not explicit_daily_path
             and not explicit_batch_path
@@ -7230,6 +7377,23 @@ class OrchestratorSystem:
                 "目录含义必须按以下规则解释：/home/workspace/dataset_batch_train 是 SFT 数据，适合 lora训练；"
                 "/home/workspace/dataset_daily_train 是 DPO 数据，适合增强训练。"
                 "无法安全判断训练类型，必须先询问用户选择 lora训练 或 增强训练。"
+            )
+
+        if (
+            pretrain_exists is True
+            and (
+                requested_train_type in {"pretrain_lora", "pretrain_full"}
+                or explicit_pretrain_path
+                or (not has_training_type and batch_exists is not True and daily_exists is not True)
+            )
+            and not explicit_batch_path
+            and not explicit_daily_path
+        ):
+            default_mode = "LoRA预训练" if requested_train_type != "pretrain_full" else "全参预训练"
+            return (
+                "[系统路由提示] 检测到该日期数据位于 /home/workspace/dataset_pretrain。"
+                "/home/workspace/dataset_pretrain 是 PT/text 预训练数据目录，适合 LoRA PT 或 全参 PT，禁止说成 SFT 或增强训练。"
+                f"如果用户未明确训练类型，必须调用 _call_trainer，默认执行 {default_mode}。"
             )
 
         if batch_exists is True and requested_train_type in {None, "lora", "full"} and not explicit_daily_path:
@@ -7270,11 +7434,12 @@ class OrchestratorSystem:
     def _build_preprocess_guidance(self, dataset_ref: str, raw_path: str) -> str:
         return f"""检测到 `{dataset_ref}` 目前还在原始数据目录 `{raw_path}`，还不能直接开始训练。
 
-先做一步数据预处理就行。我会先调用预处理工具检测数据格式；如果是 OpenAI、ShareGPT、SFT、DPO 或 text 等通用格式，只需要你补充 `data_type=sft` 或 `data_type=dpo`；如果检测为医疗 raw 原始格式，再补充 `strategy=inspection/diagnosis/prescription`。
+先做一步数据预处理就行。我会先调用预处理工具检测数据格式；如果是 OpenAI、ShareGPT、SFT、DPO 或 text 等通用格式，只需要你补充 `data_type=sft`、`data_type=dpo` 或 `data_type=pt`；如果检测为医疗 raw 原始格式，再补充 `strategy=inspection/diagnosis/prescription`。
 
 可以这样理解：
 - `sft`：常规监督微调，适合先做 LoRA / 全参训练
 - `dpo`：偏好优化数据，适合后续增强训练
+- `pt` / `text`：无监督文本数据，适合 LoRA PT / 全参 PT 预训练
 - `strategy`：只用于医疗 raw 原始格式，表示检查、诊断或处方方向
 """
 
@@ -7365,7 +7530,7 @@ class OrchestratorSystem:
         ):
             return "trainer"
 
-        explicit_training_keywords = ["lora批量训练", "全参批量训练", "定时训练", "增强训练", "多机lora批量训练", "多机增强训练"]
+        explicit_training_keywords = ["lora批量训练", "全参批量训练", "LoRA预训练", "全参预训练", "PT训练", "定时训练", "增强训练", "多机lora批量训练", "多机增强训练"]
 
         inference_keywords = [
             "推理服务",
@@ -7771,7 +7936,7 @@ class OrchestratorSystem:
                     break
 
         data_type_match = re.search(
-            r"(?:data_type|数据类型)\s*(?:是|为|=|:)?\s*(sft|dpo)",
+            r"(?:data_type|数据类型)\s*(?:是|为|=|:)?\s*(sft|dpo|pt|text)",
             text,
             re.IGNORECASE,
         )
@@ -7956,7 +8121,7 @@ class OrchestratorSystem:
     def _looks_like_new_task(self, message: str) -> bool:
         text = (message or "").lower()
         task_keywords = [
-            "训练", "lora", "全参", "增强训练", "定时训练",
+            "训练", "lora", "全参", "增强训练", "定时训练", "预训练", "pt",
             "评估", "评测", "ckpt",
             "推理", "服务",
             "数据处理", "预处理", "高级筛选", "数据准备", "数据收集",
@@ -8013,7 +8178,7 @@ class OrchestratorSystem:
         multinode_family = self._infer_multinode_train_family(task_description)
         requested_train_type = self._normalize_train_type(self._infer_train_type(task_description))
         has_training_type = self._has_training_type(task_description)
-        if has_training_type and requested_train_type not in {None, "lora", "full", "enhanced"}:
+        if has_training_type and requested_train_type not in {None, "lora", "full", "pretrain_lora", "pretrain_full", "enhanced"}:
             return None
 
         dataset_ref = self._extract_dataset_reference(task_description)
@@ -8031,10 +8196,12 @@ class OrchestratorSystem:
         container = self._training_container_for_request(task_description)
         batch_path = f"/home/workspace/dataset_batch_train/{dataset_ref}"
         daily_path = f"/home/workspace/dataset_daily_train/{dataset_ref}"
+        pretrain_path = f"/home/workspace/dataset_pretrain/{dataset_ref}"
         raw_path = f"/home/workspace/dataset/{dataset_ref}"
 
         batch_exists = self._docker_path_exists(container, batch_path)
         daily_exists = self._docker_path_exists(container, daily_path)
+        pretrain_exists = self._docker_path_exists(container, pretrain_path)
         raw_exists = self._docker_path_exists(container, raw_path)
         named_values = self._extract_named_param_values(task_description)
         explicit_paths = [
@@ -8050,10 +8217,15 @@ class OrchestratorSystem:
             path == batch_path or path.startswith(f"{batch_path}/")
             for path in explicit_paths
         )
+        explicit_pretrain_path = any(
+            path == pretrain_path or path.startswith(f"{pretrain_path}/")
+            for path in explicit_paths
+        )
 
         if (
             batch_exists is True
             and daily_exists is True
+            and pretrain_exists is not True
             and requested_train_type is None
             and not explicit_daily_path
             and not explicit_batch_path
@@ -8070,6 +8242,40 @@ class OrchestratorSystem:
             )
 
         if (
+            pretrain_exists is True
+            and (
+                requested_train_type in {"pretrain_lora", "pretrain_full"}
+                or explicit_pretrain_path
+                or (requested_train_type is None and batch_exists is not True and daily_exists is not True)
+            )
+            and not explicit_daily_path
+            and not explicit_batch_path
+        ):
+            mode_text = "全参预训练" if requested_train_type == "pretrain_full" else "LoRA预训练"
+            train_args = self._workflow_batch_train_args(task_description)
+            explicit_arg_text = "".join(
+                f"、{key}={value}"
+                for key, value in sorted(train_args.items())
+                if str(value or "").strip()
+            )
+            explicit_arg_lines = "".join(
+                f"\n{key}={value}"
+                for key, value in sorted(train_args.items())
+                if str(value or "").strip()
+            )
+            normalized_task = (
+                f"执行{mode_text}。用户指定数据标识为{dataset_ref}，"
+                f"对应PT/text数据目录为{pretrain_path}。不要询问训练类型，立即执行{mode_text}。"
+                "调用 run_script_by_name_train 时 additional_args 只能使用 "
+                f"data_identifier={dataset_ref}、data_dir={pretrain_path}"
+                f"{'、model_path=' + named_values['model_path'] if named_values.get('model_path') and 'model_path' not in train_args else ''}"
+                f"{explicit_arg_text}，禁止使用 data_id。"
+                f"{explicit_arg_lines}"
+            )
+            logger.info(f"[Orchestrator] 训练请求已归一化为 PT预训练: {dataset_ref}")
+            return await self._call_agent_with_params("trainer", normalized_task, "")
+
+        if (
             batch_exists is True
             and requested_train_type in {None, "lora", "full"}
             and not explicit_daily_path
@@ -8078,12 +8284,25 @@ class OrchestratorSystem:
                 mode_text = "全参批量训练"
             else:
                 mode_text = "多机lora批量训练" if is_multinode else "lora批量训练"
+            train_args = self._workflow_batch_train_args(task_description)
+            explicit_arg_text = "".join(
+                f"、{key}={value}"
+                for key, value in sorted(train_args.items())
+                if str(value or "").strip()
+            )
+            explicit_arg_lines = "".join(
+                f"\n{key}={value}"
+                for key, value in sorted(train_args.items())
+                if str(value or "").strip()
+            )
             normalized_task = (
                 f"执行{mode_text}。用户指定数据标识为{dataset_ref}，"
                 f"对应SFT数据目录为{batch_path}。不要询问训练类型，立即执行{mode_text}。"
                 "调用 run_script_by_name_train 时 additional_args 只能使用 "
                 f"data_identifier={dataset_ref}、data_dir={batch_path}"
-                f"{'、model_path=' + named_values['model_path'] if named_values.get('model_path') else ''}，禁止使用 data_id。"
+                f"{'、model_path=' + named_values['model_path'] if named_values.get('model_path') and 'model_path' not in train_args else ''}"
+                f"{explicit_arg_text}，禁止使用 data_id。"
+                f"{explicit_arg_lines}"
             )
             if is_multinode:
                 multinode_args = self._extract_multinode_cli_args(task_description)
@@ -8175,7 +8394,7 @@ class OrchestratorSystem:
                 type="text",
                 text=(
                     f"未检测到数据 {dataset_ref} 对应的可训练数据目录。请确认数据位于 "
-                    f"{batch_path}、{daily_path} 或 {raw_path}。"
+                    f"{batch_path}、{daily_path}、{pretrain_path} 或 {raw_path}。"
                 ),
             )
         ])
@@ -8315,6 +8534,8 @@ class OrchestratorSystem:
                 constraint = "\n[系统约束] 当前数据处理类型为 SFT，**仅允许执行 Lora 批量训练 或 全参批量训练**"
             elif data_type == 'dpo':
                 constraint = "\n[系统约束] 当前数据处理类型为 DPO，**仅允许执行 定时训练 或 增强训练**"
+            elif data_type in {'pt', 'text'}:
+                constraint = "\n[系统约束] 当前数据处理类型为 PT/text，**仅允许执行 LoRA PT 或 全参 PT**"
             else:
                 constraint = ""
 
@@ -8746,7 +8967,7 @@ class OrchestratorSystem:
 
     def _all_stop_patterns_for_type(self, task_type: str) -> List[str]:
         if task_type == "train":
-            return ["batch_train_lora", "batch_train_full", "dpo_train_launcher", "grpo_train"]
+            return ["batch_train_lora", "batch_train_full", "batch_train_pretrain_lora", "batch_train_pretrain_full", "dpo_train_launcher", "grpo_train"]
         if task_type == "data":
             return ["data_preprocessing", "score_based_filtering"]
         if task_type in {"assessment", "evaluate"}:
@@ -8755,7 +8976,7 @@ class OrchestratorSystem:
 
     def _task_type_for_script_name(self, script_name: Optional[str]) -> Optional[str]:
         name = os.path.basename(str(script_name or "").strip())
-        if name in {"batch_train_lora", "batch_train_full", "dpo_train_launcher", "grpo_train"}:
+        if name in {"batch_train_lora", "batch_train_full", "batch_train_pretrain_lora", "batch_train_pretrain_full", "dpo_train_launcher", "grpo_train"}:
             return "train"
         if name in {"data_preprocessing", "score_based_filtering"}:
             return "data"
@@ -9160,8 +9381,13 @@ class OrchestratorSystem:
             patterns.extend([
                 f"/home/workspace/dataset_batch_train/{dataset_date}",
                 f"/home/workspace/dataset_daily_train/{dataset_date}",
+                f"/home/workspace/dataset_pretrain/{dataset_date}",
+                f"model_lora_{dataset_date}",
+                f"model_full_{dataset_date}",
                 f"model_medical_lora_{dataset_date}",
                 f"model_medical_full_{dataset_date}",
+                f"model_pretrain_lora_{dataset_date}",
+                f"model_pretrain_full_{dataset_date}",
             ])
 
         dataset_dir = env_vars.get("DATASET_DIR") or script_args.get("dataset_dir")
@@ -9170,8 +9396,12 @@ class OrchestratorSystem:
             if dataset_tail:
                 patterns.extend([
                     str(dataset_dir),
+                    f"model_lora_{dataset_tail}",
+                    f"model_full_{dataset_tail}",
                     f"model_medical_lora_{dataset_tail}",
                     f"model_medical_full_{dataset_tail}",
+                    f"model_pretrain_lora_{dataset_tail}",
+                    f"model_pretrain_full_{dataset_tail}",
                 ])
 
         # Keep only reasonably specific patterns; broad executable names can kill other runs.
@@ -9180,7 +9410,7 @@ class OrchestratorSystem:
             pattern = str(pattern).strip()
             if not pattern or len(pattern) < 4:
                 continue
-            if pattern in {"deepspeed", "torchrun", "accelerate", "train", "batch_train_lora", "batch_train_full"}:
+            if pattern in {"deepspeed", "torchrun", "accelerate", "train", "batch_train_lora", "batch_train_full", "batch_train_pretrain_lora", "batch_train_pretrain_full"}:
                 continue
             if pattern not in unique:
                 unique.append(pattern)
@@ -9233,6 +9463,8 @@ class OrchestratorSystem:
         return [
             "train_multinode_sft_pipeline",
             "train_multinode_dpo_pipeline",
+            "batch_train_pretrain_lora",
+            "batch_train_pretrain_full",
             "batch_train_lora",
             "batch_train_full",
             "dpo_train_launcher",
@@ -9251,6 +9483,10 @@ class OrchestratorSystem:
             return ["train_multinode_sft_pipeline"]
         if any(keyword in text for keyword in ["增强训练", "dpo", "dpo_train_launcher"]):
             return ["dpo_train_launcher"]
+        if any(keyword in text for keyword in ["全参预训练", "全参pt", "batch_train_pretrain_full", "pretrain_full", "full_pt"]):
+            return ["batch_train_pretrain_full"]
+        if any(keyword in text for keyword in ["lora预训练", "pt训练", "继续预训练", "batch_train_pretrain_lora", "pretrain_lora", "lora_pt"]):
+            return ["batch_train_pretrain_lora"]
         if any(keyword in text for keyword in ["lora批量训练", "lora训练", "batch_train_lora"]):
             return ["batch_train_lora"]
         if any(keyword in text for keyword in ["全参批量训练", "全参训练", "batch_train_full"]):
@@ -9279,6 +9515,10 @@ class OrchestratorSystem:
             return ["train_multinode_sft_pipeline"]
         if "dpo_train_launcher" in text or "增强训练" in text or "dpo" in text:
             return ["dpo_train_launcher"]
+        if "batch_train_pretrain_full" in text or "全参预训练" in text or "全参pt" in text or "pretrain_full" in text or "full_pt" in text:
+            return ["batch_train_pretrain_full"]
+        if "batch_train_pretrain_lora" in text or "lora预训练" in text or "pt训练" in text or "继续预训练" in text or "pretrain_lora" in text or "lora_pt" in text:
+            return ["batch_train_pretrain_lora"]
         if "batch_train_lora" in text or "lora批量训练" in text or "lora训练" in text:
             return ["batch_train_lora"]
         if "batch_train_full" in text or "全参批量训练" in text or "全参训练" in text:
@@ -11197,35 +11437,44 @@ exit 0
         if requested_train_type is None:
             batch_exists = self._docker_path_exists(request_container, batch_path)
             daily_exists = self._docker_path_exists(request_container, daily_path)
-            if batch_exists is True and daily_exists is True:
+            pretrain_exists = self._docker_path_exists(request_container, pretrain_path)
+            if batch_exists is True and daily_exists is True and pretrain_exists is not True:
                 raise ValueError(
                     "同一数据标识同时存在于 SFT 和 DPO 目录，无法安全判断训练类型："
                     f"{batch_path}；{daily_path}。"
                     "请明确指定 lora训练 或 增强训练。"
                 )
-            if daily_exists is True:
-                train_type = "enhanced"
-            elif batch_exists is True:
+            if batch_exists is True:
                 train_type = "lora"
+            elif daily_exists is True:
+                train_type = "enhanced"
+            elif pretrain_exists is True:
+                train_type = "pretrain_lora"
             else:
                 raise ValueError(
                     "训练数据目录不存在。已检查："
-                    f"{batch_path}（SFT）；{daily_path}（DPO）"
+                    f"{batch_path}（SFT）；{daily_path}（DPO）；{pretrain_path}（PT/text）"
                     f"（容器：{request_container}）。"
                 )
         else:
             train_type = requested_train_type
 
         if train_type != "enhanced":
+            train_script = {
+                "full": "batch_train_full",
+                "pretrain_lora": "batch_train_pretrain_lora",
+                "pretrain_full": "batch_train_pretrain_full",
+            }.get(train_type, "batch_train_lora")
+            dataset_path = pretrain_path if train_type in {"pretrain_lora", "pretrain_full"} else batch_path
             validation_issue = validate_training_inputs_preflight(
-                "batch_train_lora",
+                train_script,
                 request_container,
-                {"DATASET_DIR": batch_path, "DATASET_DATE": dataset_ref},
+                {"DATASET_DIR": dataset_path, "DATASET_DATE": dataset_ref},
             )
             if validation_issue:
                 raise ValueError(str(validation_issue["message"]))
             context = {
-                "train_type": "lora",
+                "train_type": train_type,
                 "benchmark": benchmark_name,
                 "evaluation_dataset_name": benchmark_name,
                 "training_container": self.training_container,
@@ -11296,10 +11545,12 @@ exit 0
             "LOCALHOST_ID": r"\bLOCALHOST_ID\s*=\s*([0-9,\s]+)",
             "MBS": r"\bMBS\s*=\s*([0-9]+)",
             "ACC": r"\bACC\s*=\s*([0-9]+)",
-            "LR": r"\bLR\s*=\s*([0-9.eE+-]+)",
-            "TEM": r"\bTEM\s*=\s*([A-Za-z0-9_.-]+)",
+            "LR": r"\b(?:LR|learning_rate)\s*=\s*([0-9.eE+-]+)",
+            "TEM": r"\b(?:TEM|template)\s*=\s*([A-Za-z0-9_.-]+)",
             "RESUME": r"\bRESUME\s*=\s*([^\s,;]+)",
             "model_path": r"\b(?:MODEL_PATH|model_path|base_model_path)\s*=\s*(/[^\s,，;；]+)",
+            "DATASET_DIR": r"\b(?:DATASET_DIR|dataset_dir|data_dir)\s*=\s*(/[^\s,，;；]+)",
+            "DATASET_DATE": r"\b(?:DATASET_DATE|dataset_date|data_date|data_identifier|dataset_id|data_id)\s*=\s*(20\d{6}(?:_[A-Za-z0-9][A-Za-z0-9_.-]*)?)",
             "container": r"\b(?:container|docker_container)\s*=\s*([A-Za-z0-9_.-]+)",
         }
         for key, pattern in explicit_patterns.items():
@@ -11324,8 +11575,10 @@ exit 0
             "MBS": r"(?:批量大小|批次大小|批大小|mbs)\s*(?:是|为|=|:)?\s*([0-9]+)",
             "ACC": r"(?:梯度累积|累积步数|acc)\s*(?:是|为|=|:)?\s*([0-9]+)",
             "LR": r"(?:学习率|学习速率|lr)\s*(?:是|为|=|:)?\s*([0-9.eE+-]+)",
-            "TEM": r"(?:模型模板|模型类别|tem)\s*(?:是|为|=|:)?\s*([A-Za-z0-9_.-]+)",
+            "TEM": r"(?:模型模板|模型类别|tem|template)\s*(?:是|为|=|:)?\s*([A-Za-z0-9_.-]+)",
             "model_path": r"(?:模型路径|模型位置|基础模型路径|模型在)\s*(?:是|为|=|:)?\s*(/[^\s,，;；]+)",
+            "DATASET_DIR": r"(?:数据集路径|数据路径|数据集目录|数据目录|训练数据路径|dataset_dir|data_dir)\s*(?:是|为|=|:)?\s*(/[^\s,，;；]+)",
+            "DATASET_DATE": r"(?:数据日期|数据标识|训练日期|dataset_date|data_date|data_identifier|dataset_id|data_id)\s*(?:是|为|=|:)?\s*(20\d{6}(?:_[A-Za-z0-9][A-Za-z0-9_.-]*)?)",
             "container": r"(?:容器|docker)\s*(?:是|为|=|:)?\s*([A-Za-z0-9_.-]+)",
         }
         for key, pattern in chinese_patterns.items():

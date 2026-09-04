@@ -47,6 +47,7 @@ export interface MetricPoint {
     elapsedTime?: number;
     remainingTime?: number;
     totalSteps?: number;
+    progressPercent?: number;
 }
 
 export interface ProcessData {
@@ -218,6 +219,32 @@ const toFiniteNumber = (value: unknown): number | undefined => {
     return Number.isFinite(numberValue) ? numberValue : undefined;
 };
 
+const normalizeProgressPercent = (value: unknown): number | undefined => {
+    const parsed = typeof value === 'string'
+        ? toFiniteNumber(value.replace(/%$/, '').trim())
+        : toFiniteNumber(value);
+    if (parsed === undefined) return undefined;
+    return Math.max(0, Math.min(100, Math.round(parsed)));
+};
+
+const integerStepValue = (value: unknown): number | undefined => {
+    const parsed = toFiniteNumber(value);
+    if (parsed === undefined || parsed < 0 || !Number.isInteger(parsed)) {
+        return undefined;
+    }
+    return parsed;
+};
+
+const metricStepFromRecord = (record: Record<string, unknown>): number | undefined => {
+    return (
+        integerStepValue(record.step) ??
+        integerStepValue(record.global_step) ??
+        integerStepValue(record.train_global_step) ??
+        integerStepValue(record['train/global_step']) ??
+        integerStepValue(record.epoch)
+    );
+};
+
 const parseMetricsJSONPayload = (text: string): any | null => {
     const trimmed = text.trim();
     const candidates = [trimmed];
@@ -270,13 +297,16 @@ const parseMetricsFromJSON = (text: string): Map<string, MetricPoint[]> => {
             // 从 metrics 级别获取全局时间和步数信息
             const globalElapsedTime = parseTimeToSeconds(metrics.elapsed_time);
             const globalRemainingTime = parseTimeToSeconds(metrics.remaining_time);
-            const globalTotalSteps = metrics.total_steps;
+            const globalTotalSteps = toFiniteNumber(metrics.total_steps);
             const globalLearningRate = toFiniteNumber(metrics.latest_learning_rate);
+            const globalProgressPercent = normalizeProgressPercent(
+                metrics.progress_percent ?? metrics.progressPercent
+            );
 
             // 1. Extract from history array
             if (metrics.history && Array.isArray(metrics.history)) {
                 metrics.history.forEach((item: any) => {
-                    const step = toFiniteNumber(item.step ?? item._step);
+                    const step = metricStepFromRecord(item);
                     const loss = toFiniteNumber(item.loss);
                     if (step !== undefined && loss !== undefined) {
                         const lr = toFiniteNumber(item.lr ?? item.learning_rate) ?? globalLearningRate ?? 0;
@@ -286,14 +316,18 @@ const parseMetricsFromJSON = (text: string): Map<string, MetricPoint[]> => {
                             lr,
                             elapsedTime: globalElapsedTime,
                             remainingTime: globalRemainingTime,
-                            totalSteps: globalTotalSteps
+                            totalSteps: globalTotalSteps,
+                            progressPercent: globalProgressPercent
                         });
                     }
                 });
             }
 
             // 2. Extract latest info if no history or to supplement
-            const latestStep = toFiniteNumber(metrics.latest_step);
+            const latestStep =
+                integerStepValue(metrics.latest_step) ??
+                integerStepValue(metrics.current_step) ??
+                integerStepValue(metrics.latest_epoch);
             const latestLoss = toFiniteNumber(metrics.latest_loss);
             if (latestStep !== undefined && latestLoss !== undefined) {
                 const latestPoint: MetricPoint = {
@@ -302,7 +336,8 @@ const parseMetricsFromJSON = (text: string): Map<string, MetricPoint[]> => {
                     lr: globalLearningRate ?? 0,
                     elapsedTime: parseTimeToSeconds(metrics.elapsed_time),
                     remainingTime: parseTimeToSeconds(metrics.remaining_time),
-                    totalSteps: metrics.total_steps
+                    totalSteps: globalTotalSteps,
+                    progressPercent: globalProgressPercent
                 };
 
                 // Add latest point if no history or if latest is newer than history
@@ -591,9 +626,10 @@ const TrainingMetricsPanel = ({
 
                     const latest = updatedMetrics[updatedMetrics.length - 1];
                     const totalSteps = latest.totalSteps || existingData.totalSteps;
-                    const progress = totalSteps && totalSteps > 0
-                        ? Math.round((latest.step / totalSteps) * 100)
-                        : existingData.progress;
+                    const calculatedProgress = totalSteps && totalSteps > 0
+                        ? normalizeProgressPercent((latest.step / totalSteps) * 100)
+                        : undefined;
+                    const progress = latest.progressPercent ?? calculatedProgress ?? existingData.progress;
 
                     newDataMap.set(pid, {
                         ...existingData,
@@ -613,9 +649,10 @@ const TrainingMetricsPanel = ({
                 const sortedMetrics = metrics.sort((a, b) => a.step - b.step);
                 const latest = sortedMetrics[sortedMetrics.length - 1];
                 const totalSteps = latest.totalSteps;
-                const progress = totalSteps && totalSteps > 0
-                    ? Math.round((latest.step / totalSteps) * 100)
+                const calculatedProgress = totalSteps && totalSteps > 0
+                    ? normalizeProgressPercent((latest.step / totalSteps) * 100)
                     : undefined;
+                const progress = latest.progressPercent ?? calculatedProgress;
 
                 // 新PID只计算基础平滑数据（平滑度为0，即原始数据）
                 newDataMap.set(pid, {
@@ -1548,13 +1585,13 @@ const TrainingMetricsPanel = ({
                                     <div className="bg-muted rounded-lg p-2 flex flex-col justify-center">
                                         <div className="flex items-center justify-between mb-1">
                                             <span className="text-xs text-muted-foreground">{t('training.progress') || 'Progress'}</span>
-                                            <span className="text-xs font-medium">{selectedProcess.progress ?? 0}%</span>
+                                            <span className="text-xs font-medium">{normalizeProgressPercent(selectedProcess.progress) ?? 0}%</span>
                                         </div>
                                         <div className="w-full bg-background rounded-full h-2">
                                             <div
                                                 className="h-2 rounded-full transition-all duration-300"
                                                 style={{
-                                                    width: `${selectedProcess.progress ?? 0}%`,
+                                                    width: `${normalizeProgressPercent(selectedProcess.progress) ?? 0}%`,
                                                     backgroundColor: selectedProcess.color,
                                                 }}
                                             />

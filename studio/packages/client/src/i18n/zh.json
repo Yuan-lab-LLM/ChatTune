@@ -584,6 +584,10 @@
   "lora-batch-trainingDesc": "批量执行LoRA训练任务",
   "full-param-batch-training": "全参批量训练",
   "full-param-batch-trainingDesc": "批量执行全参数训练",
+  "pretrain-lora-train": "LoRA PT预训练",
+  "pretrain-lora-trainingDesc": "执行LoRA PT预训练任务",
+  "pretrain-full-train": "全参PT预训练",
+  "pretrain-full-trainingDesc": "执行全参PT预训练任务",
   "grpo-trainingDesc": "使用指定模型、训练集、验证集和 GPU 编号启动 GRPO 训练",
   "dual-model-assessment": "双模型评估",
   "dual-model-assessmentDesc": "对比评估两个模型",
@@ -620,7 +624,7 @@
   "data-preprocessing": "数据预处理",
   "data-preprocessingDesc": "预处理和清洗数据",
   "data-advanced-filtering": "数据高级筛选",
-  "data-advanced-filteringDesc": "应用高级筛选条件",
+  "data-advanced-filteringDesc": "筛选 SFT、DPO 或 PT 文本训练数据",
   "mgmt-studio-help": "Studio命令帮助",
   "mgmt-studio-helpDesc": "查看 Studio 前端管理命令说明",
   "mgmt-dataset-view": "切换数据集列表",
@@ -1505,6 +1509,8 @@
         "loraBatchTraining": "LoRA批量训练",
         "multinodeLoraBatchTraining": "双机 LoRA SFT",
         "fullParamBatchTraining": "全参批量训练",
+        "pretrainLoraTraining": "LoRA PT",
+        "pretrainFullTraining": "全参 PT",
         "enhancedTraining": "增强训练",
         "multinodeEnhancedTraining": "双机增强训练",
         "grpoTraining": "GRPO训练",
@@ -1622,12 +1628,14 @@
       "label": "数据集类型",
       "raw": "原始数据",
       "sft": "SFT 数据",
-      "dpo": "DPO 数据"
+      "dpo": "DPO 数据",
+      "pt": "预训练文本数据"
     },
     "typeHelp": {
       "raw": "原始数据，需要先做预处理后才能训练。",
       "sft": "监督微调数据，可直接用于 SFT 训练。",
-      "dpo": "偏好优化数据，可直接用于 DPO 训练。"
+      "dpo": "偏好优化数据，可直接用于 DPO 训练。",
+      "pt": "预训练文本数据，可直接用于 LoRA PT 或全参 PT。"
     },
     "path": "路径",
     "no-data-title": "数据集管理",
@@ -1641,6 +1649,7 @@
     "preview-load-failed": "预览加载失败",
     "train": {
       "button": "基于该数据启动训练",
+      "pt-button": "基于该数据启动预训练",
       "rawHint": "需先完成预处理后才能开始训练",
       "inputHint": "训练命令已填入，点击右下角发送即可开始",
       "missingNode": "数据集缺少节点信息，请刷新数据集列表后重试",
@@ -1736,12 +1745,14 @@
     "typeLabel": {
       "base_train": "BASE",
       "batch_trained": "SFT",
+      "pretrain": "PT",
       "daily_trained": "DPO",
       "inference": "INFER"
     },
     "typeHelp": {
       "base_train": "基础底座模型",
       "batch_trained": "批量训练产物",
+      "pretrain": "PT 预训练产物",
       "daily_trained": "DPO 增强训练产物",
       "inference": "推理部署模型"
     },
@@ -1766,11 +1777,12 @@
       "section1": {
         "title": "查询模型",
         "item1": "输入 Docker 容器名称查询可用模型",
-        "item2": "可查询以下四种类型的模型：",
+        "item2": "可查询以下五种类型的模型：",
         "item3": "Base Train：基础训练模型",
         "item4": "Batch Trained：批量训练模型",
-        "item5": "DPO：增强训练模型",
-        "item6": "Inference：推理部署模型"
+        "item5": "PT：预训练模型",
+        "item6": "DPO：增强训练模型",
+        "item7": "Inference：推理部署模型"
       },
       "section2": {
         "title": "训练状态说明",

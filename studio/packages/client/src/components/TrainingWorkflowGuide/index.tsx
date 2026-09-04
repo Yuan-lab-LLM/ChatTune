@@ -433,7 +433,7 @@ function DataPreparationStep({ isZh, defaultContainerName }: { isZh: boolean; de
 // 交互式上传演示组件
 function InteractiveUploadDemo({ isZh, defaultContainerName }: { isZh: boolean; defaultContainerName: string }) {
     const [demoStep, setDemoStep] = useState(0);
-    const [datasetType, setDatasetType] = useState<'raw' | 'sft' | 'dpo'>('sft');
+    const [datasetType, setDatasetType] = useState<'raw' | 'sft' | 'dpo' | 'pt'>('sft');
 
     const demoSteps = [
         { title: isZh ? '查询数据集' : 'Query Dataset', icon: <FileSearch className="w-4 h-4" /> },
@@ -627,11 +627,12 @@ function InteractiveUploadDemo({ isZh, defaultContainerName }: { isZh: boolean; 
                                     <Tabs
                                         size="small"
                                         activeKey={datasetType}
-                                        onChange={(key) => setDatasetType(key as 'raw' | 'sft' | 'dpo')}
+                                        onChange={(key) => setDatasetType(key as 'raw' | 'sft' | 'dpo' | 'pt')}
                                         items={[
                                             { key: 'raw', label: isZh ? '原始数据' : 'Raw' },
                                             { key: 'sft', label: 'SFT' },
                                             { key: 'dpo', label: 'DPO' },
+                                            { key: 'pt', label: isZh ? '预训练文本' : 'PT Text' },
                                         ]}
                                     />
                                 </div>

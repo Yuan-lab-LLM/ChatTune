@@ -37,7 +37,7 @@ import ManagerSectionHeader from "../ManagerSectionHeader";
 const tagSelectClassName =
   "w-[84px] [&_.ant-select-selector]:!h-8 [&_.ant-select-selector]:!rounded-lg [&_.ant-select-selector]:!border-border/40 [&_.ant-select-selector]:!bg-muted/35 [&_.ant-select-selection-item]:!text-xs [&_.ant-select-selection-item]:!font-medium [&_.ant-select-selection-item]:!leading-[30px] [&_.ant-select-arrow]:!text-muted-foreground";
 const dockerSelectClassName = "min-w-[128px]";
-const DATASET_TAG_ORDER = ["raw", "sft", "dpo"];
+const DATASET_TAG_ORDER = ["raw", "sft", "dpo", "pt"];
 const HIDDEN_DATASET_FILES = new Set([
   "preprocessing_audit.json",
   "preprocessing_summary.json",
@@ -59,7 +59,7 @@ interface Props {
   onUpload?: () => void;
   onDownload?: (dataset: DatasetInfo) => void;
   onDelete?: (dataset: DatasetInfo) => Promise<void>;
-  onUseForTraining?: (dataset: DatasetInfo) => void;
+  onUseForTraining?: (dataset: DatasetInfo, trainType?: "lora" | "full" | "enhanced" | "pretrain_lora" | "pretrain_full") => void;
   onUseForPreprocess?: (dataset: DatasetInfo) => void;
   onLoadPreviews?: (dataset: DatasetInfo) => Promise<void>;
   isInputDisabled?: boolean;
@@ -757,6 +757,8 @@ const DatasetManager = ({
                 const isPreviewLoading = previewLoadingIds.includes(panelKey);
                 const isRawDataset =
                   (dataset.type || "").toLowerCase() === "raw";
+                const isPtDataset =
+                  (dataset.type || "").toLowerCase() === "pt";
                 const canTrainDirectly = !isRawDataset;
                 const datasetNodeId = dataset.nodeId?.trim();
                 const datasetContainerName = dataset.containerName?.trim();
@@ -907,33 +909,36 @@ const DatasetManager = ({
                                 isInputDisabled ? disabledInputHint : undefined
                               }
                             >
-                              <span>
-                              <button
-                                type="button"
-                                disabled={isInputDisabled}
-                                className={`inline-flex items-center gap-1.5 rounded-full px-0 py-0 text-sm font-medium transition-colors ${
-                                  isInputDisabled
-                                    ? disabledActionClassName
-                                    : "cursor-pointer text-primary hover:text-primary/80"
-                                }`}
-                                onClick={() => {
-                                  if (canShowPreprocessAction) {
-                                    onUseForPreprocess?.(dataset);
-                                    return;
-                                  }
-                                  onUseForTraining?.(dataset);
-                                }}
-                              >
                                 <span>
-                                  {canShowPreprocessAction
-                                    ? t("dataset.preprocess.button") ||
-                                      "Preprocess with this"
-                                    : t("dataset.train.button") ||
-                                      "基于该数据启动训练"}
+                                  <button
+                                    type="button"
+                                    disabled={isInputDisabled}
+                                    className={`inline-flex items-center gap-1.5 rounded-full px-0 py-0 text-sm font-medium transition-colors ${
+                                      isInputDisabled
+                                        ? disabledActionClassName
+                                        : "cursor-pointer text-primary hover:text-primary/80"
+                                    }`}
+                                    onClick={() => {
+                                      if (canShowPreprocessAction) {
+                                        onUseForPreprocess?.(dataset);
+                                        return;
+                                      }
+                                      onUseForTraining?.(
+                                        dataset,
+                                        isPtDataset ? "pretrain_lora" : undefined,
+                                      );
+                                    }}
+                                  >
+                                    <span>
+                                      {canShowPreprocessAction
+                                        ? t("dataset.preprocess.button") ||
+                                          "Preprocess with this"
+                                        : t("dataset.train.button") ||
+                                          "基于该数据启动训练"}
+                                    </span>
+                                    <ArrowRight className="h-4 w-4" />
+                                  </button>
                                 </span>
-                                <ArrowRight className="h-4 w-4" />
-                              </button>
-                              </span>
                             </Tooltip>
                           </div>
                         ) : (

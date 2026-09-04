@@ -2745,7 +2745,7 @@ export const appRouter = t.router({
           .transform(
             (container) => container?.trim() || getDefaultContainerName(),
           ),
-        datasetType: z.enum(["raw", "sft", "dpo"]),
+        datasetType: z.enum(["raw", "sft", "dpo", "pt"]),
         datasetName: z.string(),
         nodeId: resourceNodeIdSchema,
       }),
@@ -3029,6 +3029,7 @@ export const appRouter = t.router({
         modelType: z.enum([
           "base_train",
           "batch_trained",
+          "pretrain",
           "daily_trained",
           "inference",
         ]),
@@ -3097,7 +3098,7 @@ export const appRouter = t.router({
       z.object({
         nodeId: resourceNodeIdSchema,
         container: z.string(),
-        datasetType: z.enum(["raw", "sft", "dpo"]),
+        datasetType: z.enum(["raw", "sft", "dpo", "pt"]),
         datasetName: z
           .string()
           .regex(
@@ -3198,7 +3199,7 @@ export const appRouter = t.router({
       z.object({
         nodeId: resourceNodeIdSchema,
         container: z.string(),
-        datasetType: z.enum(["raw", "sft", "dpo"]),
+        datasetType: z.enum(["raw", "sft", "dpo", "pt"]),
         datasetName: z.string(),
       }),
     )
@@ -3270,7 +3271,7 @@ export const appRouter = t.router({
           .transform(
             (container) => container?.trim() || getDefaultContainerName(),
           ),
-        datasetType: z.enum(["raw", "sft", "dpo"]),
+        datasetType: z.enum(["raw", "sft", "dpo", "pt"]),
         datasetName: z.string(),
       }),
     )

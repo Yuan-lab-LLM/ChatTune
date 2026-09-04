@@ -100,6 +100,34 @@
           ]
         },
         {
+          "id": "pretrain-lora-train",
+          "title": "pretrain-lora-train",
+          "content": "执行lora预训练",
+          "description": "pretrain-lora-trainingDesc",
+          "icon": "Layers",
+          "keywords": [
+            "pt",
+            "PT",
+            "预训练",
+            "lora",
+            "pretrain"
+          ]
+        },
+        {
+          "id": "pretrain-full-train",
+          "title": "pretrain-full-train",
+          "content": "执行全参预训练",
+          "description": "pretrain-full-trainingDesc",
+          "icon": "Database",
+          "keywords": [
+            "pt",
+            "PT",
+            "预训练",
+            "全参",
+            "pretrain"
+          ]
+        },
+        {
           "id": "enhanced-train",
           "title": "enhanced-train",
           "content": "运行增强训练，模型位置在<模型路径>，数据集在<数据集路径>，数据集名称是<数据集名称>",
@@ -581,6 +609,10 @@
     {
       "id": "example-enhanced",
       "content": "运行增强训练，模型位置在<模型路径>，数据集在<数据集路径>，数据集名称是<数据集名称>"
+    },
+    {
+      "id": "example-pretrain-lora",
+      "content": "执行lora预训练"
     },
     {
       "id": "example-dual-eval",

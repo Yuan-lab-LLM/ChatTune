@@ -772,36 +772,39 @@ body,
 }
 
 .studio-sidebar-brand {
-    min-height: 3.5rem;
-    padding: 0.56rem 0.62rem !important;
-    border-radius: 0.95rem;
+    min-height: 2.85rem;
+    padding: 0.42rem 0.5rem !important;
+    border-radius: 0.82rem;
     gap: 0.48rem !important;
-    background:
-        linear-gradient(180deg, rgba(255, 255, 255, 0.96) 0%, rgba(248, 250, 252, 0.92) 100%);
-    border: 1px solid rgba(226, 232, 240, 0.9);
-    box-shadow:
-        0 18px 34px -30px rgba(15, 23, 42, 0.3),
-        inset 0 1px 0 rgba(255, 255, 255, 0.9);
+    background: transparent;
+    border: 1px solid transparent;
+    box-shadow: none;
 }
 
-.studio-sidebar-brand-mark {
-    box-shadow:
-        0 12px 22px -18px rgba(37, 99, 235, 0.65),
-        inset 0 1px 0 rgba(255, 255, 255, 0.28);
+.studio-sidebar-brand:hover {
+    background: rgba(255, 255, 255, 0.5);
+    border-color: rgba(226, 232, 240, 0.45);
+    box-shadow: 0 12px 24px -24px rgba(15, 23, 42, 0.22);
 }
 
-.studio-sidebar-brand-title {
-    font-size: 0.84rem;
-    font-weight: 650;
-    letter-spacing: -0.03em;
-    color: rgb(15, 23, 42);
+.studio-sidebar-brand-logo-frame {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    min-width: 0;
+    height: 2rem;
+    overflow: hidden;
 }
 
-.studio-sidebar-brand-subtitle {
-    font-size: 0.68rem;
-    font-weight: 500;
-    letter-spacing: -0.02em;
-    color: rgba(30, 41, 59, 0.82);
+.studio-sidebar-brand-logo {
+    display: block;
+    width: 76%;
+    max-width: 6.3rem;
+    max-height: 2rem;
+    object-fit: contain;
+    object-position: center center;
+    user-select: none;
 }
 
 .studio-sidebar-shell [data-sidebar='content'] {
@@ -940,6 +943,26 @@ body,
     flex-direction: column;
 }
 
+.group[data-collapsible='icon'] .studio-sidebar-brand {
+    justify-content: center;
+    min-height: 2.45rem;
+    padding: 0.34rem !important;
+}
+
+.group[data-collapsible='icon'] .studio-sidebar-brand-logo-frame {
+    width: 1.75rem;
+    height: 1.75rem;
+    flex: 0 0 1.75rem;
+    justify-content: flex-start;
+}
+
+.group[data-collapsible='icon'] .studio-sidebar-brand-logo {
+    width: auto;
+    height: 1.75rem;
+    max-width: none;
+    max-height: 1.75rem;
+}
+
 .group[data-collapsible='icon'] .studio-sidebar-account-chevron {
     display: none;
 }
@@ -951,20 +974,15 @@ body,
 }
 
 .dark .studio-sidebar-brand {
-    background:
-        linear-gradient(180deg, rgba(30, 41, 59, 0.88) 0%, rgba(17, 24, 39, 0.84) 100%);
-    border-color: rgba(71, 85, 105, 0.45);
-    box-shadow:
-        0 18px 34px -30px rgba(2, 6, 23, 0.88),
-        inset 0 1px 0 rgba(255, 255, 255, 0.05);
+    background: transparent;
+    border-color: transparent;
+    box-shadow: none;
 }
 
-.dark .studio-sidebar-brand-title {
-    color: rgba(248, 250, 252, 0.96);
-}
-
-.dark .studio-sidebar-brand-subtitle {
-    color: rgba(203, 213, 225, 0.82);
+.dark .studio-sidebar-brand:hover {
+    background: rgba(30, 41, 59, 0.46);
+    border-color: rgba(71, 85, 105, 0.24);
+    box-shadow: 0 14px 26px -26px rgba(2, 6, 23, 0.66);
 }
 
 .dark .studio-sidebar-shell [data-sidebar='group-label'] {

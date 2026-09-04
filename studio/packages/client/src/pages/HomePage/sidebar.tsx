@@ -150,26 +150,24 @@ const StudioSidebar = () => {
             <SidebarMenuButton
               size="lg"
               asChild
-              tooltip="MedFlow ChatTune"
+              tooltip="ChatTune Studio"
               className="studio-sidebar-brand"
             >
               <a
                 href="/"
+                aria-label="ChatTune Studio"
                 onClick={(event) => {
                   event.preventDefault();
                   navigate("/");
                 }}
               >
-                <div className="studio-sidebar-brand-mark flex aspect-square size-10 items-center justify-center rounded-2xl bg-primary text-primary-foreground font-bold text-[1.45rem]">
-                  M
-                </div>
-                <div className="grid flex-1 text-left leading-tight">
-                  <span className="truncate studio-sidebar-brand-title">
-                    MedFlow
-                  </span>
-                  <span className="truncate studio-sidebar-brand-subtitle">
-                    ChatTune
-                  </span>
+                <div className="studio-sidebar-brand-logo-frame">
+                  <img
+                    className="studio-sidebar-brand-logo"
+                    src="/logo.svg"
+                    alt="ChatTune Studio"
+                    draggable={false}
+                  />
                 </div>
               </a>
             </SidebarMenuButton>

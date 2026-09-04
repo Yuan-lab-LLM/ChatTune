@@ -59,6 +59,11 @@ MULTINODE_DOCKER_CONTAINER = os.getenv("MULTINODE_DOCKER_CONTAINER", "")
 GRPO_DOCKER_CONTAINER = os.getenv("MEDFLOW_GRPO_DOCKER_CONTAINER", "")
 MULTINODE_SFT_SCRIPT = "train_multinode_sft_pipeline"
 MULTINODE_DPO_SCRIPT = "train_multinode_dpo_pipeline"
+PRETRAIN_LORA_SCRIPT = "batch_train_pretrain_lora"
+PRETRAIN_FULL_SCRIPT = "batch_train_pretrain_full"
+BATCH_SFT_SCRIPT_NAMES = {"batch_train_lora", "batch_train_full"}
+PRETRAIN_SCRIPT_NAMES = {PRETRAIN_LORA_SCRIPT, PRETRAIN_FULL_SCRIPT}
+BATCH_TRAIN_SCRIPT_NAMES = BATCH_SFT_SCRIPT_NAMES | PRETRAIN_SCRIPT_NAMES
 LLAMAFACTORY_BINARY_WORKDIR = "/usr/local/insinfersystem"
 LLAMAFACTORY_SOURCE_WORKDIR = "/home/workspace/llamafactory"
 MULTINODE_BINARY_FIXED_CLI_ARGS = {
@@ -107,7 +112,7 @@ MULTINODE_SFT_CLI_PARAMS = [
     "flash-attn", "torch-empty-cache-steps", "use-liger-kernel", "use-adam-mini",
     "dataloader-num-workers", "group-by-length", "report-to", "use-unsloth-gc",
     "max-steps", "skip-data-analysis", "skip-merge",
-    "replace-tokenizer-before-merge", "export-bin", "merge-cuda-visible-devices",
+    "export-bin", "merge-cuda-visible-devices",
     "node-count", "gpus-per-node", "resource-pool-id", "resource-group-id",
 ]
 
@@ -121,7 +126,6 @@ MULTINODE_DPO_CLI_PARAMS = [
     "run-id", "log-dir", "log-file",
     "skip-merge", "export-dir", "llamafactory-cli", "export-size",
     "export-device", "export-legacy-format",
-    "replace-tokenizer-before-merge", "replace-tokenizer-after-merge",
     "skip-preflight", "node-count", "gpus-per-node", "resource-pool-id", "resource-group-id",
 ]
 
@@ -130,8 +134,6 @@ MULTINODE_BOOLEAN_CLI_PARAMS = {
     "skip-preflight",
     "skip-data-analysis",
     "skip-merge",
-    "replace-tokenizer-before-merge",
-    "replace-tokenizer-after-merge",
 }
 
 MULTINODE_PARAM_MAPPING = {
@@ -266,8 +268,6 @@ MULTINODE_PARAM_MAPPING = {
     "skip_preflight": "skip-preflight",
     "skip_merge": "skip-merge",
     "skip_data_analysis": "skip-data-analysis",
-    "replace_tokenizer_before_merge": "replace-tokenizer-before-merge",
-    "replace_tokenizer_after_merge": "replace-tokenizer-after-merge",
     "data_log_file": "data-log-file",
     "base_dataset_path": "base-dataset-path",
     "base_model_path": "base-model-path",
@@ -469,11 +469,26 @@ def _normalize_train_type(train_type: Optional[str]) -> Optional[str]:
         "full_sft": "full",
         "fullsft": "full",
         "全参sft": "full",
+        "pretrain_full": "pretrain_full",
+        "pretrainfull": "pretrain_full",
+        "full_pt": "pretrain_full",
+        "fullpt": "pretrain_full",
+        "全参pt": "pretrain_full",
+        "全参预训练": "pretrain_full",
         "lora": "lora",
         "lora_train": "lora",
         "lora_sft": "lora",
         "lorasft": "lora",
         "sft": "lora",
+        "pretrain_lora": "pretrain_lora",
+        "pretrainlora": "pretrain_lora",
+        "lora_pt": "pretrain_lora",
+        "lorapt": "pretrain_lora",
+        "lora预训练": "pretrain_lora",
+        "预训练": "pretrain_lora",
+        "pt": "pretrain_lora",
+        "pt训练": "pretrain_lora",
+        "继续预训练": "pretrain_lora",
         "grpo": "grpo",
         "multinode_lora_sft": "lora",
         "multinodelorasft": "lora",
@@ -490,6 +505,8 @@ def _train_type_text(train_type: Optional[str]) -> Optional[str]:
     return {
         "lora": "LoRA SFT",
         "full": "全参 SFT",
+        "pretrain_lora": "LoRA PT",
+        "pretrain_full": "全参 PT",
         "enhanced": "增强训练",
         "scheduled": "定时训练",
         "grpo": "GRPO",
@@ -1460,6 +1477,73 @@ class ScriptManager:
                     "gpu_count_env": "MEDFLOW_DEFAULT_GPU_COUNT_BATCH_TRAIN_FULL",
                 },
             },
+            PRETRAIN_LORA_SCRIPT: {
+                "path": PRETRAIN_LORA_SCRIPT,
+                "description": "LoRA PT 预训练工具，使用 text/PT 数据",
+                "aliases": [
+                    "LoRA PT", "lora pt", "lora_pt", "pretrain_lora", "pretrain-lora",
+                    "LoRA预训练", "lora预训练", "预训练", "PT训练", "pt训练", "继续预训练",
+                ],
+                "notes": "支持修改预训练参数，数据目录默认使用 /home/workspace/dataset_pretrain",
+                "supports_background": True,
+                "long_running": True,
+                "default_env": {
+                    "MBS": "1",
+                    "ACC": "8",
+                    "LR": "1e-4",
+                    "TEM": "qwen3",
+                    "RESUME": "",
+                },
+                "supported_params": ["MBS", "ACC", "LR", "TEM", "RESUME", "MODEL_PATH", "LOCALHOST_ID", "container", "DATASET_DIR", "DATASET_DATE"],
+                "default_args": {
+                    "background": True,
+                    "capture_output": False,
+                    "startup_ready_marker": "MEDFLOW_TRAINING_COMMAND_READY",
+                    "startup_ready_timeout": 15,
+                    "startup_poll_interval": 1,
+                },
+                "docker_container": DEFAULT_DOCKER_CONTAINER,
+                "docker_working_dir": "/usr/local/insinfersystem",
+                "docker_executable": "/usr/local/insinfersystem/batch_train_pretrain_lora",
+                "requires_docker": True,
+                "resource_request": {
+                    "enabled": True, "node_count": 1, "gpus_per_node": 8,
+                    "gpu_count_env": "MEDFLOW_DEFAULT_GPU_COUNT_BATCH_PRETRAIN_LORA",
+                },
+            },
+            PRETRAIN_FULL_SCRIPT: {
+                "path": PRETRAIN_FULL_SCRIPT,
+                "description": "全参 PT 预训练工具，使用 text/PT 数据",
+                "aliases": [
+                    "全参 PT", "全参PT", "full pt", "full_pt", "pretrain_full", "pretrain-full",
+                    "全参预训练", "全量预训练", "full预训练",
+                ],
+                "supports_background": True,
+                "long_running": True,
+                "default_env": {
+                    "MBS": "1",
+                    "ACC": "8",
+                    "LR": "5e-5",
+                    "TEM": "qwen3",
+                    "RESUME": "",
+                },
+                "supported_params": ["MBS", "ACC", "LR", "TEM", "RESUME", "MODEL_PATH", "LOCALHOST_ID", "container", "DATASET_DIR", "DATASET_DATE"],
+                "default_args": {
+                    "background": True,
+                    "capture_output": False,
+                    "startup_ready_marker": "MEDFLOW_TRAINING_COMMAND_READY",
+                    "startup_ready_timeout": 15,
+                    "startup_poll_interval": 1,
+                },
+                "docker_container": DEFAULT_DOCKER_CONTAINER,
+                "docker_working_dir": "/usr/local/insinfersystem",
+                "docker_executable": "/usr/local/insinfersystem/batch_train_pretrain_full",
+                "requires_docker": True,
+                "resource_request": {
+                    "enabled": True, "node_count": 1, "gpus_per_node": 8,
+                    "gpu_count_env": "MEDFLOW_DEFAULT_GPU_COUNT_BATCH_PRETRAIN_FULL",
+                },
+            },
             "create_command_vpn": {
                 "path": "create_command_vpn",
                 "description": "定时训练工具",
@@ -2195,7 +2279,7 @@ def _training_template_value(
 ) -> str:
     env_vars = env_vars or {}
     cli_args = cli_args or {}
-    if script_name in {"batch_train_lora", "batch_train_full"}:
+    if script_name in BATCH_TRAIN_SCRIPT_NAMES:
         return str(env_vars.get("TEM") or DEFAULT_TEMPLATE).strip()
     if script_name in {MULTINODE_SFT_SCRIPT, "dpo_train_launcher", MULTINODE_DPO_SCRIPT}:
         return first_nonempty(
@@ -2218,7 +2302,7 @@ def _training_model_hint(
     env_vars = env_vars or {}
     cli_args = cli_args or {}
     values: List[Any] = []
-    if script_name in {"batch_train_lora", "batch_train_full"}:
+    if script_name in BATCH_TRAIN_SCRIPT_NAMES:
         values.extend(
             [
                 env_vars.get("MODEL_PATH"),
@@ -2251,13 +2335,15 @@ def _training_template_policy_issue(
     if script_name not in {
         "batch_train_lora",
         "batch_train_full",
+        PRETRAIN_LORA_SCRIPT,
+        PRETRAIN_FULL_SCRIPT,
         "dpo_train_launcher",
         MULTINODE_SFT_SCRIPT,
         MULTINODE_DPO_SCRIPT,
     }:
         return None
     template = _training_template_value(script_name, env_vars, cli_args)
-    param = "TEM" if script_name in {"batch_train_lora", "batch_train_full"} else "template"
+    param = "TEM" if script_name in BATCH_TRAIN_SCRIPT_NAMES else "template"
     template_issue = template_validation_issue(template, param=param, container=container)
     if template_issue:
         return template_issue
@@ -2290,6 +2376,8 @@ def validate_training_inputs_preflight(
     supported_scripts = {
         "batch_train_lora",
         "batch_train_full",
+        PRETRAIN_LORA_SCRIPT,
+        PRETRAIN_FULL_SCRIPT,
         "dpo_train_launcher",
         MULTINODE_SFT_SCRIPT,
         MULTINODE_DPO_SCRIPT,
@@ -2478,17 +2566,18 @@ def validate_training_inputs_preflight(
         return [item.strip() for item in str(value or "").split(",") if item.strip()]
 
     resume_issue = validate_resume_checkpoint()
-    if resume_issue and script_name in {"batch_train_lora", "batch_train_full", MULTINODE_SFT_SCRIPT, MULTINODE_DPO_SCRIPT}:
+    if resume_issue and script_name in BATCH_TRAIN_SCRIPT_NAMES | {MULTINODE_SFT_SCRIPT, MULTINODE_DPO_SCRIPT}:
         return resume_issue
 
-    if script_name in {"batch_train_lora", "batch_train_full"}:
+    if script_name in BATCH_TRAIN_SCRIPT_NAMES:
+        base_dataset_path = "/home/workspace/dataset_pretrain" if script_name in PRETRAIN_SCRIPT_NAMES else "/home/workspace/dataset_batch_train"
         dataset_dir = str(env_vars.get("DATASET_DIR") or "").strip().rstrip("/")
         dataset_date = str(env_vars.get("DATASET_DATE") or "").strip()
         if not dataset_dir and dataset_date:
-            dataset_dir = f"/home/workspace/dataset_batch_train/{dataset_date}"
+            dataset_dir = f"{base_dataset_path}/{dataset_date}"
         if not dataset_dir:
             latest = run_shell(
-                "find /home/workspace/dataset_batch_train -mindepth 1 -maxdepth 1 "
+                f"find {shlex.quote(base_dataset_path)} -mindepth 1 -maxdepth 1 "
                 "-type d -printf '%f\\n' 2>/dev/null | sort | tail -n 1"
             )
             if isinstance(latest, dict):
@@ -2499,7 +2588,7 @@ def validate_training_inputs_preflight(
                     "dataset_dir_missing",
                     "未找到可用的批量训练数据目录，请提供 DATASET_DIR 或 DATASET_DATE。",
                 )
-            dataset_dir = f"/home/workspace/dataset_batch_train/{latest_name}"
+            dataset_dir = f"{base_dataset_path}/{latest_name}"
         return validate_dataset_info_dir(dataset_dir)
 
     if script_name == MULTINODE_SFT_SCRIPT:
@@ -2912,7 +3001,7 @@ def run_script_by_name_train(
         for param_name, param_value in additional_args.items():
             # 批量训练里“数据集/数据集名称=20260506”常被模型写成 dataset_name。
             # LoRA/全参批量训练不使用 dataset_name；日期型值应作为 DATASET_DATE 处理。
-            if script_name in {"batch_train_lora", "batch_train_full", MULTINODE_SFT_SCRIPT}:
+            if script_name in BATCH_TRAIN_SCRIPT_NAMES | {MULTINODE_SFT_SCRIPT}:
                 pname = str(param_name).strip()
                 pname_lower = pname.lower()
                 pvalue = str(param_value).strip()
@@ -2929,7 +3018,7 @@ def run_script_by_name_train(
             pname = str(param_name).strip()
             pname_lower = pname.lower()
             normalized_launcher_param = pname_lower.replace("_", "-")
-            template_managed_script = script_name in {"batch_train_lora", "batch_train_full", MULTINODE_SFT_SCRIPT, "dpo_train_launcher", MULTINODE_DPO_SCRIPT}
+            template_managed_script = script_name in BATCH_TRAIN_SCRIPT_NAMES | {MULTINODE_SFT_SCRIPT, "dpo_train_launcher", MULTINODE_DPO_SCRIPT}
             if _is_multinode_train_script(script_name):
                 multinode_cli_param = script_info.get("param_mapping", {}).get(pname)
                 if not multinode_cli_param:
@@ -2959,7 +3048,7 @@ def run_script_by_name_train(
                 continue
             if template_managed_script and (pname in MODEL_HINT_KEYS or pname_lower in MODEL_HINT_KEYS):
                 hint = str(param_value).strip()
-                is_batch_model_path = script_name in {"batch_train_lora", "batch_train_full"} and (
+                is_batch_model_path = script_name in BATCH_TRAIN_SCRIPT_NAMES and (
                     pname in {"模型路径", "模型位置", "基础模型路径", "MODEL_PATH"}
                     or pname_lower in {"model_path", "model-path", "base_model_path"}
                 )
@@ -3106,10 +3195,11 @@ def run_script_by_name_train(
                 invalidParams=unknown_params,
             )
 
-        if script_name in {"batch_train_lora", "batch_train_full"}:
+        if script_name in BATCH_TRAIN_SCRIPT_NAMES:
             dataset_date = str(params_to_update.get("DATASET_DATE") or "").strip()
             dataset_dir = str(params_to_update.get("DATASET_DIR") or "").strip().rstrip("/")
-            if dataset_date and dataset_dir.endswith("/dataset_batch_train"):
+            base_dataset_path = "/home/workspace/dataset_pretrain" if script_name in PRETRAIN_SCRIPT_NAMES else "/home/workspace/dataset_batch_train"
+            if dataset_date and dataset_dir.endswith(base_dataset_path):
                 params_to_update["DATASET_DIR"] = f"{dataset_dir}/{dataset_date}"
         elif script_name == MULTINODE_SFT_SCRIPT:
             dataset_date = str(cli_params_to_update.get("dataset-date") or "").strip()
@@ -3522,7 +3612,7 @@ def run_script_by_name_train(
                 run_kwargs["script_path"] = script_path
 
         
-        if script_name in ("batch_train_lora", "batch_train_full") and docker_kwargs.get("docker_container"):
+        if script_name in BATCH_TRAIN_SCRIPT_NAMES and docker_kwargs.get("docker_container"):
             container = docker_kwargs["docker_container"]
             ins_path = f"/usr/local/insinfersystem/{script_name}"
             try:
