@@ -18,21 +18,21 @@ Note: The “Clear context” action in the upper-right area of the run page cle
 
 ## One-click Workflow
 
-A one-click workflow connects one complete model iteration. After the user selects the training dataset and evaluation set, the system proceeds through these stages:
+A one-click workflow connects one complete model iteration. After the user selects the training dataset and post-deployment benchmark set, the system proceeds through these stages:
 
-1. Model training: automatically runs LoRA batch training or enhanced training based on data location.
-2. Medical evaluation: runs single-model evaluation on the trained model.
+1. Model training: selects the training method from the dataset type: SFT data runs LoRA SFT, DPO data runs enhanced training, and PT/text data always runs LoRA PT.
+2. Model evaluation: runs after training; new workflows default to LLaMA-Factory general evaluation on `ceval` and `cmmlu`; explicitly selected medical evaluation keeps the existing composite medical evaluator.
 3. Model publication: copies training outputs to the configured release directory and creates a deployable version.
 4. Inference deployment: updates inference configuration, restarts the inference service, and confirms service status.
-5. Benchmark evaluation: runs inference Benchmark with the selected evaluation set.
+5. Post-deployment benchmark: runs inference Benchmark with the set selected in the workflow panel.
 
-After the workflow starts, the page status bar continuously shows the current stage and progress for training, evaluation, publication, deployment, and benchmark evaluation. Workflow state is persisted; if a task fails, handle the displayed reason and then continue.
+After the workflow starts, the page status bar continuously shows the current stage and progress for training, model evaluation, publication, deployment, and the post-deployment benchmark. Workflow state is persisted; if a task fails, handle the displayed reason and then continue.
 
 ### Page Steps
 
 1. Open the project's run page and select the "One-click workflow" button in the upper-right area.
-2. In the right-side workflow panel, select a training dataset. The training dataset is required; if the list is stale, click "Refresh datasets".
-3. Select an evaluation set. The evaluation set is optional; if omitted, `2024.json` is used by default.
+2. In the right-side workflow panel, select a training dataset. The training dataset is required; if the list is stale, click "Refresh datasets". Selecting PT/text data makes the one-click workflow use LoRA PT directly; it does not offer full-parameter PT. Full-parameter PT remains available through the standalone `执行全参预训练` command.
+3. Select the post-deployment benchmark set. It is used only by the inference Benchmark after deployment and is configured separately from the post-training model-evaluation datasets; if omitted, `2024.json` is used.
 4. Review the command preview in the panel, then click "Generate command". This places the command into the chat input.
 5. Confirm that the generated command and datasets are correct, then click the send button in the lower-right corner of the chat box to start the workflow.
 6. After the workflow starts, track each stage in the page status bar.
@@ -49,6 +49,15 @@ After the workflow starts, the page status bar continuously shows the current st
 
 Workflow IDs look like `wf-YYYYMMDDHHMMSS-xxxxxxxx` and are displayed in status messages after startup. When multiple workflows exist, include the workflow ID in control commands.
 
+New workflows default to `evaluation_scope=general` and `eval_datasets=ceval,cmmlu`. Edit the generated command to override these model-evaluation settings; selecting a post-deployment benchmark set does not change them:
+
+```text
+Run the one-click workflow with evaluation_scope=general and eval_datasets=ceval,cmmlu,mmlu
+Run the one-click workflow with evaluation_scope=medical
+```
+
+The “bilingual general” profile selects `ceval`, `cmmlu`, and `mmlu`; the “built-in medical multiple-choice” profile selects `cmbsingle`, `medqa`, and `medmcqa`. All six suites run only when explicitly requested. Medical scope rejects `eval_datasets`. Standalone single-model, two-model, and checkpoint evaluations still ask for a scope, while persisted legacy workflows without scope metadata resume with the medical evaluator.
+
 ## Data Processing
 
 | Purpose | Natural-language example |
@@ -59,7 +68,17 @@ Workflow IDs look like `wf-YYYYMMDDHHMMSS-xxxxxxxx` and are displayed in status 
 
 When required parameters are missing, Agent will ask follow-up questions.
 
-Data preprocessing supports `sft` and `dpo` data formats. For medical text data, it supports selecting the data purpose as `inspection`, `diagnosis`, or `prescription`.
+Data preprocessing supports `sft`, `dpo`, and `pt`/`text`, and recognizes Alpaca, ShareGPT, OpenAI `messages`, and plain-text data. General data does not require `strategy`; `inspection`, `diagnosis`, or `prescription` is requested only for detected raw medical records. `data_type=text` is normalized to PT.
+
+For example:
+
+```text
+Preprocess input_folder=/home/workspace/dataset/customer_service with data_type=sft and merge-output=true
+Preprocess input_folder=/home/workspace/dataset/domain_corpus with data_type=text
+Filter input_folder=/home/workspace/dataset/customer_service with threshold=60
+```
+
+When DPO source data has no `rejected` response and one must be generated, configure the OpenAI-compatible API URL, model, and API key before launch. With `merge-output`, the output directory contains merged data and `dataset_info.json`.
 
 Data preprocessing uses the latest dated data by default. To use an older dataset, select it in the left data-management tab and click `Preprocess with this`.
 
@@ -77,7 +96,7 @@ Data preprocessing uses the latest dated data by default. To use an older datase
 
 When required parameters are missing, Agent will ask follow-up questions.
 
-The current version of batch training and enhanced training supports the Qwen3 series for both training and evaluation by default. If you need to use other models, please explicitly specify the model template via the TEM or template parameter when executing training, for example: 执行lora批量训练，TEM=llama3 or 执行增强训练，template=deepseekr1.
+The Agent resolves the template from the model basename, `config.json`, and `tokenizer_config.json`, then explicitly passes `TEM` or `--template`; there is no global Qwen3 fallback. Qwen3.6 resolves to `qwen3_6` when its versioned basename and reused Qwen3.5 architecture metadata agree. Renamed models, conflicting metadata, or multiple candidates produce a template selector. Users may still explicitly override with `TEM` or `template`. Current training packages expose their bundled registry through `llamafactory-cli templates --json`; legacy packages without this command use the Agent compatibility allowlist and report a warning.
 
 LoRA batch training, full-parameter batch training, and PT pretraining use the latest model under `/home/workspace/models/base` by default. To use another model, specify it explicitly, for example: `执行lora批量训练，模型在xxxx`.
 
@@ -99,21 +118,35 @@ If you need to specify the number of GPUs per node, add `gpus-per-node` to the c
 | --- | --- |
 | Multi-node LoRA with default resources | `执行多机lora批量训练` |
 | Multi-node LoRA with 2 GPUs per node | `执行多机lora批量训练，gpus-per-node=2` |
+| Multi-node full-parameter SFT | `执行多机全参SFT` |
 | Multi-node enhanced training with default resources | `执行多机增强训练` |
 
 Multi-node LoRA defaults to the latest model in /home/workspace/models/base and the most recent dataset. Explicit specification is required to use any other model or data.
 
-## Medical Evaluation
+## Model Evaluation
 
 | Purpose | Natural-language example |
 | --- | --- |
-| Single-model evaluation | `执行单模型评估` |
-| Two-model comparison evaluation | `执行双模型评估` |
-| Checkpoint evaluation | `执行checkpoint评估` |
+| Medical single-model evaluation | `执行医疗单模型评估` |
+| General single-model evaluation | `执行通用单模型评估，eval_datasets=ceval,cmmlu` |
+| Medical two-model comparison | `执行医疗双模型评估` |
+| General two-model comparison | `执行通用双模型评估，eval_datasets=mmlu,ceval` |
+| Medical checkpoint evaluation | `执行医疗checkpoint评估` |
+| General checkpoint evaluation | `执行通用checkpoint评估，eval_datasets=medqa,medmcqa` |
 
 When required parameters are missing, Agent will ask follow-up questions.
 
-Checkpoint evaluation defaults to supporting the Qwen3 series. If you are evaluating checkpoints from other models, please specify the template via the TEM or template parameter in the evaluation command.
+Checkpoint evaluation requires `CKPT_PATH`. The Agent follows the adapter's base-model reference and explicitly passes the same resolved template. An unavailable base model or ambiguous template stops before resource allocation and requests input. The medical scope invokes the existing fixed medical workflows and retains `/home/workspace/log/daily_train` and `/home/workspace/eval/daily_train`.
+
+The general scope only runs the built-in LLaMA-Factory `eval` command and accepts one or more of `ceval`, `cmbsingle`, `cmmlu`, `medmcqa`, `medqa`, and `mmlu`. Results are stored under `/home/workspace/eval/llamafactory/<runId>` and logs under `/home/workspace/log/llamafactory_eval/<runId>`. General checkpoint evaluation exports the LoRA adapter and compares the base and merged models. It does not accept uploaded datasets, custom schemas, or custom metrics.
+
+### General SFT training example
+
+1. Upload ShareGPT, OpenAI `messages`, or Alpaca data to a raw directory.
+2. Run `data_type=sft` preprocessing without `strategy` for general data.
+3. Start LoRA or full-parameter SFT; templates are normally detected automatically, with a selector shown for ambiguous models.
+4. Monitor PID, loss, step/epoch, W&B, and the Merge/Export lifecycle stage.
+5. Select the medical compatibility suite or select the general scope and one or more of the six built-in LLaMA-Factory benchmarks.
 
 ## Status and Stop Tasks
 
@@ -127,7 +160,7 @@ Checkpoint evaluation defaults to supporting the Qwen3 series. If you are evalua
 
 To avoid stopping the wrong task when multiple tasks are running, include the task type, PID, workflow ID, or container name. After starting a task, keep the PID, run ID, and container information returned by the system so you can query or stop it later.
 
-## Inference Services, Functional Tests, and Benchmarks
+## Inference Services and Benchmarks
 
 Inference commands are forwarded to the Inference Agent. Before running them, make sure `INFERENCE_AGENT_URL` points to the Inference Agent controller `/inference_agent` endpoint, controller and workers are started, and the target node has created and configured the inference Docker container. Inference-service YAML and node configuration are documented in [Deployment Guide](DEPLOYMENT.md).
 
@@ -160,21 +193,6 @@ Ordinary users can only view and operate inference service instances they are au
 
 For multi-machine deployment, include the node name in the command to avoid operating on the wrong node.
 
-### Inference Functional Tests
-
-Ordinary users can only view and operate their own functional test tasks. Viewing all tasks or stopping another user's task requires an administrator account. For stop operations, run the preview command first.
-
-| Purpose | Natural-language example | Notes |
-| --- | --- | --- |
-| View test scripts | `查看可用的推理功能测试脚本` | Returns currently available scripts. |
-| Run a test | `运行推理功能测试脚本 basicmedicalrecord.sh` | Runs a test with an actual script name. |
-| View test status | `查看推理功能测试状态` | Shows current test status. |
-| Preview stopping a functional test | `预览停止功能测试 test_run_id=test_20260803_153000` | Only checks the target test status; it does not terminate the process. |
-| Confirm stopping a functional test | `确认停止功能测试 test_run_id=test_20260803_153000` | Ordinary users can only stop their own tasks; admins can stop specified tasks. |
-| Admin view all functional test tasks | `查看所有功能测试任务` | Returns functional test run records for all users. |
-
-View available scripts first, then run tests with the actual script name returned by the system.
-
 ### Inference Benchmarks
 
 Ordinary users can only view and operate their own Benchmark jobs. Viewing all jobs or stopping another user's job requires an administrator account. For stop operations, run the preview command first.
@@ -192,7 +210,7 @@ Ordinary users can only view and operate their own Benchmark jobs. Viewing all j
 | Confirm stopping a Benchmark | `确认停止 benchmark job_id=bench_20260803_153000` | Ordinary users can only stop their own tasks; admins can stop specified tasks. |
 | Admin view all Benchmark jobs | `查看所有 benchmark 任务` | Returns Benchmark jobs for all users. |
 
-The system supports medical multiple-choice datasets such as `2021.json`, `2024.json`, `step1.json`, `step2.json`, and `step3.json`, plus MedBench and general Benchmarks. Inference benchmark evaluation depends on the developer-provided `tests` directory, which contains currently supported benchmarks. Before deployment, confirm that this directory is mounted with `medflow/` into the inference container, and that Benchmark data directories in `service.yaml` point to actual paths inside the container. Actual available items are determined by the response from "查看可用的推理基准测试".
+The system supports medical multiple-choice datasets such as `2021.json`, `2024.json`, `step1.json`, `step2.json`, and `step3.json`, plus MedBench and general Benchmarks. Benchmark data is supplied through external mounts; before deployment, confirm that `BENCHMARK_DIR` and `GENERAL_BENCHMARK_DIR` in `service.yaml` point to actual paths inside the container. Actual available items are determined by the response from "查看可用的推理基准测试".
 
 ### Admin Maintenance Commands
 

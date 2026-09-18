@@ -1,0 +1,1700 @@
+{
+  "schemaVersion": 1,
+  "descriptors": [
+    {
+      "id": "batch_train_lora",
+      "displayName": "LoRA SFT",
+      "aliases": [
+        "batch_train_lora",
+        "lora_sft",
+        "lora sft",
+        "lora批量训练",
+        "lora训练",
+        "训练"
+      ],
+      "backend": "llamafactory",
+      "stage": "sft",
+      "finetuningType": "lora",
+      "entry": {
+        "sourceScript": "batch_train_lora.py",
+        "containerCommand": "/usr/local/insinfersystem/batch_train_lora",
+        "invocationStyle": "env"
+      },
+      "params": [
+        {
+          "name": "MODEL_PATH",
+          "type": "model",
+          "required": false,
+          "label": "基础模型路径"
+        },
+        {
+          "name": "DATASET_DIR",
+          "type": "dataset",
+          "required": false,
+          "label": "训练数据目录"
+        },
+        {
+          "name": "DATASET_DATE",
+          "type": "text",
+          "required": false,
+          "label": "数据集日期",
+          "advanced": true
+        },
+        {
+          "name": "TEM",
+          "type": "template",
+          "required": false,
+          "label": "模板（自动识别）",
+          "advanced": true
+        },
+        {
+          "name": "MBS",
+          "type": "number",
+          "required": false,
+          "label": "单卡 batch size",
+          "default": "1",
+          "advanced": true
+        },
+        {
+          "name": "ACC",
+          "type": "number",
+          "required": false,
+          "label": "梯度累积",
+          "default": "8",
+          "advanced": true
+        },
+        {
+          "name": "LR",
+          "type": "text",
+          "required": false,
+          "label": "学习率",
+          "default": "1e-7",
+          "advanced": true
+        },
+        {
+          "name": "USE_LIGER_KERNEL",
+          "type": "boolean",
+          "required": false,
+          "label": "启用 Liger Kernel",
+          "default": false,
+          "advanced": true
+        },
+        {
+          "name": "USE_ADAM_MINI",
+          "type": "boolean",
+          "required": false,
+          "label": "启用 Adam-mini",
+          "default": false,
+          "advanced": true
+        },
+        {
+          "name": "RESUME",
+          "type": "text",
+          "required": false,
+          "label": "恢复训练",
+          "advanced": true
+        },
+        {
+          "name": "LOCALHOST_ID",
+          "type": "text",
+          "required": false,
+          "label": "GPU 编号",
+          "advanced": true
+        },
+        {
+          "name": "DATASET_ROOT",
+          "type": "dataset",
+          "required": false,
+          "label": "默认数据根",
+          "default": "/home/workspace/dataset_batch_train",
+          "advanced": true
+        }
+      ],
+      "resourceRequirements": {
+        "containerRole": "training",
+        "nodeCount": 1,
+        "gpusPerNode": 8,
+        "resourcePool": true
+      },
+      "paths": {
+        "defaultDatasetRoot": "/home/workspace/dataset_batch_train",
+        "outputRoot": "/home/workspace/models/batch_train",
+        "logRoot": "/home/workspace/log/batch_train"
+      },
+      "monitoring": {
+        "primaryMetric": "loss",
+        "fallbackMetrics": [
+          "train_loss"
+        ],
+        "logFiles": [
+          "*-train-log.log",
+          "*-merge-log.log"
+        ],
+        "wandbDir": "/home/workspace/log/wandb/wandb",
+        "completionStates": [
+          "training",
+          "exporting",
+          "completed",
+          "failed"
+        ]
+      },
+      "artifactPolicy": {
+        "produces": [
+          "adapter",
+          "merged"
+        ],
+        "deployable": "merged"
+      }
+    },
+    {
+      "id": "batch_train_full",
+      "displayName": "全参 SFT",
+      "aliases": [
+        "batch_train_full",
+        "full_sft",
+        "full sft",
+        "全参SFT",
+        "全参批量训练",
+        "全参训练"
+      ],
+      "backend": "llamafactory",
+      "stage": "sft",
+      "finetuningType": "full",
+      "entry": {
+        "sourceScript": "batch_train_full.py",
+        "containerCommand": "/usr/local/insinfersystem/batch_train_full",
+        "invocationStyle": "env"
+      },
+      "params": [
+        {
+          "name": "MODEL_PATH",
+          "type": "model",
+          "required": false,
+          "label": "基础模型路径"
+        },
+        {
+          "name": "DATASET_DIR",
+          "type": "dataset",
+          "required": false,
+          "label": "训练数据目录"
+        },
+        {
+          "name": "DATASET_DATE",
+          "type": "text",
+          "required": false,
+          "label": "数据集日期",
+          "advanced": true
+        },
+        {
+          "name": "TEM",
+          "type": "template",
+          "required": false,
+          "label": "模板（自动识别）",
+          "advanced": true
+        },
+        {
+          "name": "MBS",
+          "type": "number",
+          "required": false,
+          "label": "单卡 batch size",
+          "default": "1",
+          "advanced": true
+        },
+        {
+          "name": "ACC",
+          "type": "number",
+          "required": false,
+          "label": "梯度累积",
+          "default": "8",
+          "advanced": true
+        },
+        {
+          "name": "LR",
+          "type": "text",
+          "required": false,
+          "label": "学习率",
+          "default": "1e-6",
+          "advanced": true
+        },
+        {
+          "name": "USE_LIGER_KERNEL",
+          "type": "boolean",
+          "required": false,
+          "label": "启用 Liger Kernel",
+          "default": false,
+          "advanced": true
+        },
+        {
+          "name": "USE_ADAM_MINI",
+          "type": "boolean",
+          "required": false,
+          "label": "启用 Adam-mini",
+          "default": false,
+          "advanced": true
+        },
+        {
+          "name": "RESUME",
+          "type": "text",
+          "required": false,
+          "label": "恢复训练",
+          "advanced": true
+        },
+        {
+          "name": "LOCALHOST_ID",
+          "type": "text",
+          "required": false,
+          "label": "GPU 编号",
+          "advanced": true
+        },
+        {
+          "name": "DATASET_ROOT",
+          "type": "dataset",
+          "required": false,
+          "label": "默认数据根",
+          "default": "/home/workspace/dataset_batch_train",
+          "advanced": true
+        }
+      ],
+      "resourceRequirements": {
+        "containerRole": "training",
+        "nodeCount": 1,
+        "gpusPerNode": 8,
+        "resourcePool": true
+      },
+      "paths": {
+        "defaultDatasetRoot": "/home/workspace/dataset_batch_train",
+        "outputRoot": "/home/workspace/models/batch_train",
+        "logRoot": "/home/workspace/log/batch_train"
+      },
+      "monitoring": {
+        "primaryMetric": "loss",
+        "fallbackMetrics": [
+          "train_loss"
+        ],
+        "logFiles": [
+          "*-train-log.log",
+          "*-export-log.log"
+        ],
+        "wandbDir": "/home/workspace/log/wandb/wandb",
+        "completionStates": [
+          "training",
+          "exporting",
+          "completed",
+          "failed"
+        ]
+      },
+      "artifactPolicy": {
+        "produces": [
+          "checkpoint",
+          "merged"
+        ],
+        "deployable": "merged"
+      }
+    },
+    {
+      "id": "batch_train_pretrain_lora",
+      "displayName": "LoRA PT",
+      "aliases": [
+        "batch_train_pretrain_lora",
+        "pretrain_lora",
+        "lora_pt",
+        "LoRA预训练",
+        "pt训练",
+        "继续预训练"
+      ],
+      "backend": "llamafactory",
+      "stage": "pt",
+      "finetuningType": "lora",
+      "entry": {
+        "sourceScript": "batch_train_pretrain_lora.py",
+        "containerCommand": "/usr/local/insinfersystem/batch_train_pretrain_lora",
+        "invocationStyle": "env"
+      },
+      "params": [
+        {
+          "name": "MODEL_PATH",
+          "type": "model",
+          "required": false,
+          "label": "基础模型路径"
+        },
+        {
+          "name": "DATASET_DIR",
+          "type": "dataset",
+          "required": false,
+          "label": "训练数据目录"
+        },
+        {
+          "name": "DATASET_DATE",
+          "type": "text",
+          "required": false,
+          "label": "数据集日期",
+          "advanced": true
+        },
+        {
+          "name": "TEM",
+          "type": "template",
+          "required": false,
+          "label": "模板（自动识别）",
+          "advanced": true
+        },
+        {
+          "name": "MBS",
+          "type": "number",
+          "required": false,
+          "label": "单卡 batch size",
+          "default": "1",
+          "advanced": true
+        },
+        {
+          "name": "ACC",
+          "type": "number",
+          "required": false,
+          "label": "梯度累积",
+          "default": "8",
+          "advanced": true
+        },
+        {
+          "name": "LR",
+          "type": "text",
+          "required": false,
+          "label": "学习率",
+          "default": "1e-4",
+          "advanced": true
+        },
+        {
+          "name": "USE_LIGER_KERNEL",
+          "type": "boolean",
+          "required": false,
+          "label": "启用 Liger Kernel",
+          "default": false,
+          "advanced": true
+        },
+        {
+          "name": "USE_ADAM_MINI",
+          "type": "boolean",
+          "required": false,
+          "label": "启用 Adam-mini",
+          "default": false,
+          "advanced": true
+        },
+        {
+          "name": "RESUME",
+          "type": "text",
+          "required": false,
+          "label": "恢复训练",
+          "advanced": true
+        },
+        {
+          "name": "LOCALHOST_ID",
+          "type": "text",
+          "required": false,
+          "label": "GPU 编号",
+          "advanced": true
+        },
+        {
+          "name": "DATASET_ROOT",
+          "type": "dataset",
+          "required": false,
+          "label": "默认数据根",
+          "default": "/home/workspace/dataset_pretrain",
+          "advanced": true
+        }
+      ],
+      "resourceRequirements": {
+        "containerRole": "training",
+        "nodeCount": 1,
+        "gpusPerNode": 8,
+        "resourcePool": true
+      },
+      "paths": {
+        "defaultDatasetRoot": "/home/workspace/dataset_pretrain",
+        "outputRoot": "/home/workspace/models/pretrain",
+        "logRoot": "/home/workspace/log/pretrain"
+      },
+      "monitoring": {
+        "primaryMetric": "loss",
+        "fallbackMetrics": [
+          "train_loss"
+        ],
+        "logFiles": [
+          "*-train-log.log",
+          "*-merge-log.log"
+        ],
+        "wandbDir": "/home/workspace/log/wandb/wandb",
+        "completionStates": [
+          "training",
+          "exporting",
+          "completed",
+          "failed"
+        ]
+      },
+      "artifactPolicy": {
+        "produces": [
+          "adapter",
+          "merged"
+        ],
+        "deployable": "merged"
+      }
+    },
+    {
+      "id": "batch_train_pretrain_full",
+      "displayName": "全参 PT",
+      "aliases": [
+        "batch_train_pretrain_full",
+        "pretrain_full",
+        "full_pt",
+        "全参PT",
+        "全参预训练"
+      ],
+      "backend": "llamafactory",
+      "stage": "pt",
+      "finetuningType": "full",
+      "entry": {
+        "sourceScript": "batch_train_pretrain_full.py",
+        "containerCommand": "/usr/local/insinfersystem/batch_train_pretrain_full",
+        "invocationStyle": "env"
+      },
+      "params": [
+        {
+          "name": "MODEL_PATH",
+          "type": "model",
+          "required": false,
+          "label": "基础模型路径"
+        },
+        {
+          "name": "DATASET_DIR",
+          "type": "dataset",
+          "required": false,
+          "label": "训练数据目录"
+        },
+        {
+          "name": "DATASET_DATE",
+          "type": "text",
+          "required": false,
+          "label": "数据集日期",
+          "advanced": true
+        },
+        {
+          "name": "TEM",
+          "type": "template",
+          "required": false,
+          "label": "模板（自动识别）",
+          "advanced": true
+        },
+        {
+          "name": "MBS",
+          "type": "number",
+          "required": false,
+          "label": "单卡 batch size",
+          "default": "1",
+          "advanced": true
+        },
+        {
+          "name": "ACC",
+          "type": "number",
+          "required": false,
+          "label": "梯度累积",
+          "default": "8",
+          "advanced": true
+        },
+        {
+          "name": "LR",
+          "type": "text",
+          "required": false,
+          "label": "学习率",
+          "default": "5e-5",
+          "advanced": true
+        },
+        {
+          "name": "USE_LIGER_KERNEL",
+          "type": "boolean",
+          "required": false,
+          "label": "启用 Liger Kernel",
+          "default": false,
+          "advanced": true
+        },
+        {
+          "name": "USE_ADAM_MINI",
+          "type": "boolean",
+          "required": false,
+          "label": "启用 Adam-mini",
+          "default": false,
+          "advanced": true
+        },
+        {
+          "name": "RESUME",
+          "type": "text",
+          "required": false,
+          "label": "恢复训练",
+          "advanced": true
+        },
+        {
+          "name": "LOCALHOST_ID",
+          "type": "text",
+          "required": false,
+          "label": "GPU 编号",
+          "advanced": true
+        },
+        {
+          "name": "DATASET_ROOT",
+          "type": "dataset",
+          "required": false,
+          "label": "默认数据根",
+          "default": "/home/workspace/dataset_pretrain",
+          "advanced": true
+        }
+      ],
+      "resourceRequirements": {
+        "containerRole": "training",
+        "nodeCount": 1,
+        "gpusPerNode": 8,
+        "resourcePool": true
+      },
+      "paths": {
+        "defaultDatasetRoot": "/home/workspace/dataset_pretrain",
+        "outputRoot": "/home/workspace/models/pretrain",
+        "logRoot": "/home/workspace/log/pretrain"
+      },
+      "monitoring": {
+        "primaryMetric": "loss",
+        "fallbackMetrics": [
+          "train_loss"
+        ],
+        "logFiles": [
+          "*-train-log.log",
+          "*-export-log.log"
+        ],
+        "wandbDir": "/home/workspace/log/wandb/wandb",
+        "completionStates": [
+          "training",
+          "exporting",
+          "completed",
+          "failed"
+        ]
+      },
+      "artifactPolicy": {
+        "produces": [
+          "checkpoint",
+          "merged"
+        ],
+        "deployable": "merged"
+      }
+    },
+    {
+      "id": "dpo_train_launcher",
+      "displayName": "DPO",
+      "aliases": [
+        "dpo_train_launcher",
+        "dpo_train",
+        "dpo",
+        "增强训练",
+        "enhanced",
+        "enhance"
+      ],
+      "backend": "llamafactory",
+      "stage": "dpo",
+      "finetuningType": "lora",
+      "entry": {
+        "sourceScript": "dpo_train_launcher.py",
+        "containerCommand": "/usr/local/insinfersystem/dpo_train_launcher",
+        "invocationStyle": "argv"
+      },
+      "params": [
+        {
+          "name": "model_path",
+          "type": "model",
+          "required": true,
+          "label": "模型路径",
+          "aliases": [
+            "model-path"
+          ]
+        },
+        {
+          "name": "dataset_dir",
+          "type": "dataset",
+          "required": true,
+          "label": "数据集目录",
+          "aliases": [
+            "dataset-dir"
+          ]
+        },
+        {
+          "name": "dataset_name",
+          "type": "text",
+          "required": true,
+          "label": "数据集名称",
+          "aliases": [
+            "dataset-name",
+            "dataset"
+          ]
+        },
+        {
+          "name": "template",
+          "type": "template",
+          "required": false,
+          "label": "模板（自动识别）",
+          "aliases": [
+            "TEM"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "output_dir",
+          "type": "text",
+          "required": false,
+          "label": "输出目录",
+          "aliases": [
+            "output-dir"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "report-to",
+          "type": "text",
+          "required": false,
+          "label": "指标上报",
+          "aliases": [
+            "report_to"
+          ],
+          "advanced": true
+        }
+      ],
+      "resourceRequirements": {
+        "containerRole": "training",
+        "nodeCount": 1,
+        "gpusPerNode": 8,
+        "resourcePool": true
+      },
+      "paths": {
+        "defaultDatasetRoot": "/home/workspace/dataset_daily_train",
+        "outputRoot": "/home/workspace/models/dpo_train/internal/saves",
+        "logRoot": "/home/workspace/log/dpo_train",
+        "exportRoot": "/home/workspace/models/dpo_train/internal/export"
+      },
+      "monitoring": {
+        "primaryMetric": "loss",
+        "fallbackMetrics": [
+          "train_loss",
+          "rewards/chosen"
+        ],
+        "logFiles": [
+          "*-dpo-train.log"
+        ],
+        "wandbDir": "/home/workspace/log/wandb/wandb",
+        "completionStates": [
+          "training",
+          "exporting",
+          "completed",
+          "failed"
+        ]
+      },
+      "artifactPolicy": {
+        "produces": [
+          "adapter",
+          "merged"
+        ],
+        "deployable": "merged"
+      }
+    },
+    {
+      "id": "train_multinode_sft_pipeline",
+      "displayName": "多机 LoRA SFT",
+      "aliases": [
+        "train_multinode_sft_pipeline",
+        "multinode_lora_sft",
+        "多机SFT",
+        "多机LoRA SFT",
+        "双机 LoRA SFT"
+      ],
+      "backend": "llamafactory",
+      "stage": "sft",
+      "finetuningType": "lora",
+      "entry": {
+        "sourceScript": "train_multinode_sft_pipeline.py",
+        "containerCommand": "/usr/local/insinfersystem/train_multinode_sft_pipeline",
+        "invocationStyle": "argv"
+      },
+      "params": [
+        {
+          "name": "model-path",
+          "type": "model",
+          "required": false,
+          "label": "基础模型路径",
+          "aliases": [
+            "model_path",
+            "MODEL_PATH"
+          ]
+        },
+        {
+          "name": "dataset-dir",
+          "type": "dataset",
+          "required": false,
+          "label": "训练数据目录",
+          "aliases": [
+            "dataset_dir",
+            "DATASET_DIR"
+          ]
+        },
+        {
+          "name": "dataset-date",
+          "type": "text",
+          "required": false,
+          "label": "数据集日期",
+          "aliases": [
+            "dataset_date",
+            "DATASET_DATE"
+          ]
+        },
+        {
+          "name": "dataset",
+          "type": "text",
+          "required": false,
+          "label": "数据集名称",
+          "aliases": [
+            "dataset-name",
+            "dataset_name"
+          ]
+        },
+        {
+          "name": "batch-size",
+          "type": "number",
+          "required": false,
+          "label": "单卡 batch size",
+          "aliases": [
+            "batch_size",
+            "MBS"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "acc",
+          "type": "number",
+          "required": false,
+          "label": "梯度累积",
+          "aliases": [
+            "ACC"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "learning-rate",
+          "type": "text",
+          "required": false,
+          "label": "学习率",
+          "aliases": [
+            "lr",
+            "LR"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "template",
+          "type": "template",
+          "required": false,
+          "label": "模板（自动识别）",
+          "aliases": [
+            "TEM"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "resume-from-checkpoint",
+          "type": "text",
+          "required": false,
+          "label": "恢复训练",
+          "aliases": [
+            "resume_from_checkpoint",
+            "RESUME"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "output-dir",
+          "type": "text",
+          "required": false,
+          "label": "输出目录",
+          "aliases": [
+            "output_dir"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "hostfile",
+          "type": "file",
+          "required": false,
+          "label": "hostfile",
+          "advanced": true
+        },
+        {
+          "name": "allocation-file",
+          "type": "file",
+          "required": false,
+          "label": "资源分配文件",
+          "advanced": true
+        },
+        {
+          "name": "master-addr",
+          "type": "text",
+          "required": false,
+          "label": "Master 地址",
+          "advanced": true
+        },
+        {
+          "name": "master-port",
+          "type": "number",
+          "required": false,
+          "label": "Master 端口",
+          "advanced": true
+        },
+        {
+          "name": "nccl-ifname",
+          "type": "text",
+          "required": false,
+          "label": "NCCL 网卡",
+          "advanced": true
+        },
+        {
+          "name": "nccl-debug",
+          "type": "enum",
+          "required": false,
+          "label": "NCCL 日志级别",
+          "default": "INFO",
+          "options": [
+            "INFO",
+            "WARN",
+            "ERROR"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "include-resources",
+          "type": "text",
+          "required": false,
+          "label": "DeepSpeed 资源范围",
+          "aliases": [
+            "include_resources"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "deepspeed-config",
+          "type": "file",
+          "required": false,
+          "label": "DeepSpeed 配置",
+          "advanced": true
+        },
+        {
+          "name": "skip-preflight",
+          "type": "boolean",
+          "required": false,
+          "label": "跳过 preflight",
+          "advanced": true
+        },
+        {
+          "name": "skip-merge",
+          "type": "boolean",
+          "required": false,
+          "label": "跳过合并",
+          "advanced": true
+        },
+        {
+          "name": "skip-data-analysis",
+          "type": "boolean",
+          "required": false,
+          "label": "跳过数据分析",
+          "advanced": true
+        },
+        {
+          "name": "use-liger-kernel",
+          "type": "boolean",
+          "required": false,
+          "label": "启用 Liger Kernel",
+          "aliases": [
+            "use_liger_kernel",
+            "USE_LIGER_KERNEL"
+          ],
+          "default": false,
+          "advanced": true
+        },
+        {
+          "name": "use-adam-mini",
+          "type": "boolean",
+          "required": false,
+          "label": "启用 Adam-mini",
+          "aliases": [
+            "use_adam_mini",
+            "USE_ADAM_MINI"
+          ],
+          "default": false,
+          "advanced": true
+        },
+        {
+          "name": "report-to",
+          "type": "text",
+          "required": false,
+          "label": "指标上报",
+          "aliases": [
+            "report_to"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "max-steps",
+          "type": "number",
+          "required": false,
+          "label": "最大训练步数",
+          "aliases": [
+            "max_steps"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "export-bin",
+          "type": "file",
+          "required": false,
+          "label": "导出命令",
+          "aliases": [
+            "export_bin"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "merge-cuda-visible-devices",
+          "type": "text",
+          "required": false,
+          "label": "合并使用的 GPU",
+          "aliases": [
+            "merge_cuda_visible_devices"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "extra-train-args",
+          "type": "argvRemainder",
+          "required": false,
+          "label": "额外训练参数",
+          "aliases": [
+            "extra_train_args"
+          ],
+          "advanced": true
+        }
+      ],
+      "resourceRequirements": {
+        "containerRole": "multinodeTraining",
+        "nodeCount": 2,
+        "gpusPerNode": 1,
+        "resourcePool": true
+      },
+      "paths": {
+        "defaultDatasetRoot": "/home/workspace/dataset_batch_train",
+        "outputRoot": "/home/workspace/models/batch_train",
+        "logRoot": "/home/workspace/log/batch_train"
+      },
+      "monitoring": {
+        "primaryMetric": "loss",
+        "fallbackMetrics": [
+          "train_loss"
+        ],
+        "logFiles": [
+          "*-train-log.log",
+          "*-merge-log.log"
+        ],
+        "wandbDir": "/home/workspace/log/wandb/wandb",
+        "completionStates": [
+          "training",
+          "exporting",
+          "completed",
+          "failed"
+        ]
+      },
+      "artifactPolicy": {
+        "produces": [
+          "adapter",
+          "merged"
+        ],
+        "deployable": "merged"
+      }
+    },
+    {
+      "id": "train_multinode_sft_full_pipeline",
+      "displayName": "多机全参 SFT",
+      "aliases": [
+        "train_multinode_sft_full_pipeline",
+        "multinode_full_sft",
+        "多机全参SFT",
+        "双机全参SFT",
+        "多机全参训练"
+      ],
+      "backend": "llamafactory",
+      "stage": "sft",
+      "finetuningType": "full",
+      "entry": {
+        "sourceScript": "train_multinode_sft_full_pipeline.py",
+        "containerCommand": "/usr/local/insinfersystem/train_multinode_sft_full_pipeline",
+        "invocationStyle": "argv"
+      },
+      "params": [
+        {
+          "name": "model-path",
+          "type": "model",
+          "required": false,
+          "label": "基础模型路径",
+          "aliases": [
+            "model_path",
+            "MODEL_PATH"
+          ]
+        },
+        {
+          "name": "dataset-dir",
+          "type": "dataset",
+          "required": false,
+          "label": "训练数据目录",
+          "aliases": [
+            "dataset_dir",
+            "DATASET_DIR"
+          ]
+        },
+        {
+          "name": "dataset-date",
+          "type": "text",
+          "required": false,
+          "label": "数据集日期",
+          "aliases": [
+            "dataset_date",
+            "DATASET_DATE"
+          ]
+        },
+        {
+          "name": "dataset",
+          "type": "text",
+          "required": false,
+          "label": "数据集名称",
+          "aliases": [
+            "dataset-name",
+            "dataset_name"
+          ]
+        },
+        {
+          "name": "batch-size",
+          "type": "number",
+          "required": false,
+          "label": "单卡 batch size",
+          "aliases": [
+            "batch_size",
+            "MBS"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "acc",
+          "type": "number",
+          "required": false,
+          "label": "梯度累积",
+          "aliases": [
+            "ACC"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "learning-rate",
+          "type": "text",
+          "required": false,
+          "label": "学习率",
+          "aliases": [
+            "lr",
+            "LR"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "template",
+          "type": "template",
+          "required": false,
+          "label": "模板（自动识别）",
+          "aliases": [
+            "TEM"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "resume-from-checkpoint",
+          "type": "text",
+          "required": false,
+          "label": "恢复训练",
+          "aliases": [
+            "resume_from_checkpoint",
+            "RESUME"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "output-dir",
+          "type": "text",
+          "required": false,
+          "label": "输出目录",
+          "aliases": [
+            "output_dir"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "hostfile",
+          "type": "file",
+          "required": false,
+          "label": "hostfile",
+          "advanced": true
+        },
+        {
+          "name": "allocation-file",
+          "type": "file",
+          "required": false,
+          "label": "资源分配文件",
+          "advanced": true
+        },
+        {
+          "name": "master-addr",
+          "type": "text",
+          "required": false,
+          "label": "Master 地址",
+          "advanced": true
+        },
+        {
+          "name": "master-port",
+          "type": "number",
+          "required": false,
+          "label": "Master 端口",
+          "advanced": true
+        },
+        {
+          "name": "nccl-ifname",
+          "type": "text",
+          "required": false,
+          "label": "NCCL 网卡",
+          "advanced": true
+        },
+        {
+          "name": "nccl-debug",
+          "type": "enum",
+          "required": false,
+          "label": "NCCL 日志级别",
+          "default": "INFO",
+          "options": [
+            "INFO",
+            "WARN",
+            "ERROR"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "include-resources",
+          "type": "text",
+          "required": false,
+          "label": "DeepSpeed 资源范围",
+          "aliases": [
+            "include_resources"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "deepspeed-config",
+          "type": "file",
+          "required": false,
+          "label": "DeepSpeed 配置",
+          "advanced": true
+        },
+        {
+          "name": "skip-preflight",
+          "type": "boolean",
+          "required": false,
+          "label": "跳过 preflight",
+          "advanced": true
+        },
+        {
+          "name": "skip-merge",
+          "type": "boolean",
+          "required": false,
+          "label": "跳过合并",
+          "advanced": true
+        },
+        {
+          "name": "skip-data-analysis",
+          "type": "boolean",
+          "required": false,
+          "label": "跳过数据分析",
+          "advanced": true
+        },
+        {
+          "name": "use-liger-kernel",
+          "type": "boolean",
+          "required": false,
+          "label": "启用 Liger Kernel",
+          "aliases": [
+            "use_liger_kernel",
+            "USE_LIGER_KERNEL"
+          ],
+          "default": false,
+          "advanced": true
+        },
+        {
+          "name": "use-adam-mini",
+          "type": "boolean",
+          "required": false,
+          "label": "启用 Adam-mini",
+          "aliases": [
+            "use_adam_mini",
+            "USE_ADAM_MINI"
+          ],
+          "default": false,
+          "advanced": true
+        },
+        {
+          "name": "report-to",
+          "type": "text",
+          "required": false,
+          "label": "指标上报",
+          "aliases": [
+            "report_to"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "max-steps",
+          "type": "number",
+          "required": false,
+          "label": "最大训练步数",
+          "aliases": [
+            "max_steps"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "export-bin",
+          "type": "file",
+          "required": false,
+          "label": "导出命令",
+          "aliases": [
+            "export_bin"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "merge-cuda-visible-devices",
+          "type": "text",
+          "required": false,
+          "label": "合并使用的 GPU",
+          "aliases": [
+            "merge_cuda_visible_devices"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "extra-train-args",
+          "type": "argvRemainder",
+          "required": false,
+          "label": "额外训练参数",
+          "aliases": [
+            "extra_train_args"
+          ],
+          "advanced": true
+        }
+      ],
+      "resourceRequirements": {
+        "containerRole": "multinodeTraining",
+        "nodeCount": 2,
+        "gpusPerNode": 1,
+        "resourcePool": true
+      },
+      "paths": {
+        "defaultDatasetRoot": "/home/workspace/dataset_batch_train",
+        "outputRoot": "/home/workspace/models/batch_train",
+        "logRoot": "/home/workspace/log/batch_train"
+      },
+      "monitoring": {
+        "primaryMetric": "loss",
+        "fallbackMetrics": [
+          "train_loss"
+        ],
+        "logFiles": [
+          "*-train-log.log",
+          "*-merge-log.log"
+        ],
+        "wandbDir": "/home/workspace/log/wandb/wandb",
+        "completionStates": [
+          "training",
+          "exporting",
+          "completed",
+          "failed"
+        ]
+      },
+      "artifactPolicy": {
+        "produces": [
+          "checkpoint",
+          "merged"
+        ],
+        "deployable": "merged"
+      }
+    },
+    {
+      "id": "train_multinode_dpo_pipeline",
+      "displayName": "多机 DPO",
+      "aliases": [
+        "train_multinode_dpo_pipeline",
+        "multinode_dpo",
+        "多机DPO",
+        "双机DPO",
+        "多机增强训练",
+        "双机增强训练"
+      ],
+      "backend": "llamafactory",
+      "stage": "dpo",
+      "finetuningType": "lora",
+      "entry": {
+        "sourceScript": "train_multinode_dpo_pipeline.py",
+        "containerCommand": "/usr/local/insinfersystem/train_multinode_dpo_pipeline",
+        "invocationStyle": "argv"
+      },
+      "params": [
+        {
+          "name": "model-path",
+          "type": "model",
+          "required": true,
+          "label": "模型路径",
+          "aliases": [
+            "model_path"
+          ]
+        },
+        {
+          "name": "dataset-dir",
+          "type": "dataset",
+          "required": true,
+          "label": "数据集目录",
+          "aliases": [
+            "dataset_dir"
+          ]
+        },
+        {
+          "name": "dataset-name",
+          "type": "text",
+          "required": true,
+          "label": "数据集名称",
+          "aliases": [
+            "dataset",
+            "dataset_name"
+          ]
+        },
+        {
+          "name": "template",
+          "type": "template",
+          "required": false,
+          "label": "模板（自动识别）",
+          "aliases": [
+            "TEM"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "output-dir",
+          "type": "text",
+          "required": false,
+          "label": "输出目录",
+          "aliases": [
+            "output_dir"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "batch-size",
+          "type": "number",
+          "required": false,
+          "label": "单卡 batch size",
+          "aliases": [
+            "batch_size"
+          ],
+          "default": "1",
+          "advanced": true
+        },
+        {
+          "name": "acc",
+          "type": "number",
+          "required": false,
+          "label": "梯度累积",
+          "default": "4",
+          "advanced": true
+        },
+        {
+          "name": "learning-rate",
+          "type": "text",
+          "required": false,
+          "label": "学习率",
+          "aliases": [
+            "lr",
+            "learning_rate"
+          ],
+          "default": "1e-6",
+          "advanced": true
+        },
+        {
+          "name": "max-steps",
+          "type": "number",
+          "required": false,
+          "label": "最大训练步数",
+          "aliases": [
+            "max_steps"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "report-to",
+          "type": "text",
+          "required": false,
+          "label": "指标上报",
+          "aliases": [
+            "report_to"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "hostfile",
+          "type": "file",
+          "required": false,
+          "label": "hostfile",
+          "advanced": true
+        },
+        {
+          "name": "allocation-file",
+          "type": "file",
+          "required": false,
+          "label": "资源分配文件",
+          "aliases": [
+            "allocation_file"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "master-addr",
+          "type": "text",
+          "required": false,
+          "label": "Master 地址",
+          "aliases": [
+            "master_addr"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "master-port",
+          "type": "number",
+          "required": false,
+          "label": "Master 端口",
+          "aliases": [
+            "master_port"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "nccl-ifname",
+          "type": "text",
+          "required": false,
+          "label": "NCCL 网卡",
+          "aliases": [
+            "nccl_ifname"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "deepspeed-config",
+          "type": "file",
+          "required": false,
+          "label": "DeepSpeed 配置",
+          "aliases": [
+            "deepspeed_config"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "skip-preflight",
+          "type": "boolean",
+          "required": false,
+          "label": "跳过 preflight",
+          "aliases": [
+            "skip_preflight"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "skip-merge",
+          "type": "boolean",
+          "required": false,
+          "label": "跳过合并",
+          "aliases": [
+            "skip_merge"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "export-dir",
+          "type": "text",
+          "required": false,
+          "label": "导出目录",
+          "aliases": [
+            "export_dir"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "export-device",
+          "type": "enum",
+          "required": false,
+          "label": "导出设备",
+          "aliases": [
+            "export_device"
+          ],
+          "default": "cpu",
+          "options": [
+            "cpu",
+            "cuda"
+          ],
+          "advanced": true
+        },
+        {
+          "name": "export-legacy-format",
+          "type": "boolean",
+          "required": false,
+          "label": "导出旧格式",
+          "aliases": [
+            "export_legacy_format"
+          ],
+          "default": false,
+          "advanced": true
+        }
+      ],
+      "resourceRequirements": {
+        "containerRole": "multinodeTraining",
+        "nodeCount": 2,
+        "gpusPerNode": 1,
+        "resourcePool": true
+      },
+      "paths": {
+        "defaultDatasetRoot": "/home/workspace/dataset_daily_train",
+        "outputRoot": "/home/workspace/models/dpo_train/internal/saves",
+        "logRoot": "/home/workspace/log/dpo_train",
+        "exportRoot": "/home/workspace/models/dpo_train/internal/export"
+      },
+      "monitoring": {
+        "primaryMetric": "loss",
+        "fallbackMetrics": [
+          "train_loss",
+          "rewards/chosen"
+        ],
+        "logFiles": [
+          "*-dpo-train.log"
+        ],
+        "wandbDir": "/home/workspace/log/wandb/wandb",
+        "completionStates": [
+          "training",
+          "exporting",
+          "completed",
+          "failed"
+        ]
+      },
+      "artifactPolicy": {
+        "produces": [
+          "adapter",
+          "merged"
+        ],
+        "deployable": "merged"
+      }
+    },
+    {
+      "id": "grpo_train",
+      "displayName": "GRPO",
+      "aliases": [
+        "grpo_train",
+        "grpo",
+        "GRPO训练",
+        "grpo训练"
+      ],
+      "backend": "verl",
+      "stage": "grpo",
+      "finetuningType": "rl",
+      "entry": {
+        "sourceScript": "verl recipe",
+        "containerCommand": "verl key=value overrides",
+        "invocationStyle": "keyValue"
+      },
+      "params": [
+        {
+          "name": "model_path",
+          "type": "model",
+          "required": true,
+          "label": "模型路径"
+        },
+        {
+          "name": "train_files",
+          "type": "file",
+          "required": true,
+          "label": "训练文件"
+        },
+        {
+          "name": "val_files",
+          "type": "file",
+          "required": true,
+          "label": "验证文件"
+        },
+        {
+          "name": "gpu-count",
+          "type": "number",
+          "required": false,
+          "label": "GPU 数量",
+          "resourceOnly": true
+        },
+        {
+          "name": "wandb_mode",
+          "type": "enum",
+          "required": false,
+          "label": "W&B 模式",
+          "default": "online",
+          "options": [
+            "online",
+            "offline"
+          ],
+          "advanced": true
+        }
+      ],
+      "resourceRequirements": {
+        "containerRole": "grpoTraining",
+        "nodeCount": 1,
+        "gpusPerNode": 4,
+        "resourcePool": true
+      },
+      "paths": {
+        "defaultDatasetRoot": "/home/workspace/verl/examples/data_preprocess/data",
+        "outputRoot": "/home/workspace/models/grpo_train",
+        "logRoot": "/home/workspace/log/grpo_train"
+      },
+      "monitoring": {
+        "primaryMetric": "actor/pg_loss",
+        "fallbackMetrics": [
+          "actor/kl_loss",
+          "critic/vf_loss",
+          "reward"
+        ],
+        "logFiles": [
+          "*.log",
+          "output.log"
+        ],
+        "wandbDir": "/home/workspace/verl/wandb",
+        "completionStates": [
+          "training",
+          "completed",
+          "failed"
+        ]
+      },
+      "artifactPolicy": {
+        "produces": [
+          "checkpoint"
+        ],
+        "deployable": "none"
+      }
+    }
+  ]
+}

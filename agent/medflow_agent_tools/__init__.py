@@ -15,6 +15,15 @@ from .runlocal_evaluate_monitor import (
     run_script_by_name_evaluate_monitor,
 )
 from .runlocal_monitor import run_script_by_name_monitor1
+from ._training_descriptors import (
+    find_training_descriptor,
+    list_training_descriptors,
+    validate_training_descriptors,
+)
+from ._evaluation_descriptors import (
+    find_evaluation_descriptor,
+    list_evaluation_descriptors,
+)
 from .runlocal_train import (
     run_script_by_name_train,
     validate_training_inputs_preflight,
@@ -36,4 +45,9 @@ __all__ = [
     "run_script_by_name_monitor1",
     "run_script_by_name_train",
     "validate_training_inputs_preflight",
+    "find_training_descriptor",
+    "list_training_descriptors",
+    "validate_training_descriptors",
+    "find_evaluation_descriptor",
+    "list_evaluation_descriptors",
 ]

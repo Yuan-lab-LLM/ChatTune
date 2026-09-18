@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Button, Card, Alert } from 'antd';
 import { Play, Terminal, CheckCircle, Send } from 'lucide-react';
+import { DEFAULT_TRAINING_COMMAND } from '../config';
 
 interface Step3TrainingProps {
   isExecuting: boolean;
@@ -15,7 +16,7 @@ export function Step3Training({ isExecuting, logs, onFillCommand, isFilled }: St
   const [isChecking, setIsChecking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // 命令始终使用中文，不翻译
-  const command = '运行lora批量训练';
+  const command = DEFAULT_TRAINING_COMMAND;
 
   const handleConfirm = async () => {
     setIsChecking(true);

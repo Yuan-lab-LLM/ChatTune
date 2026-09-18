@@ -30,11 +30,18 @@ import { useEnvironmentConfig } from "@/hooks/useEnvironmentConfig";
 import { GuideModal } from "@/components/GuideModal";
 import { ManagerButton } from "@/components/buttons/ASButton";
 import ManagerSectionHeader from "../ManagerSectionHeader";
+import { getModelMergeBadgeKind } from "./modelMergeBadge";
 
 const tagSelectClassName =
   "w-[84px] [&_.ant-select-selector]:!h-8 [&_.ant-select-selector]:!rounded-lg [&_.ant-select-selector]:!border-border/40 [&_.ant-select-selector]:!bg-muted/35 [&_.ant-select-selection-item]:!text-xs [&_.ant-select-selection-item]:!font-medium [&_.ant-select-selection-item]:!leading-[30px] [&_.ant-select-arrow]:!text-muted-foreground";
 const dockerSelectClassName = "min-w-[128px]";
 const MODEL_TAG_ORDER = ["base", "sft", "pt", "dpo", "inference"];
+const HIDDEN_MODEL_FILTER_TAGS = new Set([
+  "merged",
+  "adapter",
+  "checkpoint",
+  "custom",
+]);
 
 const MODEL_TYPE_TAG_MAP: Record<string, string> = {
   base_train: "base",
@@ -48,6 +55,11 @@ const getModelTags = (model: ModelInfo) => {
   const normalizedText =
     `${model.type || ""} ${model.name || ""} ${model.path || ""}`.toLowerCase();
   const tags = new Set<string>();
+
+  for (const artifactType of model.artifactTypes || []) {
+    tags.add(artifactType);
+  }
+  if (model.artifactType) tags.add(model.artifactType);
 
   if (model.type) {
     tags.add(MODEL_TYPE_TAG_MAP[model.type] || model.type);
@@ -113,10 +125,40 @@ const ModelManager = ({
     `     • ${t("model.guide.section1.item6") || "DPO：增强训练模型"}`,
     `     • ${t("model.guide.section1.item7") || "Inference：推理部署模型"}`,
     "",
-    `2. ${t("model.guide.section2.title") || "合并状态说明"}`,
-    `   - ${t("model.guide.section2.item1") || "Training Complete：模型已完成合并，可直接使用"}`,
-    `   - ${t("model.guide.section2.item2") || "Training Incomplete：模型训练流程尚未完成，仍需继续处理"}`,
+    `2. ${t("model.guide.section2.title") || "合并产物说明"}`,
+    `   - ${t("model.guide.section2.item1") || "已生成合并模型：原始训练目录已有对应的合并产物"}`,
+    `   - ${t("model.guide.section2.item2") || "未生成合并模型：未检测到对应的合并产物"}`,
+    `   - ${t("model.guide.section2.item3") || "合并模型：当前目录就是合并产物"}`,
   ].join("\n");
+  const renderMergeBadge = (model: ModelInfo) => {
+    const kind = getModelMergeBadgeKind(model);
+    if (!kind) return null;
+
+    const hasMergedOutput = kind !== "merged-output-missing";
+    const label =
+      kind === "merged-artifact"
+        ? t("model.merged-artifact") || "合并模型"
+        : kind === "merged-output-exists"
+          ? t("model.merged-output-exists") || "已生成合并模型"
+          : t("model.merged-output-missing") || "未生成合并模型";
+
+    return (
+      <span
+        className={`rounded-full px-2.5 py-1 text-[11px] font-medium flex items-center gap-1 border ${
+          hasMergedOutput
+            ? "bg-green-50 text-green-700 border-green-200/70"
+            : "bg-yellow-50 text-yellow-700 border-yellow-200/70"
+        }`}
+      >
+        {hasMergedOutput ? (
+          <CheckCircle2 className="w-3 h-3" />
+        ) : (
+          <XCircle className="w-3 h-3" />
+        )}
+        {label}
+      </span>
+    );
+  };
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isGuideOpen, setIsGuideOpen] = useState(false);
   const [selectedTag, setSelectedTag] = useState("all");
@@ -152,7 +194,8 @@ const ModelManager = ({
     const availableTags = new Set(
       effectiveModels
         .filter((model) => model.size !== "0 B")
-        .flatMap((model) => getModelTags(model)),
+        .flatMap((model) => getModelTags(model))
+        .filter((tag) => !HIDDEN_MODEL_FILTER_TAGS.has(tag.toLowerCase())),
     );
     const orderedTags = [
       ...MODEL_TAG_ORDER.filter((tag) => availableTags.has(tag)),
@@ -672,31 +715,7 @@ const ModelManager = ({
                             {model.containerName}
                           </span>
                         )}
-                        {/* 显示 merged 状态 - 训练产物需要判断 */}
-                        {["batch_trained", "pretrain", "daily_trained"].includes(
-                          model.type || "",
-                        ) &&
-                          "merged" in model && (
-                            <span
-                              className={`rounded-full px-2.5 py-1 text-[11px] font-medium flex items-center gap-1 border ${
-                                model.merged
-                                  ? "bg-green-50 text-green-700 border-green-200/70"
-                                  : "bg-yellow-50 text-yellow-700 border-yellow-200/70"
-                              }`}
-                            >
-                              {model.merged ? (
-                                <>
-                                  <CheckCircle2 className="w-3 h-3" />
-                                  {t("model.merged") || "Training Complete"}
-                                </>
-                              ) : (
-                                <>
-                                  <XCircle className="w-3 h-3" />
-                                  {t("model.not-merged") || "Training Incomplete"}
-                                </>
-                              )}
-                            </span>
-                          )}
+                        {renderMergeBadge(model)}
                       </div>
                     </div>
                     {onDelete && model.canDelete !== false && (

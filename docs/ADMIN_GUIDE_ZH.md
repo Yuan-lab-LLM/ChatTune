@@ -4,7 +4,7 @@
 
 ## 首次初始化顺序
 
-浏览器打开 `STUDIO_PUBLIC_URL`，使用管理员账号及runtime.env中生成的密码登录。
+浏览器打开 `STUDIO_PUBLIC_URL`，首次使用管理员账号及 `runtime.env` 中生成的初始密码登录。之后的密码保存在 Studio 数据库中，重新生成 `runtime.env` 不会更改它。
 
 首次登录后，建议按以下顺序配置资源：
 
@@ -30,6 +30,8 @@
 - 在确认无影响后删除用户。
 
 生产部署建议保留至少两个具名管理员账号。初始管理员账号只用于初始化和应急恢复。
+
+若忘记唯一管理员密码，在中心服务器停止 Studio，只修改 `runtime.env` 中的 `MEDFLOW_ADMIN_PASSWORD`，执行 `bash runtime.sh reset-admin-password --username admin`，然后重新启动。命令只重置指定的现有管理员并撤销其会话；将 `admin` 替换为实际用户名。无需重新生成整个 `runtime.env`。
 
 ## 用户组和 Docker 容器
 

@@ -12,6 +12,7 @@ import json
 import os
 import time
 import logging
+import math
 import posixpath
 import re
 import shlex
@@ -53,6 +54,27 @@ _RUNTIME_DIR = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "..", "runtime")
 )
 _BACKGROUND_TASK_REGISTRY = os.path.join(_RUNTIME_DIR, "background_task_registry.jsonl")
+
+_CLI_TRUE_VALUES = {"1", "true", "yes", "on", "y"}
+_CLI_FALSE_VALUES = {"0", "false", "no", "off", "n", ""}
+
+
+def normalize_cli_param_value(
+    script_info: Dict[str, Any],
+    param_name: str,
+    value: Any,
+) -> Any:
+    """Normalize argparse flags while preserving ordinary scalar values."""
+    if param_name not in set(script_info.get("boolean_cli_params", [])):
+        return value
+    if isinstance(value, bool):
+        return value
+    normalized = str(value or "").strip().lower()
+    if normalized in _CLI_TRUE_VALUES:
+        return True
+    if normalized in _CLI_FALSE_VALUES:
+        return False
+    return value
 
 
 def _data_protocol_hint(
@@ -255,7 +277,13 @@ class ScriptManager:
                     "base_url": DEFAULT_MODEL_BASE_URL
                     },
                 "required_cli_params": ["data_type", "strategy"],  # 新增：必需的命令行参数
-                "supported_cli_params": ["input_folder","data_type","strategy","model_name","api_key","base_url","output_folder"],  # 新增：支持的命令行参数
+                "supported_cli_params": [
+                    "input_folder", "output_folder", "data_type", "strategy",
+                    "model_name", "api_key", "base_url", "workers",
+                    "request-timeout", "max-retries", "resume", "keep-score",
+                    "merge-output", "latest-subfolder",
+                ],
+                "boolean_cli_params": ["resume", "keep-score", "merge-output", "latest-subfolder"],
                 "validate_existing_dirs": ["input_folder"],
                 "container_relative_path_base": "/home/workspace",
                 "param_mapping": {  # 新增：命令行参数的中文映射
@@ -274,7 +302,24 @@ class ScriptManager:
                     "dpo处理模型地址":"base_url",
                     "--model_name":"model_name",
                     "--api_key":"api_key",
-                    "--base_url":"base_url"
+                    "--base_url":"base_url",
+                    "并发数": "workers",
+                    "--workers": "workers",
+                    "request_timeout": "request-timeout",
+                    "--request-timeout": "request-timeout",
+                    "max_retries": "max-retries",
+                    "--max-retries": "max-retries",
+                    "断点续跑": "resume",
+                    "--resume": "resume",
+                    "保留分数": "keep-score",
+                    "keep_score": "keep-score",
+                    "--keep-score": "keep-score",
+                    "合并输出": "merge-output",
+                    "merge_output": "merge-output",
+                    "--merge-output": "merge-output",
+                    "选择最新子目录": "latest-subfolder",
+                    "latest_subfolder": "latest-subfolder",
+                    "--latest-subfolder": "latest-subfolder"
                     },
                 "supported_params": [],
                 "default_args": {
@@ -305,7 +350,13 @@ class ScriptManager:
                     "base_url": DEFAULT_MODEL_BASE_URL
                     },
                 "required_cli_params": ["input_folder"],  # 新增：必需的命令行参数
-                "supported_cli_params": ["input_folder","threshold","model_name","api_key","base_url"],  # 新增：支持的命令行参数
+                "supported_cli_params": [
+                    "input_folder", "output_folder", "threshold", "model_name",
+                    "api_key", "base_url", "workers", "request-timeout",
+                    "max-retries", "request-interval", "resume", "keep-score",
+                    "merge-output",
+                ],
+                "boolean_cli_params": ["resume", "keep-score", "merge-output"],
                 "validate_existing_dirs": ["input_folder"],
                 "container_relative_path_base": "/home/workspace",
                 "param_mapping": {  # 新增：命令行参数的中文映射
@@ -318,7 +369,26 @@ class ScriptManager:
                     "--threshold":"threshold",
                     "--model_name":"model_name",
                     "--api_key":"api_key",
-                    "--base_url":"base_url"
+                    "--base_url":"base_url",
+                    "输出路径": "output_folder",
+                    "输出目录": "output_folder",
+                    "--output_folder": "output_folder",
+                    "并发数": "workers",
+                    "--workers": "workers",
+                    "request_timeout": "request-timeout",
+                    "--request-timeout": "request-timeout",
+                    "max_retries": "max-retries",
+                    "--max-retries": "max-retries",
+                    "request_interval": "request-interval",
+                    "--request-interval": "request-interval",
+                    "断点续跑": "resume",
+                    "--resume": "resume",
+                    "保留分数": "keep-score",
+                    "keep_score": "keep-score",
+                    "--keep-score": "keep-score",
+                    "合并输出": "merge-output",
+                    "merge_output": "merge-output",
+                    "--merge-output": "merge-output"
                     },
                 "supported_params": [],
                 "default_args": {
@@ -824,6 +894,22 @@ def effective_data_preprocessing_required_params(
     return required_params
 
 
+def missing_dpo_generation_api_params(
+    cli_args: Dict[str, Any],
+    detected_format: str,
+) -> List[str]:
+    """Require generation credentials only when DPO rejected data is absent."""
+    data_type = str(cli_args.get("data_type") or "").strip().lower()
+    detected_format = str(detected_format or "").strip().lower()
+    if data_type != "dpo" or detected_format == "dpo":
+        return []
+    return [
+        name
+        for name in ("model_name", "api_key", "base_url")
+        if _is_placeholder_value(name, cli_args.get(name))
+    ]
+
+
 
 def cleanup_data_preprocessing_cli_args(
     script_info: Dict[str, Any],
@@ -958,6 +1044,44 @@ def validate_cli_param_values(
         data_type = str(cli_args.get("data_type") or "").strip().lower()
         if data_type not in {"sft", "dpo", "pt", "text"}:
             invalid.append(f"data_type={cli_args.get('data_type')!r}")
+    if "threshold" in script_info.get("supported_cli_params", []) and str(cli_args.get("threshold") or "").strip():
+        raw_threshold = cli_args.get("threshold")
+        try:
+            threshold = float(str(raw_threshold).strip())
+        except (TypeError, ValueError):
+            invalid.append(f"threshold={raw_threshold!r}")
+        else:
+            if threshold < 0 or threshold > 100:
+                invalid.append(f"threshold={raw_threshold!r}")
+    numeric_rules = {
+        "workers": (int, 1, None),
+        "request-timeout": (float, 0, None),
+        "max-retries": (int, 1, None),
+        "request-interval": (float, 0, None),
+    }
+    for param_name, (number_type, minimum, maximum) in numeric_rules.items():
+        if param_name not in script_info.get("supported_cli_params", []):
+            continue
+        raw_value = cli_args.get(param_name)
+        if raw_value is None or not str(raw_value).strip():
+            continue
+        try:
+            parsed_value = number_type(str(raw_value).strip())
+        except (TypeError, ValueError):
+            invalid.append(f"{param_name}={raw_value!r}")
+            continue
+        if (
+            not math.isfinite(parsed_value)
+            or parsed_value < minimum
+            or (param_name == "request-timeout" and parsed_value <= 0)
+            or (maximum is not None and parsed_value > maximum)
+        ):
+            invalid.append(f"{param_name}={raw_value!r}")
+    for param_name in script_info.get("boolean_cli_params", []):
+        if param_name not in cli_args:
+            continue
+        if not isinstance(cli_args.get(param_name), bool):
+            invalid.append(f"{param_name}={cli_args.get(param_name)!r}")
     return invalid
 
 
@@ -1291,7 +1415,11 @@ def run_script_by_name_data(
                         # 如果是使用位置参数的脚本，并且是位置参数名，添加到位置参数列表
                         positional_args.append(str(param_value))
                     elif cli_param in script_info.get("supported_cli_params", []):
-                        cli_params_to_update[cli_param] = str(param_value)
+                        cli_params_to_update[cli_param] = normalize_cli_param_value(
+                            script_info,
+                            cli_param,
+                            param_value,
+                        )
                     else:
                         unknown_params.append(f"{param_name} ({cli_param})")
                 else:
@@ -1406,6 +1534,16 @@ def run_script_by_name_data(
     ) -> ToolResponse:
         missing_items = [f"{param}={cli_args.get(param)!r}" for param in missing_params]
         blocked_items = invalid_params or missing_items
+        invalid_param_names = {
+            item.split("=", 1)[0]
+            for item in invalid_params
+            if "=" in item
+        }
+        prompt_params = [
+            param
+            for param in required_params
+            if param in missing_params or param in invalid_param_names
+        ]
         response_text = (
             f"错误！脚本 '{script_name}' 的必需参数存在无效值或占位值，已阻止启动：\n"
             + "\n".join(f"- {item}" for item in blocked_items)
@@ -1415,7 +1553,7 @@ def run_script_by_name_data(
             script_name,
             response_text,
             error_reason="invalid_required_params",
-            required_params=required_params,
+            required_params=prompt_params,
             missing_params=(missing_params if not all_params_provided and skip_prompt else []),
             recoverable=True,
             invalidParams=blocked_items,
@@ -1689,6 +1827,21 @@ def run_script_by_name_data(
             invalid_params = validate_cli_param_values(script_info, cli_args, required_params)
             if invalid_params or (not all_params_provided and skip_prompt):
                 return invalid_required_response(required_params, missing_params, invalid_params, all_params_provided)
+            missing_api_params = missing_dpo_generation_api_params(cli_args, detected_format)
+            if missing_api_params:
+                return missing_required_response(
+                    missing_api_params,
+                    missing_api_params,
+                    {
+                        name: {
+                            "name": name,
+                            "description": f"{name} (DPO rejected 生成所需的 OpenAI-compatible API 参数)",
+                            "chinese_names": [],
+                        }
+                        for name in missing_api_params
+                    },
+                    preprocessing_diagnostics,
+                )
             cleanup_data_preprocessing_cli_args(script_info, cli_args, args, detected_format)
             run_kwargs["script_args"] = args
 

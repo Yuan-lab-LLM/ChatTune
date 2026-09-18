@@ -34,7 +34,7 @@ const UserLandingPage = () => {
 
   const startPageTour = () => {
     if (!target) return;
-    startTour(target.project);
+    startTour(target.project, target.runId);
   };
 
   if (serviceQuery.isLoading || targetQuery.isLoading) {

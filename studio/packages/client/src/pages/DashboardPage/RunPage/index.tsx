@@ -31,6 +31,7 @@ import {
   Workflow,
   Filter,
   RefreshCw,
+  Clock,
 } from "lucide-react";
 
 import {
@@ -176,6 +177,7 @@ interface TrainingTaskSummary {
   scriptName?: string;
   workflowId?: string;
   wandbUrl?: string;
+  lifecycleStatus?: string;
 }
 
 interface WorkflowTaskSummary {
@@ -190,6 +192,12 @@ interface WorkflowTaskSummary {
   currentStageMessage?: string;
   datasetRef?: string;
   evaluationDatasetName?: string;
+  evaluationScope?: string;
+  evalDatasets?: string[];
+  runId?: string;
+  reportPath?: string;
+  scores?: Record<string, unknown>;
+  scoreDeltas?: Record<string, unknown>;
   container?: string;
   pid?: string;
   modelPath?: string;
@@ -202,6 +210,9 @@ interface WorkflowTaskSummary {
   wandbUrl?: string;
   stageStatuses?: Record<string, string>;
   workflowLogs?: Record<string, WorkflowStageLogSummary>;
+  etaStatus?: BenchmarkEtaStatus;
+  estimatedRemainingSeconds?: number;
+  etaCalculatedAt?: number;
 }
 
 interface WorkflowStageLogSummary {
@@ -223,6 +234,13 @@ interface AssessmentTaskSummary {
   assessmentTypeText?: string;
   evalType?: string;
   evalTypeText?: string;
+  evaluationScope?: string;
+  evalDatasets?: string[];
+  runId?: string;
+  reportPath?: string;
+  status?: string;
+  scores?: Record<string, unknown>;
+  scoreDeltas?: Record<string, unknown>;
 }
 
 interface InferenceInstanceSummary {
@@ -238,7 +256,6 @@ interface InferenceTaskSummary {
   sourceKey?: string;
   modelName?: string;
   hostIp?: string;
-  inferencePort?: string;
   vllmPort?: string;
   hasConfig?: boolean;
   hasStatus?: boolean;
@@ -256,6 +273,21 @@ interface BenchmarkTaskSummary {
   dataset?: string;
   status?: string;
   resultPath?: string;
+  etaStatus?: BenchmarkEtaStatus;
+  estimatedRemainingSeconds?: number;
+  etaCalculatedAt?: number;
+}
+
+type BenchmarkEtaStatus =
+  | "calculating"
+  | "available"
+  | "complete"
+  | "unavailable";
+
+interface BenchmarkEtaSnapshot {
+  etaStatus?: BenchmarkEtaStatus;
+  estimatedRemainingSeconds?: number;
+  etaCalculatedAt?: number;
 }
 
 interface DataFilterTaskSummary {
@@ -307,20 +339,17 @@ const ADMIN_NL_CAPABILITIES = {
   userEditableInferenceFields: ["model_name"],
   adminOnlyInferenceFields: [
     "vllm_openai_port",
-    "inference_port",
-    "ui_port",
-    "data_annotation_port",
+    "master_port",
     "host_ip",
     "cuda_visible_devices",
     "model_path",
     "start_script",
     "log_dir",
-    "test_dir",
     "benchmark_dir",
     "general_benchmark_dir",
     "tensor_parallel_size",
     "gpu_memory_utilization",
-    "max_tokens",
+    "gpu_utilization_threshold",
   ],
 } as const;
 
@@ -485,7 +514,7 @@ const normalizeWorkflowStatusDisplayText = (text: string): string => {
   );
 
   if (progressPercent !== undefined) {
-    const progressLinePattern = /(-\s*进度\s*[:：]\s*)`?[^`\n]*%`?/;
+    const progressLinePattern = /(-\s*(?:整体)?进度\s*[:：]\s*)`?[^`\n]*%`?/;
     if (progressLinePattern.test(message)) {
       message = message.replace(
         progressLinePattern,
@@ -691,9 +720,6 @@ const messageMatchesContextUsername = (
 interface InferenceProtocolConfig {
   ports?: {
     VLLM_OPENAI_PORT?: number | string;
-    INFERENCE_PORT?: number | string;
-    UI_PORT?: number | string;
-    DATA_ANNOTATION_PORT?: number | string;
   };
   env?: {
     HOST_IP?: string;
@@ -702,14 +728,14 @@ interface InferenceProtocolConfig {
     MODEL_PATH?: string;
     START_SCRIPT?: string;
     LOG_DIR?: string;
-    TEST_DIR?: string;
     BENCHMARK_DIR?: string;
     GENERAL_BENCHMARK_DIR?: string;
+    MASTER_PORT?: number | string;
   };
   runtime?: {
     TENSOR_PARALLEL_SIZE?: number | string;
     GPU_MEMORY_UTILIZATION?: number | string;
-    MAX_TOKENS?: number | string;
+    GPU_UTILIZATION_THRESHOLD?: number | string;
   };
 }
 
@@ -801,6 +827,9 @@ interface TrainingJobProtocol {
   trainType?: string;
   trainTypeEn?: string;
   trainTypeText?: string;
+  descriptorId?: string;
+  lifecycleStatus?: string;
+  lifecycle_status?: string;
   launchMode?: string;
   isMultinode?: boolean;
   workflowId?: string;
@@ -844,6 +873,19 @@ interface TrainingJobProtocol {
         script_name?: string;
         wandb_url?: string;
         wandbUrl?: string;
+        descriptorId?: string;
+        descriptor_id?: string;
+        lifecycleStatus?: string;
+        lifecycle_status?: string;
+        sub_stage?: string;
+        merge_status?: string;
+        overall_progress_percent?: number | string;
+        evaluation_scope?: string;
+        eval_datasets?: string[];
+        run_id?: string;
+        report_path?: string;
+        scores?: Record<string, unknown>;
+        score_deltas?: Record<string, unknown>;
       };
       result?: {
         log_path?: string;
@@ -860,6 +902,12 @@ interface TrainingJobProtocol {
         stopServiceLogTail?: string;
         stop_service_log_updated_at?: number | string;
         stopServiceLogUpdatedAt?: number | string;
+        eta_status?: BenchmarkEtaStatus;
+        etaStatus?: BenchmarkEtaStatus;
+        estimated_remaining_seconds?: number | string;
+        estimatedRemainingSeconds?: number | string;
+        eta_calculated_at?: number | string;
+        etaCalculatedAt?: number | string;
       };
       log_path?: string;
       logPath?: string;
@@ -881,18 +929,30 @@ interface TrainingJobProtocol {
   modelPath?: string;
   progress_percent?: number | string;
   progressPercent?: number | string;
+  outputDir?: string;
+  exportDir?: string;
   script?: string;
   scriptName?: string;
   assessmentType?: string;
   assessmentTypeText?: string;
   evalType?: string;
   evalTypeText?: string;
+  evaluationScope?: string;
+  evalDatasets?: string[];
+  runId?: string;
+  reportPath?: string;
+  scores?: Record<string, unknown>;
+  scoreDeltas?: Record<string, unknown>;
+  macroAverage?: Record<string, unknown>;
   model?: string;
   dataset?: string;
   status?: string;
   jobId?: string;
   job_id?: string;
   benchmark_job_id?: string;
+  etaStatus?: BenchmarkEtaStatus;
+  estimatedRemainingSeconds?: number | string;
+  etaCalculatedAt?: number | string;
   outputFolder?: string;
   output_folder?: string;
   inputFolder?: string;
@@ -1080,6 +1140,9 @@ const normalizeTrainingTaskStatus = (
   if (/starting|启动/.test(normalized)) {
     return "starting";
   }
+  if (/exporting|export|merge|导出|合并/.test(normalized)) {
+    return "exporting";
+  }
   if (/running|运行/.test(normalized)) {
     return "running";
   }
@@ -1096,6 +1159,24 @@ const normalizeTrainingTaskStatus = (
     return "failed";
   }
   return fallback;
+};
+
+const trainingDisplayStatusFromProtocol = (
+  protocol: TrainingJobProtocol,
+): string => {
+  if (protocol.type === "job_preparing") {
+    return "preparing";
+  }
+
+  const primaryStatus = normalizeTrainingTaskStatus(protocol.status, "");
+  const lifecycleStatus = normalizeTrainingTaskStatus(
+    protocol.lifecycleStatus || protocol.lifecycle_status,
+    "",
+  );
+  if (primaryStatus === "running" && lifecycleStatus === "exporting") {
+    return "exporting";
+  }
+  return primaryStatus || lifecycleStatus || "running";
 };
 
 const isTrainingTerminalStatus = (status?: string): boolean =>
@@ -1134,6 +1215,27 @@ const isTrainingTerminalProtocol = (
   return false;
 };
 
+const isAssessmentTerminalProtocol = (
+  protocol: TrainingJobProtocol | null,
+): boolean => {
+  if (
+    !protocol ||
+    isWorkflowProtocol(protocol) ||
+    !["assessment", "evaluate"].includes(protocol.jobType || "")
+  ) {
+    return false;
+  }
+  if (protocol.type === "job_stopped") {
+    return true;
+  }
+  if (["job_started", "monitor_status"].includes(protocol.type)) {
+    return isTrainingTerminalStatus(
+      normalizeTrainingTaskStatus(protocol.status, ""),
+    );
+  }
+  return false;
+};
+
 const trainingSummaryFromProtocol = (
   protocol: TrainingJobProtocol | null,
 ): TrainingTaskSummary | null => {
@@ -1158,9 +1260,8 @@ const trainingSummaryFromProtocol = (
     return null;
   }
 
-  const status = protocol.type === "job_preparing"
-    ? "preparing"
-    : normalizeTrainingTaskStatus(protocol.status, "running");
+  const lifecycleStatus = protocol.lifecycleStatus || protocol.lifecycle_status;
+  const status = trainingDisplayStatusFromProtocol(protocol);
   if (isTrainingTerminalStatus(status)) {
     return null;
   }
@@ -1168,12 +1269,13 @@ const trainingSummaryFromProtocol = (
   return {
     container,
     pid,
-    trainType: protocol.trainTypeEn || protocol.trainType || protocol.trainTypeText,
+    trainType: protocol.trainType || protocol.trainTypeEn || protocol.trainTypeText,
     status,
     launchMode: inferTrainingLaunchMode(protocol),
     isMultinode: Boolean(protocol.isMultinode),
     scriptName: protocol.scriptName || protocol.script,
     wandbUrl,
+    lifecycleStatus,
   };
 };
 
@@ -1204,6 +1306,106 @@ const normalizePercent = (value: unknown): number | undefined => {
   return Math.max(0, Math.min(100, Math.round(parsed)));
 };
 
+const normalizeNonNegativeNumber = (value: unknown): number | undefined => {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return undefined;
+  }
+  return parsed;
+};
+
+const normalizeBenchmarkEtaStatus = (
+  value: unknown,
+): BenchmarkEtaStatus | undefined => {
+  const status = String(value || "").trim().toLowerCase();
+  return ["calculating", "available", "complete", "unavailable"].includes(
+    status,
+  )
+    ? (status as BenchmarkEtaStatus)
+    : undefined;
+};
+
+const isActiveBenchmarkStatus = (value: unknown): boolean => {
+  const status = String(value || "").trim().toLowerCase();
+  return ![
+    "cancelled",
+    "canceled",
+    "complete",
+    "completed",
+    "done",
+    "error",
+    "failed",
+    "finished",
+    "stopped",
+    "success",
+    "succeeded",
+  ].includes(status);
+};
+
+interface BenchmarkEtaCountdown {
+  status: "calculating" | "available" | "unavailable";
+  remainingSeconds?: number;
+}
+
+const useBenchmarkEtaCountdown = (
+  snapshot: BenchmarkEtaSnapshot | null,
+  active: boolean,
+): BenchmarkEtaCountdown | null => {
+  const [now, setNow] = useState(() => Date.now());
+  const shouldTick =
+    active &&
+    snapshot?.etaStatus === "available" &&
+    snapshot.estimatedRemainingSeconds !== undefined;
+
+  useEffect(() => {
+    setNow(Date.now());
+    if (!shouldTick) {
+      return;
+    }
+    const intervalId = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(intervalId);
+  }, [
+    shouldTick,
+    snapshot?.etaCalculatedAt,
+    snapshot?.estimatedRemainingSeconds,
+  ]);
+
+  if (!active || snapshot?.etaStatus === "complete") {
+    return null;
+  }
+  if (!snapshot?.etaStatus || snapshot.etaStatus === "calculating") {
+    return { status: "calculating" };
+  }
+  if (snapshot.etaStatus === "unavailable") {
+    return { status: "unavailable" };
+  }
+  if (
+    snapshot.estimatedRemainingSeconds === undefined ||
+    snapshot.etaCalculatedAt === undefined
+  ) {
+    return { status: "unavailable" };
+  }
+
+  const calculatedAtMs =
+    snapshot.etaCalculatedAt > 1_000_000_000_000
+      ? snapshot.etaCalculatedAt
+      : snapshot.etaCalculatedAt * 1000;
+  const elapsedSinceEstimate = Math.max(
+    0,
+    Math.floor((now - calculatedAtMs) / 1000),
+  );
+  return {
+    status: "available",
+    remainingSeconds: Math.max(
+      0,
+      Math.round(snapshot.estimatedRemainingSeconds - elapsedSinceEstimate),
+    ),
+  };
+};
+
 const normalizeDataFilterStatus = (
   value: unknown,
 ): DataFilterTaskSummary["status"] => {
@@ -1230,6 +1432,16 @@ const workflowSummaryFromProtocol = (
   const currentStage = protocol.currentStage;
   const stage = currentStage ? protocol.stages?.[currentStage] : undefined;
   const stageMetrics = stage?.metrics;
+  const stageResult = stage?.result;
+  const trainStageStatus =
+    currentStage === "train" &&
+    stage?.status === "running" &&
+    (stageMetrics?.merge_status === "running" ||
+      stageMetrics?.sub_stage === "merge" ||
+      stageMetrics?.lifecycleStatus === "exporting" ||
+      stageMetrics?.lifecycle_status === "exporting")
+      ? "exporting"
+      : stage?.status || protocol.status;
   const wandbUrl =
     typeof stageMetrics?.wandb_url === "string" && stageMetrics.wandb_url.trim()
       ? stageMetrics.wandb_url.trim()
@@ -1249,13 +1461,16 @@ const workflowSummaryFromProtocol = (
   const progressPercent = normalizePercent(
     stage?.progress_percent ??
       stage?.progressPercent ??
+      stageMetrics?.overall_progress_percent ??
       protocol.progress_percent ??
       protocol.progressPercent,
   );
   const stageStatuses = Object.fromEntries(
     Object.entries(protocol.stages || {}).map(([name, value]) => [
       name,
-      value.status || "pending",
+      name === currentStage && name === "train"
+        ? trainStageStatus || "pending"
+        : value.status || "pending",
     ]),
   );
   const workflowLogs = Object.fromEntries(
@@ -1313,10 +1528,17 @@ const workflowSummaryFromProtocol = (
     workflowUpdatedAt: protocol.workflowUpdatedAt,
     workflowDbPath: protocol.workflowDbPath,
     currentStage,
-    currentStageStatus: stage?.status || protocol.status,
+    currentStageStatus: trainStageStatus,
     currentStageMessage: stage?.message || protocol.message,
     datasetRef: protocol.datasetRef,
     evaluationDatasetName: protocol.evaluationDatasetName,
+    evaluationScope:
+      protocol.evaluationScope || stageMetrics?.evaluation_scope,
+    evalDatasets: protocol.evalDatasets || stageMetrics?.eval_datasets,
+    runId: protocol.runId || stageMetrics?.run_id,
+    reportPath: protocol.reportPath || stageMetrics?.report_path,
+    scores: protocol.scores || stageMetrics?.scores,
+    scoreDeltas: protocol.scoreDeltas || stageMetrics?.score_deltas,
     container:
       stage?.container ||
       stage?.container_name ||
@@ -1359,6 +1581,16 @@ const workflowSummaryFromProtocol = (
     wandbUrl,
     stageStatuses,
     workflowLogs,
+    etaStatus: normalizeBenchmarkEtaStatus(
+      stageResult?.eta_status ?? stageResult?.etaStatus,
+    ),
+    estimatedRemainingSeconds: normalizeNonNegativeNumber(
+      stageResult?.estimated_remaining_seconds ??
+        stageResult?.estimatedRemainingSeconds,
+    ),
+    etaCalculatedAt: normalizeNonNegativeNumber(
+      stageResult?.eta_calculated_at ?? stageResult?.etaCalculatedAt,
+    ),
   };
 };
 
@@ -1368,6 +1600,7 @@ const WORKFLOW_STAGE_STATUS_RANK: Record<string, number> = {
   starting_external: 2,
   starting: 2,
   running: 3,
+  exporting: 3,
   timeout: 3,
   stopping: 4,
   finished: 5,
@@ -1423,7 +1656,8 @@ const mergeWorkflowTaskSummary = (
     if (
       !incomingStatus ||
       (WORKFLOW_STAGE_STATUS_RANK[incomingStatus] ?? 0) <
-        (WORKFLOW_STAGE_STATUS_RANK[status] ?? 0)
+        (WORKFLOW_STAGE_STATUS_RANK[status] ?? 0) ||
+      (status === "exporting" && incomingStatus === "running")
     ) {
       stageStatuses[stage] = status;
     }
@@ -1445,7 +1679,10 @@ const mergeWorkflowTaskSummary = (
     WORKFLOW_STAGE_STATUS_RANK[current.currentStageStatus || ""] ?? 0;
   const incomingStatusRank =
     WORKFLOW_STAGE_STATUS_RANK[incoming.currentStageStatus || ""] ?? 0;
-  const stageRegressed = incomingStatusRank < currentStatusRank;
+  const stageRegressed =
+    incomingStatusRank < currentStatusRank ||
+    (current.currentStageStatus === "exporting" &&
+      incoming.currentStageStatus === "running");
   if (stageRegressed) {
     if (hasNewTaskIdentity) {
       return { ...current, ...incoming, stageStatuses, workflowLogs };
@@ -1473,6 +1710,138 @@ const mergeWorkflowTaskSummary = (
   };
 };
 
+const assessmentIdentityFromScript = (
+  script?: string,
+): Pick<
+  AssessmentTaskSummary,
+  "assessmentType" | "assessmentTypeText" | "evalType" | "evalTypeText" | "evaluationScope"
+> => {
+  const normalized = (script || "").trim().toLowerCase();
+  const scriptName = normalized
+    .split(/[\\/]/)
+    .pop()
+    ?.replace(/\.py$/, "");
+  const identities: Array<{
+    scripts: string[];
+    type: string;
+    text: string;
+    scope: string;
+  }> = [
+    {
+      scripts: ["single_model_evaluation_vpn"],
+      type: "single_model",
+      text: "内置医疗单模型评估",
+      scope: "legacyMedical",
+    },
+    {
+      scripts: ["compare_between_models_vpn"],
+      type: "compare_between_models",
+      text: "内置医疗双模型评估",
+      scope: "legacyMedical",
+    },
+    {
+      scripts: ["ckpt_eval"],
+      type: "ckpt",
+      text: "内置医疗 Checkpoint 评估",
+      scope: "legacyMedical",
+    },
+    {
+      scripts: ["generic_single_model_eval"],
+      type: "single_model",
+      text: "LLaMA-Factory 通用单模型评测",
+      scope: "llamafactoryBuiltin",
+    },
+    {
+      scripts: ["generic_compare_models_eval"],
+      type: "compare_between_models",
+      text: "LLaMA-Factory 通用双模型评测",
+      scope: "llamafactoryBuiltin",
+    },
+    {
+      scripts: ["generic_ckpt_eval"],
+      type: "ckpt",
+      text: "LLaMA-Factory 通用 Checkpoint 评测",
+      scope: "llamafactoryBuiltin",
+    },
+  ];
+  const identity = identities.find(({ scripts }) =>
+    scripts.includes(scriptName || ""),
+  );
+  if (!identity) {
+    return {};
+  }
+  return {
+    assessmentType: identity.type,
+    assessmentTypeText: identity.text,
+    evalType: identity.type,
+    evalTypeText: identity.text,
+    evaluationScope: identity.scope,
+  };
+};
+
+const enrichAssessmentTaskSummary = (
+  summary: AssessmentTaskSummary,
+): AssessmentTaskSummary => {
+  const inferred = assessmentIdentityFromScript(summary.script);
+  const assessmentType =
+    summary.assessmentType || summary.evalType || inferred.assessmentType;
+  const assessmentTypeText =
+    summary.assessmentTypeText ||
+    summary.evalTypeText ||
+    inferred.assessmentTypeText;
+  return {
+    ...inferred,
+    ...summary,
+    assessmentType,
+    assessmentTypeText,
+    evalType: summary.evalType || assessmentType || inferred.evalType,
+    evalTypeText:
+      summary.evalTypeText || assessmentTypeText || inferred.evalTypeText,
+    evaluationScope: summary.evaluationScope || inferred.evaluationScope,
+  };
+};
+
+const isSameAssessmentTask = (
+  newer: AssessmentTaskSummary,
+  older: AssessmentTaskSummary,
+): boolean => {
+  if (newer.runId && older.runId) {
+    return newer.runId === older.runId;
+  }
+  if (newer.pid && older.pid) {
+    return (
+      newer.pid === older.pid &&
+      (!newer.container ||
+        !older.container ||
+        newer.container === older.container)
+    );
+  }
+  return false;
+};
+
+const mergeAssessmentTaskSummary = (
+  newer: AssessmentTaskSummary,
+  older: AssessmentTaskSummary,
+): AssessmentTaskSummary =>
+  enrichAssessmentTaskSummary({
+    container: newer.container || older.container,
+    pid: newer.pid || older.pid,
+    script: newer.script || older.script,
+    assessmentType: newer.assessmentType || older.assessmentType,
+    assessmentTypeText:
+      newer.assessmentTypeText || older.assessmentTypeText,
+    evalType: newer.evalType || older.evalType,
+    evalTypeText: newer.evalTypeText || older.evalTypeText,
+    evaluationScope: newer.evaluationScope || older.evaluationScope,
+    evalDatasets:
+      newer.evalDatasets?.length ? newer.evalDatasets : older.evalDatasets,
+    runId: newer.runId || older.runId,
+    reportPath: newer.reportPath || older.reportPath,
+    status: newer.status || older.status,
+    scores: newer.scores ?? older.scores,
+    scoreDeltas: newer.scoreDeltas ?? older.scoreDeltas,
+  });
+
 const assessmentSummaryFromProtocol = (
   protocol: TrainingJobProtocol | null,
 ): AssessmentTaskSummary | null => {
@@ -1484,21 +1853,32 @@ const assessmentSummaryFromProtocol = (
     return null;
   }
 
+  if (isAssessmentTerminalProtocol(protocol)) {
+    return null;
+  }
+
   const pid = protocol.pid === undefined ? undefined : String(protocol.pid);
   const container = protocol.container || protocol.container_name;
   if (!container && !pid) {
     return null;
   }
 
-  return {
+  return enrichAssessmentTaskSummary({
     container,
     pid,
-    script: protocol.script,
+    script: protocol.script || protocol.scriptName,
     assessmentType: protocol.assessmentType || protocol.evalType,
     assessmentTypeText: protocol.assessmentTypeText || protocol.evalTypeText,
     evalType: protocol.evalType,
     evalTypeText: protocol.evalTypeText,
-  };
+    evaluationScope: protocol.evaluationScope,
+    evalDatasets: protocol.evalDatasets,
+    runId: protocol.runId,
+    reportPath: protocol.reportPath,
+    status: protocol.status,
+    scores: protocol.scores,
+    scoreDeltas: protocol.scoreDeltas,
+  });
 };
 
 const extractMarkdownValue = (
@@ -1608,6 +1988,15 @@ const benchmarkSummaryFromProtocol = (
     model: protocol.model || messageSummary?.model,
     dataset: protocol.dataset || messageSummary?.dataset,
     status: protocol.status || messageSummary?.status,
+    etaStatus:
+      normalizeBenchmarkEtaStatus(protocol.etaStatus) ||
+      messageSummary?.etaStatus,
+    estimatedRemainingSeconds:
+      normalizeNonNegativeNumber(protocol.estimatedRemainingSeconds) ??
+      messageSummary?.estimatedRemainingSeconds,
+    etaCalculatedAt:
+      normalizeNonNegativeNumber(protocol.etaCalculatedAt) ??
+      messageSummary?.etaCalculatedAt,
   };
 };
 
@@ -1875,13 +2264,13 @@ const parseAssessmentTaskSummary = (
     return null;
   }
 
-  return {
+  return enrichAssessmentTaskSummary({
     container,
     pid,
     script,
     assessmentTypeText,
     evalTypeText: assessmentTypeText,
-  };
+  });
 };
 
 const parseInferenceTaskSummary = (
@@ -1896,7 +2285,7 @@ const parseInferenceTaskSummaryFromText = (
   const hasInferenceConfig =
     /当前推理(?:服务)?(?:的)?配置(?:文件|信息)?如下/.test(sourceText) ||
     (sourceText.includes("推理配置") &&
-      /(?:MODEL_NAME|VLLM_OPENAI_PORT|INFERENCE_PORT)/.test(sourceText));
+      /(?:MODEL_NAME|VLLM_OPENAI_PORT)/.test(sourceText));
   const hasInferenceStatus =
     /当前推理(?:服务)?状态如下/.test(sourceText) ||
     (sourceText.includes("推理服务") && sourceText.includes("服务状态")) ||
@@ -1913,12 +2302,6 @@ const parseInferenceTaskSummaryFromText = (
   const hostIp =
     extractMarkdownValue(sourceText, "HOST_IP") ||
     extractMarkdownValue(sourceText, "主机IP地址");
-  const inferencePort =
-    extractMarkdownValue(sourceText, "INFERENCE_PORT") ||
-    sourceText.match(
-      /推理服务端口\s*[（(]\s*INFERENCE_PORT\s*[）)]\s*[：:]\s*(\d+)/,
-    )?.[1] ||
-    sourceText.match(/推理服务端口\s*[：:]\s*(\d+)/)?.[1];
   const vllmPort =
     extractMarkdownValue(sourceText, "VLLM_OPENAI_PORT") ||
     sourceText.match(/VLLM(?:_|\s*)OpenAI\s*服务端口\s*[：:]\s*(\d+)/i)?.[1];
@@ -1943,7 +2326,6 @@ const parseInferenceTaskSummaryFromText = (
   return {
     modelName,
     hostIp,
-    inferencePort,
     vllmPort,
     hasConfig: hasInferenceConfig,
     hasStatus: hasInferenceStatus,
@@ -2104,10 +2486,6 @@ const inferenceSummaryFromProtocol = (
     return {
       modelName: env?.MODEL_NAME || messageSummary?.modelName,
       hostIp: env?.HOST_IP || messageSummary?.hostIp,
-      inferencePort:
-        ports?.INFERENCE_PORT === undefined
-          ? messageSummary?.inferencePort
-          : String(ports.INFERENCE_PORT),
       vllmPort:
         ports?.VLLM_OPENAI_PORT === undefined
           ? messageSummary?.vllmPort
@@ -2155,10 +2533,6 @@ const inferenceSummaryFromProtocol = (
     return {
       modelName: env?.MODEL_NAME || messageSummary?.modelName,
       hostIp: env?.HOST_IP || messageSummary?.hostIp,
-      inferencePort:
-        ports?.INFERENCE_PORT === undefined
-          ? messageSummary?.inferencePort
-          : String(ports.INFERENCE_PORT),
       vllmPort:
         ports?.VLLM_OPENAI_PORT === undefined
           ? messageSummary?.vllmPort
@@ -2179,7 +2553,6 @@ const mergeInferenceTaskSummary = (
   sourceKey: current?.sourceKey || next.sourceKey,
   modelName: current?.modelName || next.modelName,
   hostIp: current?.hostIp || next.hostIp,
-  inferencePort: current?.inferencePort || next.inferencePort,
   vllmPort: current?.vllmPort || next.vllmPort,
   hasConfig: Boolean(current?.hasConfig || next.hasConfig),
   hasStatus: Boolean(current?.hasStatus || next.hasStatus),
@@ -2337,16 +2710,16 @@ const isTrainingTaskStopped = (text: string): boolean => {
 
 const isAssessmentTaskStopped = (text: string): boolean => {
   const protocol = extractProtocolFromText(text);
-  if (
-    protocol?.type === "job_stopped" &&
-    ["assessment", "evaluate"].includes(protocol.jobType || "")
-  ) {
+  if (isAssessmentTerminalProtocol(protocol)) {
     return true;
   }
 
   return (
-    /(?:停止|结束).{0,12}评(?:估|测)/.test(text) &&
-    /(?:已完成清理|未发现残留进程|已结束)/.test(text)
+    (/(?:停止|结束).{0,12}评(?:估|测)/.test(text) &&
+      /(?:已完成清理|未发现残留进程|已结束)/.test(text)) ||
+    /当前评(?:估|测)任务.{0,100}状态为\s*[:：]?\s*\*{0,2}(?:interrupted|stopped|finished|completed|failed|error|中断|已停止|停止|已完成|完成|失败)/i.test(
+      text,
+    )
   );
 };
 
@@ -2479,7 +2852,6 @@ const resolveTrainableDatasetDir = (
 const buildOneClickWorkflowCommand = (
   dataset: DatasetInfo | string,
   evaluationName?: string,
-  trainTypeOverride?: DatasetTrainingType,
 ) => {
   const datasetName = typeof dataset === "string" ? dataset : dataset.name;
   const datasetType =
@@ -2492,12 +2864,13 @@ const buildOneClickWorkflowCommand = (
         ? resolveTrainableDatasetDir(dataset, config)
         : dataset.path?.trim();
   const trainingHint = config
-    ? `，训练类型=${trainTypeOverride || config.trainType}，数据类型=${config.label}${datasetDir ? `，dataset_dir=${datasetDir}` : ""}`
+    ? `，训练类型=${config.trainType}，数据类型=${config.label}${datasetDir ? `，dataset_dir=${datasetDir}` : ""}`
     : "";
   const baseCommand = `我想用${datasetName}这个数据一键训练、部署并评测模型${trainingHint}`;
-  return evaluationName
+  const commandWithBenchmark = evaluationName
     ? `${baseCommand}，评测集使用${evaluationName}`
     : baseCommand;
+  return `${commandWithBenchmark}，evaluation_scope=general，eval_datasets=ceval,cmmlu`;
 };
 
 const buildDatasetTrainingCommand = (
@@ -3262,6 +3635,7 @@ const RunContentPage = ({
         .replace(/[\s_-]+/g, "");
       const typeKeyMap: Record<string, string> = {
         lora: "loraBatchTraining",
+        lorasft: "loraBatchTraining",
         sft: "loraBatchTraining",
         lora批量训练: "loraBatchTraining",
         多机lora批量训练: "multinodeLoraBatchTraining",
@@ -3274,6 +3648,8 @@ const RunContentPage = ({
         multinodelorabatchtrain: "multinodeLoraBatchTraining",
         multinodelorabatchtraining: "multinodeLoraBatchTraining",
         full: "fullParamBatchTraining",
+        fullsft: "fullParamBatchTraining",
+        multinodefullsft: "multinodeFullParamBatchTraining",
         全参批量训练: "fullParamBatchTraining",
         fullparambatchtrain: "fullParamBatchTraining",
         fullparambatchtraining: "fullParamBatchTraining",
@@ -3307,6 +3683,9 @@ const RunContentPage = ({
         grpo训练: "grpoTraining",
         grpotrain: "grpoTraining",
         grpotraining: "grpoTraining",
+        scheduled: "scheduledTraining",
+        schedule: "scheduledTraining",
+        定时训练: "scheduledTraining",
         单模型评估: "singleModelEvaluation",
         singlemodel: "singleModelEvaluation",
         singlemodelevaluation: "singleModelEvaluation",
@@ -3333,12 +3712,96 @@ const RunContentPage = ({
       if (isMultinodeTraining && typeKey === "loraBatchTraining") {
         typeKey = "multinodeLoraBatchTraining";
       }
+      if (isMultinodeTraining && typeKey === "fullParamBatchTraining") {
+        typeKey = "multinodeFullParamBatchTraining";
+      }
       if (isMultinodeTraining && typeKey === "enhancedTraining") {
         typeKey = "multinodeEnhancedTraining";
       }
 
       return t(`runpage.statusBar.typeValues.${typeKey}`, {
         defaultValue: value,
+      });
+    },
+    [t],
+  );
+
+  const translateAssessmentTypeValue = useCallback(
+    (
+      assessmentType?: string,
+      evalType?: string,
+      evaluationScope?: string,
+      fallbackText?: string,
+    ): string => {
+      const rawType = assessmentType || evalType || fallbackText || "";
+      if (!rawType) {
+        return "";
+      }
+
+      const normalizedType = rawType
+        .trim()
+        .toLowerCase()
+        .replace(/[\s_-]+/g, "");
+      const normalizedFallback = (fallbackText || "")
+        .trim()
+        .toLowerCase()
+        .replace(/[\s_-]+/g, "");
+      const typeKeyMap: Record<string, string> = {
+        singlemodel: "singleModelEvaluation",
+        singlemodelevaluation: "singleModelEvaluation",
+        singlemodelassessment: "singleModelEvaluation",
+        单模型评估: "singleModelEvaluation",
+        单模型评测: "singleModelEvaluation",
+        llamafactory通用单模型评测: "singleModelEvaluation",
+        comparebetweenmodels: "dualModelEvaluation",
+        comparemodels: "dualModelEvaluation",
+        dualmodel: "dualModelEvaluation",
+        dualmodelevaluation: "dualModelEvaluation",
+        dualmodelassessment: "dualModelEvaluation",
+        双模型评估: "dualModelEvaluation",
+        双模型评测: "dualModelEvaluation",
+        双模型对比评测: "dualModelEvaluation",
+        llamafactory通用双模型评测: "dualModelEvaluation",
+        ckpt: "checkpointEvaluation",
+        ckpteval: "checkpointEvaluation",
+        ckptevaluation: "checkpointEvaluation",
+        checkpoint: "checkpointEvaluation",
+        checkpointevaluation: "checkpointEvaluation",
+        checkpointassessment: "checkpointEvaluation",
+        ckpt评估: "checkpointEvaluation",
+        ckpt评测: "checkpointEvaluation",
+        checkpoint评估: "checkpointEvaluation",
+        checkpoint评测: "checkpointEvaluation",
+        llamafactory通用checkpoint评测: "checkpointEvaluation",
+      };
+      const baseTypeKey =
+        typeKeyMap[normalizedType] || typeKeyMap[normalizedFallback];
+      if (!baseTypeKey) {
+        return fallbackText || rawType;
+      }
+
+      const normalizedScope = (evaluationScope || "")
+        .trim()
+        .toLowerCase()
+        .replace(/[\s_-]+/g, "");
+      const isGeneral =
+        ["general", "llamafactorybuiltin"].includes(normalizedScope) ||
+        normalizedFallback.includes("通用") ||
+        normalizedFallback.includes("general");
+      const isMedical =
+        ["medical", "legacymedical"].includes(normalizedScope) ||
+        normalizedFallback.includes("医疗") ||
+        normalizedFallback.includes("medical");
+      const scopedTypeKey = isGeneral
+        ? `general${baseTypeKey[0].toUpperCase()}${baseTypeKey.slice(1)}`
+        : isMedical
+          ? `medical${baseTypeKey[0].toUpperCase()}${baseTypeKey.slice(1)}`
+          : baseTypeKey;
+
+      return t(`runpage.statusBar.typeValues.${scopedTypeKey}`, {
+        defaultValue: t(`runpage.statusBar.typeValues.${baseTypeKey}`, {
+          defaultValue: fallbackText || rawType,
+        }),
       });
     },
     [t],
@@ -5385,6 +5848,8 @@ const RunContentPage = ({
   ]);
 
   const latestAssessmentTask = useMemo(() => {
+    let mergedSummary: AssessmentTaskSummary | null = null;
+
     for (
       let replyIndex = statusBarReplies.length - 1;
       replyIndex >= 0;
@@ -5405,36 +5870,69 @@ const RunContentPage = ({
           messageItem.metadata,
         );
         if (isWorkflowProtocol(metadataProtocol)) {
-          return null;
+          return mergedSummary;
         }
-        if (
-          metadataProtocol?.type === "job_stopped" &&
-          ["assessment", "evaluate"].includes(metadataProtocol.jobType || "")
-        ) {
-          return null;
+        if (isAssessmentTerminalProtocol(metadataProtocol)) {
+          return mergedSummary;
         }
 
         const metadataSummary = assessmentSummaryFromProtocol(metadataProtocol);
         if (metadataSummary) {
-          return metadataSummary;
+          if (
+            mergedSummary &&
+            !isSameAssessmentTask(mergedSummary, metadataSummary)
+          ) {
+            return mergedSummary;
+          }
+          mergedSummary = mergedSummary
+            ? mergeAssessmentTaskSummary(mergedSummary, metadataSummary)
+            : metadataSummary;
+          if (metadataProtocol?.type === "job_started") {
+            return mergedSummary;
+          }
+          continue;
         }
 
         const messageText = extractTextFromContent(messageItem.content);
-        if (isWorkflowProtocol(extractProtocolFromText(messageText))) {
-          return null;
+        const textProtocol = extractProtocolFromText(messageText);
+        if (isWorkflowProtocol(textProtocol)) {
+          return mergedSummary;
         }
         if (isAssessmentTaskStopped(messageText)) {
-          return null;
+          return mergedSummary;
+        }
+
+        const protocolSummary = assessmentSummaryFromProtocol(textProtocol);
+        if (protocolSummary) {
+          if (
+            mergedSummary &&
+            !isSameAssessmentTask(mergedSummary, protocolSummary)
+          ) {
+            return mergedSummary;
+          }
+          mergedSummary = mergedSummary
+            ? mergeAssessmentTaskSummary(mergedSummary, protocolSummary)
+            : protocolSummary;
+          if (textProtocol?.type === "job_started") {
+            return mergedSummary;
+          }
+          continue;
         }
 
         const summary = parseAssessmentTaskSummary(messageText);
         if (summary) {
-          return summary;
+          if (mergedSummary && !isSameAssessmentTask(mergedSummary, summary)) {
+            return mergedSummary;
+          }
+          mergedSummary = mergedSummary
+            ? mergeAssessmentTaskSummary(mergedSummary, summary)
+            : summary;
+          return mergedSummary;
         }
       }
     }
 
-    return null;
+    return mergedSummary;
   }, [statusBarReplies]);
 
   const latestBenchmarkTask = useMemo(() => {
@@ -5543,6 +6041,66 @@ const RunContentPage = ({
   const displayedBenchmarkTask =
     latestBenchmarkTask ||
     (pendingBenchmarkStop ? benchmarkTaskSnapshot : null);
+  const standaloneBenchmarkEta = useBenchmarkEtaCountdown(
+    displayedBenchmarkTask,
+    Boolean(
+      displayedBenchmarkTask &&
+        isActiveBenchmarkStatus(displayedBenchmarkTask.status),
+    ),
+  );
+  const workflowBenchmarkEta = useBenchmarkEtaCountdown(
+    displayedWorkflowTask,
+    Boolean(
+      displayedWorkflowTask?.currentStage === "benchmark" &&
+        !isWorkflowDismissStatus(displayedWorkflowTask.workflowStatus) &&
+        isActiveBenchmarkStatus(displayedWorkflowTask.currentStageStatus),
+    ),
+  );
+  const formatBenchmarkEta = useCallback(
+    (eta: BenchmarkEtaCountdown | null): string | null => {
+      if (!eta) {
+        return null;
+      }
+      if (eta.status === "calculating") {
+        return t("runpage.statusBar.benchmarkEtaCalculating");
+      }
+      if (eta.status === "unavailable") {
+        return t("runpage.statusBar.benchmarkEtaUnavailable");
+      }
+
+      const seconds = Math.max(0, eta.remainingSeconds || 0);
+      if (seconds < 60) {
+        return t("runpage.statusBar.benchmarkEtaLessThanMinute");
+      }
+      const minutes = Math.floor(seconds / 60);
+      if (minutes < 60) {
+        return t("runpage.statusBar.benchmarkEtaMinutes", { count: minutes });
+      }
+      const hours = Math.floor(minutes / 60);
+      const remainingMinutes = minutes % 60;
+      if (hours < 24) {
+        return remainingMinutes
+          ? t("runpage.statusBar.benchmarkEtaHoursMinutes", {
+              hours,
+              minutes: remainingMinutes,
+            })
+          : t("runpage.statusBar.benchmarkEtaHours", { count: hours });
+      }
+      const days = Math.floor(hours / 24);
+      const remainingHours = hours % 24;
+      return remainingHours
+        ? t("runpage.statusBar.benchmarkEtaDaysHours", {
+            days,
+            hours: remainingHours,
+          })
+        : t("runpage.statusBar.benchmarkEtaDays", { count: days });
+    },
+    [t],
+  );
+  const standaloneBenchmarkEtaText = formatBenchmarkEta(
+    standaloneBenchmarkEta,
+  );
+  const workflowBenchmarkEtaText = formatBenchmarkEta(workflowBenchmarkEta);
 
   const latestInferenceTask = useMemo(() => {
     let mergedSummary: InferenceTaskSummary | null = null;
@@ -5652,8 +6210,17 @@ const RunContentPage = ({
         displayedWorkflowTask.currentStageStatus || "",
         displayedWorkflowTask.currentStageMessage || "",
         displayedWorkflowTask.evaluationDatasetName || "",
+        displayedWorkflowTask.evaluationScope || "",
+        (displayedWorkflowTask.evalDatasets || []).join(","),
+        displayedWorkflowTask.runId || "",
+        displayedWorkflowTask.reportPath || "",
+        JSON.stringify(displayedWorkflowTask.scores || {}),
+        JSON.stringify(displayedWorkflowTask.scoreDeltas || {}),
         displayedWorkflowTask.modelPath || "",
         displayedWorkflowTask.progressPercent ?? "",
+        displayedWorkflowTask.etaStatus || "",
+        displayedWorkflowTask.estimatedRemainingSeconds ?? "",
+        displayedWorkflowTask.etaCalculatedAt ?? "",
         displayedWorkflowTask.container || "",
         displayedWorkflowTask.pid || "",
         ...WORKFLOW_STAGE_NAMES.map(
@@ -5681,6 +6248,9 @@ const RunContentPage = ({
         displayedBenchmarkTask.dataset || "",
         displayedBenchmarkTask.status || "",
         displayedBenchmarkTask.resultPath || "",
+        displayedBenchmarkTask.etaStatus || "",
+        displayedBenchmarkTask.estimatedRemainingSeconds ?? "",
+        displayedBenchmarkTask.etaCalculatedAt ?? "",
       ].join("|")
     : "";
   const inferenceStatusKey = latestInferenceTask
@@ -5689,7 +6259,6 @@ const RunContentPage = ({
         latestInferenceTask.hasConfig ? "config" : "",
         latestInferenceTask.hasStatus ? "status" : "",
         latestInferenceTask.modelName || "",
-        latestInferenceTask.inferencePort || "",
         latestInferenceTask.vllmPort || "",
       ].join("|")
     : "";
@@ -6444,6 +7013,14 @@ const RunContentPage = ({
                               {displayedWorkflowTask.progressPercent}%
                             </span>
                           )}
+                          {workflowBenchmarkEtaText && (
+                            <span className="inline-flex items-center gap-1 rounded-md bg-white/42 px-2 py-0.5 ring-1 ring-violet-100/70 dark:bg-violet-950/20 dark:ring-violet-300/12">
+                              <Clock className="h-3 w-3" />
+                              {t("runpage.statusBar.benchmarkEta")}
+                              {t("runpage.statusBar.labelSeparator")}
+                              {workflowBenchmarkEtaText}
+                            </span>
+                          )}
                           {displayedWorkflowTask.datasetRef && (
                             <span className="rounded-md bg-white/42 px-2 py-0.5 ring-1 ring-violet-100/70 dark:bg-violet-950/20 dark:ring-violet-300/12">
                               {t("runpage.statusBar.datasetRef")}
@@ -6453,11 +7030,25 @@ const RunContentPage = ({
                           )}
                           {displayedWorkflowTask.evaluationDatasetName && (
                             <span className="rounded-md bg-white/42 px-2 py-0.5 ring-1 ring-violet-100/70 dark:bg-violet-950/20 dark:ring-violet-300/12">
-                              {t("runpage.statusBar.evaluationDataset")}
+                              {t("runpage.statusBar.workflowBenchmarkDataset")}
                               {t("runpage.statusBar.labelSeparator")}
                               {displayedWorkflowTask.evaluationDatasetName}
                             </span>
                           )}
+                          {displayedWorkflowTask.evaluationScope && (
+                            <span className="rounded-md bg-white/42 px-2 py-0.5 ring-1 ring-violet-100/70 dark:bg-violet-950/20 dark:ring-violet-300/12">
+                              {t("runpage.statusBar.workflowModelEvaluationScope")}
+                              {t("runpage.statusBar.labelSeparator")}
+                              {displayedWorkflowTask.evaluationScope}
+                            </span>
+                          )}
+                          {displayedWorkflowTask.evalDatasets?.length ? (
+                            <span className="rounded-md bg-white/42 px-2 py-0.5 ring-1 ring-violet-100/70 dark:bg-violet-950/20 dark:ring-violet-300/12">
+                              {t("runpage.statusBar.workflowModelEvaluationDatasets")}
+                              {t("runpage.statusBar.labelSeparator")}
+                              {displayedWorkflowTask.evalDatasets.join(", ")}
+                            </span>
+                          ) : null}
                           <button
                             type="button"
                             className="inline-flex items-center gap-0.5 px-1 text-[11px] font-semibold text-violet-600 transition hover:text-violet-900 dark:text-violet-200 dark:hover:text-violet-50"
@@ -6496,6 +7087,34 @@ const RunContentPage = ({
                                 {t("runpage.statusBar.pid")}
                                 {t("runpage.statusBar.labelSeparator")}
                                 {displayedWorkflowTask.pid}
+                              </span>
+                            )}
+                            {displayedWorkflowTask.runId && (
+                              <span className="rounded-md bg-white/36 px-2 py-0.5 ring-1 ring-violet-100/60 dark:bg-violet-950/18 dark:ring-violet-300/10">
+                                {t("runpage.statusBar.runId")}
+                                {t("runpage.statusBar.labelSeparator")}
+                                {displayedWorkflowTask.runId}
+                              </span>
+                            )}
+                            {displayedWorkflowTask.reportPath && (
+                              <span className="max-w-full truncate rounded-md bg-white/36 px-2 py-0.5 ring-1 ring-violet-100/60 dark:bg-violet-950/18 dark:ring-violet-300/10" title={displayedWorkflowTask.reportPath}>
+                                {t("runpage.statusBar.reportPath")}
+                                {t("runpage.statusBar.labelSeparator")}
+                                {displayedWorkflowTask.reportPath}
+                              </span>
+                            )}
+                            {displayedWorkflowTask.scores && Object.keys(displayedWorkflowTask.scores).length > 0 && (
+                              <span className="max-w-full truncate rounded-md bg-white/36 px-2 py-0.5 ring-1 ring-violet-100/60 dark:bg-violet-950/18 dark:ring-violet-300/10" title={JSON.stringify(displayedWorkflowTask.scores)}>
+                                {t("runpage.statusBar.scores")}
+                                {t("runpage.statusBar.labelSeparator")}
+                                {JSON.stringify(displayedWorkflowTask.scores)}
+                              </span>
+                            )}
+                            {displayedWorkflowTask.scoreDeltas && Object.keys(displayedWorkflowTask.scoreDeltas).length > 0 && (
+                              <span className="max-w-full truncate rounded-md bg-white/36 px-2 py-0.5 ring-1 ring-violet-100/60 dark:bg-violet-950/18 dark:ring-violet-300/10" title={JSON.stringify(displayedWorkflowTask.scoreDeltas)}>
+                                {t("runpage.statusBar.scoreDeltas")}
+                                {t("runpage.statusBar.labelSeparator")}
+                                {JSON.stringify(displayedWorkflowTask.scoreDeltas)}
                               </span>
                             )}
                             {Object.values(
@@ -6582,6 +7201,7 @@ const RunContentPage = ({
                                   : status === "timeout"
                                     ? "border-amber-200 bg-amber-50/90 text-amber-800 dark:border-amber-300/25 dark:bg-amber-950/32 dark:text-amber-100"
                                   : status === "running" ||
+                                      status === "exporting" ||
                                       status.startsWith("starting")
                                     ? "border-violet-200 bg-violet-100/86 text-violet-800 dark:border-violet-300/20 dark:bg-violet-900/38 dark:text-violet-100"
                                     : "border-slate-200 bg-white/58 text-slate-500 dark:border-white/10 dark:bg-slate-900/24 dark:text-slate-400";
@@ -6704,13 +7324,35 @@ const RunContentPage = ({
                             {displayedWorkflowTask.progressPercent}%
                           </span>
                         )}
+                        {workflowBenchmarkEtaText && (
+                          <span className="inline-flex items-center gap-1 rounded-md bg-white/70 px-2 py-0.5 ring-1 ring-violet-100/80 dark:bg-violet-950/40 dark:ring-violet-300/12">
+                            <Clock className="h-3 w-3" />
+                            {t("runpage.statusBar.benchmarkEta")}
+                            {t("runpage.statusBar.labelSeparator")}
+                            {workflowBenchmarkEtaText}
+                          </span>
+                        )}
                         {displayedWorkflowTask.evaluationDatasetName && (
                           <span className="rounded-md bg-white/70 px-2 py-0.5 ring-1 ring-violet-100/80 dark:bg-violet-950/40 dark:ring-violet-300/12">
-                            {t("runpage.statusBar.evaluationDataset")}
+                            {t("runpage.statusBar.workflowBenchmarkDataset")}
                             {t("runpage.statusBar.labelSeparator")}
                             {displayedWorkflowTask.evaluationDatasetName}
                           </span>
                         )}
+                        {displayedWorkflowTask.evaluationScope && (
+                          <span className="rounded-md bg-white/70 px-2 py-0.5 ring-1 ring-violet-100/80 dark:bg-violet-950/40 dark:ring-violet-300/12">
+                            {t("runpage.statusBar.workflowModelEvaluationScope")}
+                            {t("runpage.statusBar.labelSeparator")}
+                            {displayedWorkflowTask.evaluationScope}
+                          </span>
+                        )}
+                        {displayedWorkflowTask.evalDatasets?.length ? (
+                          <span className="rounded-md bg-white/70 px-2 py-0.5 ring-1 ring-violet-100/80 dark:bg-violet-950/40 dark:ring-violet-300/12">
+                            {t("runpage.statusBar.workflowModelEvaluationDatasets")}
+                            {t("runpage.statusBar.labelSeparator")}
+                            {displayedWorkflowTask.evalDatasets.join(", ")}
+                          </span>
+                        ) : null}
                         <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-200/80 bg-emerald-50/88 px-2 py-0.5 text-[10px] font-semibold text-emerald-700 dark:border-emerald-400/20 dark:bg-emerald-950/30 dark:text-emerald-200">
                           <span
                             className={`h-1.5 w-1.5 rounded-full bg-emerald-500 ${workflowMonitorState.isPolling ? "animate-pulse" : ""}`}
@@ -6967,11 +7609,29 @@ const RunContentPage = ({
                             <span className="rounded-md bg-white/42 px-2 py-0.5 ring-1 ring-indigo-100/70 dark:bg-indigo-950/20 dark:ring-indigo-300/12">
                               {t("runpage.statusBar.evaluationType")}
                               {t("runpage.statusBar.labelSeparator")}
-                              {translateStatusBarTypeValue(
+                              {translateAssessmentTypeValue(
+                                latestAssessmentTask.assessmentType,
+                                latestAssessmentTask.evalType,
+                                latestAssessmentTask.evaluationScope,
                                 latestAssessmentTask.assessmentTypeText ||
-                                  latestAssessmentTask.assessmentType ||
-                                  latestAssessmentTask.evalTypeText ||
-                                  latestAssessmentTask.evalType,
+                                  latestAssessmentTask.evalTypeText,
+                              )}
+                            </span>
+                          )}
+                          {latestAssessmentTask.evalDatasets?.length ? (
+                            <span className="rounded-md bg-white/42 px-2 py-0.5 ring-1 ring-indigo-100/70 dark:bg-indigo-950/20 dark:ring-indigo-300/12">
+                              {t("runpage.statusBar.evaluationDatasets")}
+                              {t("runpage.statusBar.labelSeparator")}
+                              {latestAssessmentTask.evalDatasets.join(", ")}
+                            </span>
+                          ) : null}
+                          {latestAssessmentTask.status && (
+                            <span className="rounded-md bg-white/42 px-2 py-0.5 ring-1 ring-indigo-100/70 dark:bg-indigo-950/20 dark:ring-indigo-300/12">
+                              {t("runpage.statusBar.status")}
+                              {t("runpage.statusBar.labelSeparator")}
+                              {t(
+                                `runpage.statusBar.evaluationStatuses.${latestAssessmentTask.status.toLowerCase()}`,
+                                { defaultValue: latestAssessmentTask.status },
                               )}
                             </span>
                           )}
@@ -6986,7 +7646,7 @@ const RunContentPage = ({
                         >
                           <span className="inline-flex items-center gap-1.5">
                             <Search className="h-3.5 w-3.5" />
-                            {t("runpage.statusBar.viewStatus") || "View Status"}
+                            {t("runpage.statusBar.viewStatus")}
                           </span>
                         </Button>
                         <Button
@@ -7028,6 +7688,16 @@ const RunContentPage = ({
                             {t("runpage.statusBar.pid")}
                             {t("runpage.statusBar.labelSeparator")}
                             {latestAssessmentTask.pid}
+                          </span>
+                        )}
+                        {latestAssessmentTask.status && (
+                          <span className="rounded-md bg-white/70 px-2 py-0.5 ring-1 ring-indigo-100/80 dark:bg-indigo-950/40 dark:ring-indigo-300/12">
+                            {t("runpage.statusBar.status")}
+                            {t("runpage.statusBar.labelSeparator")}
+                            {t(
+                              `runpage.statusBar.evaluationStatuses.${latestAssessmentTask.status.toLowerCase()}`,
+                              { defaultValue: latestAssessmentTask.status },
+                            )}
                           </span>
                         )}
                       </div>
@@ -7083,6 +7753,14 @@ const RunContentPage = ({
                             <Activity className="h-4 w-4" />
                           </span>
                           {t("runpage.statusBar.benchmarkTitle")}
+                          {standaloneBenchmarkEtaText && (
+                            <span className="inline-flex items-center gap-1 rounded-full border border-emerald-200/80 bg-white/72 px-2 py-0.5 text-[10px] font-semibold text-emerald-700 dark:border-emerald-400/20 dark:bg-emerald-950/30 dark:text-emerald-200">
+                              <Clock className="h-3 w-3" />
+                              {t("runpage.statusBar.benchmarkEta")}
+                              {t("runpage.statusBar.labelSeparator")}
+                              {standaloneBenchmarkEtaText}
+                            </span>
+                          )}
                         </div>
                       </div>
                       <div className="flex flex-wrap items-center gap-2 pl-10 sm:pl-0">
@@ -7124,6 +7802,14 @@ const RunContentPage = ({
                           <Activity className="h-3.5 w-3.5" />
                           {t("runpage.statusBar.benchmarkTitle")}
                         </span>
+                        {standaloneBenchmarkEtaText && (
+                          <span className="inline-flex items-center gap-1 rounded-md bg-white/70 px-2 py-0.5 ring-1 ring-emerald-100/80 dark:bg-emerald-950/40 dark:ring-emerald-300/12">
+                            <Clock className="h-3 w-3" />
+                            {t("runpage.statusBar.benchmarkEta")}
+                            {t("runpage.statusBar.labelSeparator")}
+                            {standaloneBenchmarkEtaText}
+                          </span>
+                        )}
                       </div>
                       <div className="flex items-center gap-2">
                         <Button
@@ -7820,7 +8506,7 @@ const RunContentPage = ({
                     </SheetTitle>
                     <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
                       {t("oneClickWorkflow.subtitle") ||
-                        "选择数据集和评测集，生成命令后手动发送执行。"}
+                        "选择训练数据集和部署后基准评测集，生成命令后手动发送执行。"}
                     </p>
                   </div>
                 </div>
@@ -7895,7 +8581,7 @@ const RunContentPage = ({
                 <section className="space-y-2">
                   <div className="flex items-center justify-between gap-2">
                     <label className="text-xs font-semibold text-slate-700 dark:text-slate-200">
-                      {t("oneClickWorkflow.evaluation.label") || "评测集"}
+                      {t("oneClickWorkflow.evaluation.label") || "部署后基准评测集"}
                     </label>
                     <Tooltip
                       title={t("oneClickWorkflow.refreshCurrentRunNodeResources", {
@@ -7954,6 +8640,9 @@ const RunContentPage = ({
                       : t("oneClickWorkflow.evaluation.defaultHint") ||
                         "未指定，默认使用 2024.json"}
                   </p>
+                  <p className="text-xs leading-5 text-slate-500 dark:text-slate-400">
+                    {t("oneClickWorkflow.evaluation.description")}
+                  </p>
                 </section>
 
                 <section className="rounded-xl border border-slate-200/70 bg-slate-50/80 p-3 dark:border-white/10 dark:bg-slate-900/60">
@@ -8008,7 +8697,7 @@ const RunContentPage = ({
           selectedDataset={wizardSelectedDataset}
           onSelectDataset={setWizardSelectedDataset}
           onStepChange={handleWizardStepChange}
-          requiredDatasetId="medical-example"
+          requiredDatasetId="general-conversation-example"
           inputRequests={inputRequests}
           runs={runs.map((r) => ({
             id: r.id,
@@ -9478,6 +10167,8 @@ const RunPage = () => {
           path: model.path,
           merged: model.merged,
           checkpoints: model.checkpoints,
+          artifactType: model.artifactType,
+          artifactTypes: model.artifactTypes,
           size: model.size,
           createdAt: model.createdAt,
         });

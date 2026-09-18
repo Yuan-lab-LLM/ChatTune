@@ -118,7 +118,7 @@ const getTestTypeConfig = (
   other: { label: t("evaluation.type.other") || "其他", color: "default" },
 });
 
-type EvaluationCategoryFilter = "all" | "medical" | "general";
+type EvaluationCategoryFilter = "all" | "general" | "medical" | "custom" | "unknown";
 type TestTypeConfig = { label: string; color: string };
 
 // 格式化文件大小（字节 -> KB/MB/GB）
@@ -182,10 +182,15 @@ const inferMedicalTestType = (
   return null;
 };
 
-const getEvaluationCategory = (test: MedicalTestFile): "medical" | "general" =>
-  test.category === "general" || test.type === "general"
-    ? "general"
-    : "medical";
+const getEvaluationCategory = (
+  test: MedicalTestFile,
+): Exclude<EvaluationCategoryFilter, "all"> => {
+  if (test.category) return test.category;
+  if (test.type === "general" || test.type === "custom" || test.type === "medical") {
+    return test.type;
+  }
+  return inferMedicalTestType(test.filename || "", test.type) ? "medical" : "unknown";
+};
 
 const getGeneralEvaluationTypeConfig = (
   testName: string,
@@ -267,8 +272,15 @@ const getEvaluationTypeConfig = (
   test: MedicalTestFile,
   t: (key: string) => string,
 ): TestTypeConfig => {
-  if (getEvaluationCategory(test) === "general") {
+  const category = getEvaluationCategory(test);
+  if (category === "general") {
     return getGeneralEvaluationTypeConfig(test.filename || "", t);
+  }
+  if (category === "custom") {
+    return { label: t("evaluation.filter.custom") || "自定义", color: "purple" };
+  }
+  if (category === "unknown") {
+    return { label: t("evaluation.filter.unknown") || "未分类", color: "default" };
   }
 
   const testTypeConfig = getTestTypeConfig(t);
@@ -376,11 +388,11 @@ const EvaluationManager = ({
     `1. ${t("evaluation.guide.section1.title") || "查询评测"}`,
     `  - ${t("evaluation.guide.section1.item1") || "使用后端默认 Docker 容器查询可用评测"}`,
     `  ${t("evaluation.guide.section1.item2") || "评测类型："}`,
-    `    - ${t("evaluation.guide.section1.item3") || "医疗评测"}`,
-    `    - ${t("evaluation.guide.section1.item4") || "通用评测"}`,
+    `    - ${t("evaluation.guide.section1.item3") || "通用评测"}`,
+    `    - ${t("evaluation.guide.section1.item4") || "医疗评测"}`,
     "",
     `2. ${t("evaluation.guide.section2.title") || "上传评测"}`,
-    `  - ${t("evaluation.guide.section2.item1") || "支持上传标准医疗评测数据集"}`,
+    `  - ${t("evaluation.guide.section2.item1") || "支持上传 .json、.jsonl 评测文件"}`,
     `  - ${t("evaluation.guide.section2.item2") || "支持格式：.json、.jsonl"}`,
   ].join("\n");
   const [activeTab, setActiveTab] = useState("opensource");
@@ -1245,12 +1257,20 @@ const EvaluationManager = ({
                       label: t("evaluation.filter.all") || "全部",
                     },
                     {
-                      value: "medical",
-                      label: t("evaluation.filter.medical") || "Medical",
+                      value: "general",
+                      label: t("evaluation.filter.general") || "通用",
                     },
                     {
-                      value: "general",
-                      label: t("evaluation.filter.general") || "General",
+                      value: "medical",
+                      label: t("evaluation.filter.medical") || "医疗",
+                    },
+                    {
+                      value: "custom",
+                      label: t("evaluation.filter.custom") || "自定义",
+                    },
+                    {
+                      value: "unknown",
+                      label: t("evaluation.filter.unknown") || "未分类",
                     },
                   ]}
                 />

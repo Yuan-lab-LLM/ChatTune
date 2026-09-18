@@ -48,6 +48,8 @@ def infer_train_type_from_name(name: Optional[str]) -> Optional[str]:
         return "scheduled"
     if "grpo" in lower:
         return "grpo"
+    if "train_multinode_sft_full_pipeline" in lower:
+        return "full"
     if "batch_train_pretrain_full" in lower:
         return "pretrain_full"
     if "batch_train_pretrain_lora" in lower:
@@ -118,11 +120,16 @@ def public_train_type(
     normalized = normalize_train_type(train_type)
     script = str(script_name or "").strip().lower()
     is_multinode = str(launch_mode or "").strip().lower() in {"multinode", "dual_node", "dual"}
-    is_multinode = is_multinode or "train_multinode_sft_pipeline" in script or "train_multinode_dpo_pipeline" in script
+    is_multinode = (
+        is_multinode
+        or "train_multinode_sft_pipeline" in script
+        or "train_multinode_sft_full_pipeline" in script
+        or "train_multinode_dpo_pipeline" in script
+    )
     if normalized == "lora":
         return "multinode_lora_sft" if is_multinode else "lora_sft"
     if normalized == "full":
-        return "full_sft"
+        return "multinode_full_sft" if is_multinode else "full_sft"
     if normalized == "pretrain_lora":
         return "pretrain_lora"
     if normalized == "pretrain_full":
@@ -150,6 +157,7 @@ def public_train_type_text(
         "enhanced": "增强训练",
         "grpo": "GRPO",
         "multinode_lora_sft": "双机 LoRA SFT",
+        "multinode_full_sft": "双机全参 SFT",
         "multinode_enhanced": "双机增强训练",
         "scheduled": "定时训练",
     }.get(public_type or "")
@@ -488,7 +496,10 @@ def extract_wandb_history(
     }
 
 
-def parse_output_log_history(lines: List[str]) -> List[Dict[str, Any]]:
+def parse_output_log_history(
+    lines: List[str],
+    latest_step_hint: Optional[Any] = None,
+) -> List[Dict[str, Any]]:
     loss_patterns = [
         r"(?:^|[^\w])(?:loss|train_loss|training_loss)\s*[:=]\s*([+-]?(?:\d+\.\d+|\d+)(?:[eE][+-]?\d+)?)",
         r"(?:^|[^\w])(?:actor/kl_loss|actor_kl_loss)\s*[:=]\s*([+-]?(?:\d+\.\d+|\d+)(?:[eE][+-]?\d+)?)",
@@ -538,6 +549,12 @@ def parse_output_log_history(lines: List[str]) -> List[Dict[str, Any]]:
             if k in d:
                 return d[k]
         return None
+
+    def _pick_first_with_key(d: Dict[str, Any], keys: List[str]) -> Tuple[Optional[str], Any]:
+        for k in keys:
+            if k in d:
+                return k, d[k]
+        return None, None
 
     def _to_number(value: Any) -> Any:
         if isinstance(value, (int, float)):
@@ -597,6 +614,8 @@ def parse_output_log_history(lines: List[str]) -> List[Dict[str, Any]]:
             "actor_kl_loss": actor_kl_loss,
             "actor_pg_loss": actor_pg_loss,
             "actor_kl_coef": actor_kl_coef,
+            "_aggregate_loss": False,
+            "_explicit_step": _pick_first(parsed, ["training/global_step", "training_global_step", "step"]) is not None,
         }
         if any(v is not None for v in item.values()):
             return item
@@ -646,33 +665,99 @@ def parse_output_log_history(lines: List[str]) -> List[Dict[str, Any]]:
             actor_kl_loss = _to_number(_pick_first(data, ["actor/kl_loss", "actor_kl_loss"]))
             actor_pg_loss = _to_number(_pick_first(data, ["actor/pg_loss", "actor_pg_loss"]))
             actor_kl_coef = _to_number(_pick_first(data, ["actor/kl_coef", "actor_kl_coef"]))
+            loss_key, raw_loss = _pick_first_with_key(data, ["loss", "train_loss", "training_loss"])
+            step_value = _to_number(_pick_first(data, ["training/global_step", "training_global_step", "step", "global_step", "current_steps", "iteration"]))
             item = {
-                "loss": actor_kl_loss if actor_kl_loss is not None else _to_number(_pick_first(data, ["loss", "train_loss", "training_loss"])),
+                "loss": actor_kl_loss if actor_kl_loss is not None else _to_number(raw_loss),
                 "learning_rate": _to_number(_pick_first(data, ["actor/lr", "actor_lr", "learning_rate", "lr"])),
-                "step": _to_number(_pick_first(data, ["training/global_step", "training_global_step", "step", "global_step", "current_steps", "iteration"])),
+                "step": step_value,
                 "epoch": _to_number(_pick_first(data, ["training/epoch", "training_epoch", "epoch", "train_epoch"])),
                 "actor_kl_loss": actor_kl_loss,
                 "actor_pg_loss": actor_pg_loss,
                 "actor_kl_coef": actor_kl_coef,
+                "_aggregate_loss": bool(
+                    actor_kl_loss is None
+                    and loss_key in {"train_loss", "training_loss"}
+                    and step_value is None
+                ),
+                "_explicit_step": step_value is not None,
             }
         else:
             parsed_kl_loss = _extract_number(loss_patterns, stripped)
+            step_value = _extract_int(step_patterns, stripped)
             item = {
                 "loss": parsed_kl_loss,
                 "learning_rate": _extract_number(lr_patterns, stripped),
-                "step": _extract_int(step_patterns, stripped),
+                "step": step_value,
                 "epoch": _extract_number(epoch_patterns, stripped),
                 "actor_kl_loss": parsed_kl_loss,
                 "actor_pg_loss": _extract_number(pg_loss_patterns, stripped),
                 "actor_kl_coef": _extract_number(kl_coef_patterns, stripped),
+                "_aggregate_loss": bool(
+                    step_value is None
+                    and re.search(r"(?:^|[^\w])(?:train_loss|training_loss)\s*[:=]", stripped, re.IGNORECASE)
+                ),
+                "_explicit_step": step_value is not None,
             }
-        if any(v is not None for v in item.values()):
+        if any(
+            item.get(key) is not None
+            for key in (
+                "loss",
+                "learning_rate",
+                "step",
+                "epoch",
+                "actor_kl_loss",
+                "actor_pg_loss",
+                "actor_kl_coef",
+            )
+        ):
             history.append(item)
 
+    curve_candidates = [
+        item
+        for item in history
+        if _is_present(item.get("loss"))
+        and not bool(item.get("_aggregate_loss"))
+    ]
+
+    # Hugging Face/W&B output.log often batches metric dictionaries after a
+    # tqdm/checkpoint line. Those dictionaries contain fractional epoch but no
+    # step. Recover steps only when a reliable final-step anchor makes the
+    # spacing unambiguous; otherwise retain the conservative integer-epoch
+    # fallback used by older logs.
+    if curve_candidates and not any(item.get("_explicit_step") for item in curve_candidates):
+        anchor_step = None
+        if is_integer_step_value(latest_step_hint):
+            anchor_step = int(float(latest_step_hint))
+        if anchor_step is None:
+            anchor_candidates: List[int] = []
+            for line in lines:
+                if "%" in line:
+                    for match in re.finditer(r"(\d+)\s*/\s*(\d+)", line):
+                        current = int(match.group(1))
+                        total = int(match.group(2))
+                        if 0 <= current <= total and total > 0:
+                            anchor_candidates.append(current)
+                for match in re.finditer(r"(?:^|[/\\])checkpoint-(\d+)(?:$|[/\\])", line):
+                    anchor_candidates.append(int(match.group(1)))
+            if anchor_candidates:
+                anchor_step = max(anchor_candidates)
+
+        point_count = len(curve_candidates)
+        if (
+            anchor_step is not None
+            and anchor_step > 0
+            and point_count > 0
+            and anchor_step >= point_count
+            and anchor_step % point_count == 0
+        ):
+            step_stride = anchor_step // point_count
+            for index, item in enumerate(curve_candidates, start=1):
+                item["step"] = index * step_stride
+                item["_step_inferred"] = True
+
     deduped_by_step: Dict[str, Dict[str, Any]] = {}
-    for item in history:
-        if not _is_present(item.get("loss")):
-            continue
+    for item in curve_candidates:
         if not _is_present(item.get("step")) and is_integer_step_value(item.get("epoch")):
             item = dict(item)
             item["step"] = item.get("epoch")
@@ -689,7 +774,13 @@ def parse_output_log_history(lines: List[str]) -> List[Dict[str, Any]]:
         else:
             deduped_by_step[step_key_text] = item
 
-    return list(deduped_by_step.values())
+    result = list(deduped_by_step.values())
+    result.sort(key=lambda item: float(item.get("step")))
+    for item in result:
+        item.pop("_aggregate_loss", None)
+        item.pop("_explicit_step", None)
+        item.pop("_step_inferred", None)
+    return result
 
 
 

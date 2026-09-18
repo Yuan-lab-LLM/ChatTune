@@ -64,16 +64,16 @@ Each stage is persisted. Failed workflows can be inspected and resumed, while a 
 ### Training and evaluation
 
 - LoRA SFT, full-parameter SFT, DPO/preference enhancement, and GRPO.
-- Single-model, two-model comparison, and checkpoint evaluation.
+- Existing medical composite single-model, two-model comparison, and checkpoint evaluators are retained for compatibility. New LLaMA-Factory built-in general evaluation supports single-model, two-model, and checkpoint runs over `ceval`, `cmbsingle`, `cmmlu`, `medmcqa`, `medqa`, and `mmlu`. The training workflow evaluator does not yet accept uploaded custom evaluation datasets, custom schemas, or custom metrics.
 - Preflight checks for parameters, model templates, Docker, GPU usage, and resource quotas.
 - Status, progress monitoring, and controlled termination for training and evaluation jobs.
-- Qwen3 templates are the default. Other models can be selected with `TEM` / `template` when supported by the chosen training image.
+- Qwen3 templates are supported by default. Training and checkpoint evaluation resolve a registered LLaMA-Factory template from model metadata and pass it explicitly; other supported models can also be selected with `TEM` / `template`. Actual availability depends on the training image, and ambiguous models ask for a template instead of assuming one.
 
 ### Inference and benchmarks
 
 - Inspect and modify model paths, ports, GPUs, tensor parallelism, memory utilization, and token limits.
 - Start, stop, and restart inference services; inspect nodes, status, and logs.
-- Run functional tests, custom evaluation suites, domain benchmarks, and general-purpose benchmarks.
+- Run registered inference benchmarks, domain benchmarks, and general-purpose benchmarks. These inference benchmarks are separate from the training workflow evaluator described above.
 - Bundled loaders and local resources include general benchmarks such as C-Eval, CMMLU, MMLU, and CMB-Single, plus healthcare examples such as MedQA and MedMCQA. These datasets retain their own license terms; see [NOTICE](NOTICE).
 
 ### Studio and governance
@@ -132,6 +132,8 @@ Open `runtime.env` and verify at least:
 | `MEDFLOW_LOCAL_GRPO_CONTAINER` | GRPO/verl task container. |
 | `MODEL_NAME` / `MODEL_API_KEY` / `MODEL_BASE_URL` | OpenAI-compatible endpoint used by the agent. |
 | `INFERENCE_AGENT_URL` | `/inference_agent` endpoint of the inference controller. |
+| `INFERENCE_OPS_AUTH_MODE` | Inbound Inference Ops authentication mode; defaults to `trusted_network`, and requires a Bearer token only when explicitly set to `token`. |
+| `INFERENCE_OPS_API_TOKEN` | Shared by Studio, the main Agent, controller, and workers only when `INFERENCE_OPS_AUTH_MODE=token`. |
 | `STUDIO_PUBLIC_URL` / `STUDIO_URL` | Browser-facing Studio URL and Runtime callback URL. |
 
 ### 5. Check and start
@@ -160,8 +162,9 @@ See the [Quickstart](docs/QUICKSTART.md) for the complete setup and troubleshoot
 Once signed in to Studio, try commands such as:
 
 ```text
-Preprocess data with data_type=sft and strategy=diagnosis
+Preprocess data
 Run LoRA batch training with MBS=1, ACC=8, and LR=1e-7
+Run LoRA batch training with MODEL_PATH=/home/workspace/models/base/llama3 and TEM=llama3
 Run DPO enhancement with model_path=/path/to/model, dataset_dir=/path/to/data, dataset_name=my_dpo
 Run a single-model evaluation with model_fir=/path/to/model
 Show the current training status
@@ -171,6 +174,8 @@ Show the one-click workflow status
 ```
 
 When required values are missing, the agent explains the fields and asks for them. It does not guess model, path, or checkpoint values.
+
+Studio initializes forms from nine built-in training descriptors returned by `queryTrainingMethods` and from dataset, model, evaluation, and container directories returned by `queryResourceCatalogConfig`. A descriptor declares its invocation style, parameter schema, resource requirements, logs/metrics, and artifact policy. Legacy script names and natural-language commands remain aliases. See [Resource catalog configuration](docs/DEPLOYMENT.md#resource-catalog-configuration) for customization and rollback.
 
 ## Deployment modes
 
@@ -201,7 +206,8 @@ Domain-specific behavior is concentrated in data strategies, evaluation resource
 ├── agent/                        # Agent API, workflows, tools, and resource API
 ├── agent-studio-runtime-bridge/  # Bridge between Studio and Agent API backends
 ├── docker_scripts/               # Task-container scripts and evaluation resources
-├── medflow/                      # Optional legacy inference examples, agents, tests, benchmarks
+├── inference-ops/                # Independent vLLM operations controller/workers and benchmarks
+├── medflow/                      # Retained legacy application directory; not required by inference-ops
 └── docs/                         # Deployment, user, and administration documentation
 ```
 

@@ -1,45 +1,23 @@
-# inpatient-住院文书
+#!/usr/bin/env bash
 
-ip=$1
-port=$2
-if [ -z "$ip" ] || [ -z "$port" ]; then
-    echo "错误：请提供 IP 地址和端口号作为参数。"
-    echo "用法：$0 <IP地址> <端口号>"
-    exit 1
-fi
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=medical-smoke-lib.sh
+source "$SCRIPT_DIR/medical-smoke-lib.sh"
 
-#Test 1
-curl -X 'POST' \
-  "http://$ip:$port/inference?request_type=inpatient&scheme=admission_record" \
-  -H 'accept: application/json' \
-  -H 'Content-Type: application/json' \
-  -d @data/inpatient-admission_record.json
+medical_smoke_init
+BASE_URL=$(medical_smoke_base_url "${1:-}" "${2:-}" "${MEDFLOW_BASE_URL:-}")
+URL="$BASE_URL/inference?request_type=inpatient&scheme=admission_record"
 
-  echo -e "\n==================================\n"
+medical_smoke_request \
+    "inpatient admission record generation" \
+    POST \
+    "$URL" \
+    "$SCRIPT_DIR/data/inpatient-admission_record.json" \
+    inpatient
 
-#Test 2
-curl -X 'POST' \
-  "http://$ip:$port/inference?request_type=inpatient&scheme=admission_record" \
-  -H 'accept: application/json' \
-  -H 'Content-Type: application/json' \
-  -d @data/inpatient-admission_record-modify.json
-
-  echo -e "\n==================================\n"
-
-#Test 3
-curl -X 'POST' \
-  "http://$ip:$port/inference?request_type=inpatient&scheme=admission_record" \
-  -H 'accept: application/json' \
-  -H 'Content-Type: application/json' \
-  -d @data/inpatient-admission_record-fields.json
-
-  echo -e "\n==================================\n"
-
-#Test 4
-curl -X 'POST' \
-  "http://$ip:$port/inference?request_type=inpatient&scheme=admission_record" \
-  -H 'accept: application/json' \
-  -H 'Content-Type: application/json' \
-  -d @data/inpatient-admission_record-prefill.json
-
-  echo -e "\n==================================\n"
+medical_smoke_request \
+    "inpatient admission record modification" \
+    POST \
+    "$URL" \
+    "$SCRIPT_DIR/data/inpatient-admission_record-modify.json" \
+    inpatient

@@ -4,22 +4,7 @@
       "id": "beginner",
       "name": "Beginner",
       "icon": "BookOpen",
-      "templates": [
-        {
-          "id": "beginner-train",
-          "title": "Beginner",
-          "content": "我想用<数据集名称>这个数据训练模型",
-          "description": "beginner-train",
-          "icon": "BookOpen",
-          "keywords": [
-            "beginner",
-            "新手",
-            "训练",
-            "数据集",
-            "模型"
-          ]
-        }
-      ]
+      "templates": []
     },
     {
       "id": "data",
@@ -29,7 +14,7 @@
         {
           "id": "data-preprocessing",
           "title": "data-preprocessing",
-          "content": "执行数据预处理操作，数据类型为sft，数据格式为diagnosis",
+          "content": "执行数据预处理操作",
           "description": "data-preprocessingDesc",
           "icon": "Settings",
           "keywords": [
@@ -42,7 +27,7 @@
         {
           "id": "data-advanced-filtering",
           "title": "data-advanced-filtering",
-          "content": "执行数据高级筛选处理，数据在<数据集路径>",
+          "content": "执行数据高级筛选处理",
           "description": "data-advanced-filteringDesc",
           "icon": "Filter",
           "keywords": [
@@ -130,7 +115,7 @@
         {
           "id": "enhanced-train",
           "title": "enhanced-train",
-          "content": "运行增强训练，模型位置在<模型路径>，数据集在<数据集路径>，数据集名称是<数据集名称>",
+          "content": "运行增强训练",
           "description": "enhanced-trainingDesc",
           "icon": "Rocket",
           "keywords": [
@@ -143,7 +128,7 @@
         {
           "id": "grpo-train",
           "title": "grpo-train",
-          "content": "启动grpo训练，模型路径是<模型路径>,train_files是<训练文件路径>,val_files是<验证文件路径>，显卡是<GPU编号列表>",
+          "content": "启动grpo训练",
           "description": "grpo-trainingDesc",
           "icon": "Activity",
           "keywords": [
@@ -165,7 +150,7 @@
         {
           "id": "dual-model-assessment",
           "title": "dual-model-assessment",
-          "content": "运行双模型评估，第一个模型在<第一个模型路径>，第二个模型在<第二个模型路径>",
+          "content": "运行双模型评估",
           "description": "dual-model-assessmentDesc",
           "icon": "GitCompare",
           "keywords": [
@@ -179,7 +164,7 @@
         {
           "id": "single-model-assessment",
           "title": "single-model-assessment",
-          "content": "执行单模型评估，模型路径为<模型路径>",
+          "content": "执行单模型评估",
           "description": "single-model-assessmentDesc",
           "icon": "Activity",
           "keywords": [
@@ -192,7 +177,7 @@
         {
           "id": "checkpoint-assessment",
           "title": "checkpoint-assessment",
-          "content": "执行checkpoint评估，路径为<模型路径>",
+          "content": "执行checkpoint评估",
           "description": "checkpoint-assessmentDesc",
           "icon": "CheckCircle",
           "keywords": [
@@ -273,44 +258,6 @@
       "name": "Evaluation",
       "icon": "CheckCircle",
       "templates": [
-        {
-          "id": "view-inference-test-scripts",
-          "title": "view-inference-test-scripts",
-          "content": "查看可用的推理功能测试脚本",
-          "description": "view-inference-test-scriptsDesc",
-          "icon": "FileText",
-          "keywords": [
-            "推理",
-            "inference",
-            "功能测试",
-            "测试",
-            "test",
-            "脚本",
-            "查看",
-            "可用",
-            "评测",
-            "evaluation"
-          ]
-        },
-        {
-          "id": "run-inference-test-scripts",
-          "title": "run-inference-test-scripts",
-          "content": "运行推理功能测试脚本",
-          "description": "run-inference-test-scriptsDesc",
-          "icon": "Play",
-          "keywords": [
-            "推理",
-            "inference",
-            "功能测试",
-            "测试",
-            "test",
-            "脚本",
-            "运行",
-            "执行",
-            "评测",
-            "evaluation"
-          ]
-        },
         {
           "id": "view-inference-benchmark-tests",
           "title": "view-inference-benchmark-tests",
@@ -623,14 +570,6 @@
       "content": "启动推理服务"
     },
     {
-      "id": "example-inference-test-view",
-      "content": "查看可用的推理功能测试脚本"
-    },
-    {
-      "id": "example-inference-test-run",
-      "content": "运行推理功能测试脚本"
-    },
-    {
       "id": "example-inference-benchmark-view",
       "content": "查看可用的推理基准测试"
     },
@@ -648,7 +587,7 @@
     },    
     {
       "id": "example-preprocessing",
-      "content": "执行数据预处理操作，数据类型为sft，数据格式为diagnosis"
+      "content": "执行数据预处理，data_type=sft，input_folder=<数据集路径>"
     },
     {
       "id": "example-filtering",

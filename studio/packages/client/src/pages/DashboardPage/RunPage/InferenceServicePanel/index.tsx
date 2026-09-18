@@ -227,9 +227,6 @@ const isInferenceServiceStartProtocol = (
 const serviceDisplayName = (name: string) => {
   const labels: Record<string, string> = {
     VLLM_OPENAI_PORT: "VLLM OpenAI API",
-    INFERENCE_PORT: "推理服务",
-    UI_PORT: "UI 服务",
-    DATA_ANNOTATION_PORT: "数据标注服务",
   };
   return labels[name] || name;
 };
@@ -237,18 +234,12 @@ const serviceDisplayName = (name: string) => {
 const serviceDescription = (name: string) => {
   const labels: Record<string, string> = {
     VLLM_OPENAI_PORT: "vLLM OpenAI 兼容 API 服务",
-    INFERENCE_PORT: "主推理服务",
-    UI_PORT: "Web UI 服务",
-    DATA_ANNOTATION_PORT: "数据标注工具服务",
   };
   return labels[name];
 };
 
 const STANDARD_SERVICE_KEYS = [
   "VLLM_OPENAI_PORT",
-  "INFERENCE_PORT",
-  "UI_PORT",
-  "DATA_ANNOTATION_PORT",
 ] as const;
 
 type StandardServiceKey = (typeof STANDARD_SERVICE_KEYS)[number];
@@ -279,33 +270,6 @@ const normalizeServiceName = (name: string): string => {
     vLLMAPI: "VLLM_OPENAI_PORT",
     vLLMOpenAI兼容API服务: "VLLM_OPENAI_PORT",
     VLLM开放API端口: "VLLM_OPENAI_PORT",
-    InferenceServer: "INFERENCE_PORT",
-    INFERENCE服务端口: "INFERENCE_PORT",
-    inference: "INFERENCE_PORT",
-    推理服务: "INFERENCE_PORT",
-    推理服务端口: "INFERENCE_PORT",
-    推理接口: "INFERENCE_PORT",
-    推理接口端口: "INFERENCE_PORT",
-    推理引擎: "INFERENCE_PORT",
-    主推理服务: "INFERENCE_PORT",
-    Web界面: "UI_PORT",
-    UI界面: "UI_PORT",
-    UI界面服务: "UI_PORT",
-    UI端口: "UI_PORT",
-    UI服务端口: "UI_PORT",
-    WebUI: "UI_PORT",
-    ui: "UI_PORT",
-    UI服务: "UI_PORT",
-    DataAnnotation: "DATA_ANNOTATION_PORT",
-    DATAANNOTATION端口: "DATA_ANNOTATION_PORT",
-    Case2Chat: "DATA_ANNOTATION_PORT",
-    case2chat: "DATA_ANNOTATION_PORT",
-    数据标注: "DATA_ANNOTATION_PORT",
-    数据标注端口: "DATA_ANNOTATION_PORT",
-    数据标注接口: "DATA_ANNOTATION_PORT",
-    数据标注接口端口: "DATA_ANNOTATION_PORT",
-    数据标注服务: "DATA_ANNOTATION_PORT",
-    数据标注服务端口: "DATA_ANNOTATION_PORT",
   };
   return aliases[normalized] || name;
 };
@@ -399,6 +363,9 @@ const serviceInstanceStatus = (
   value: unknown,
 ): ServiceStatus["status"] => {
   const normalized = cleanProtocolStatusText(value).toUpperCase();
+  if (normalized.includes("RESERVED") || normalized.includes("预留")) {
+    return "reserved";
+  }
   if (normalized.includes("STARTING") || normalized.includes("启动中")) {
     return "starting";
   }
@@ -512,9 +479,6 @@ const serviceStatusesFromProtocolPorts = (
   const statusesByKey: Partial<Record<StandardServiceKey, ServiceStatus>> = {};
 
   Object.entries(ports || {}).forEach(([name, portValue]) => {
-    if (name.toLowerCase() === "master") {
-      return;
-    }
     const serviceKey = normalizeServiceName(name);
     const port = Number(portValue);
     if (!isStandardServiceKey(serviceKey) || !Number.isFinite(port)) {
@@ -699,13 +663,6 @@ const configFromProtocol = (
   config.ports.VLLM_OPENAI_PORT = numberFromProtocolValue(
     source.ports?.VLLM_OPENAI_PORT,
   );
-  config.ports.INFERENCE_PORT = numberFromProtocolValue(
-    source.ports?.INFERENCE_PORT,
-  );
-  config.ports.UI_PORT = numberFromProtocolValue(source.ports?.UI_PORT);
-  config.ports.DATA_ANNOTATION_PORT = numberFromProtocolValue(
-    source.ports?.DATA_ANNOTATION_PORT,
-  );
 
   config.env.HOST_IP = cleanConfigStringValue(source.env?.HOST_IP);
   config.env.CUDA_VISIBLE_DEVICES = cleanConfigStringValue(
@@ -716,7 +673,6 @@ const configFromProtocol = (
   config.env.MODEL_PATH = cleanConfigStringValue(source.env?.MODEL_PATH);
   config.env.START_SCRIPT = cleanConfigStringValue(source.env?.START_SCRIPT);
   config.env.LOG_DIR = cleanConfigStringValue(source.env?.LOG_DIR);
-  config.env.TEST_DIR = cleanConfigStringValue(source.env?.TEST_DIR);
   config.env.BENCHMARK_DIR = cleanConfigStringValue(source.env?.BENCHMARK_DIR);
   config.env.GENERAL_BENCHMARK_DIR = cleanConfigStringValue(
     source.env?.GENERAL_BENCHMARK_DIR,
@@ -731,9 +687,6 @@ const configFromProtocol = (
   );
   config.runtime.GPU_UTILIZATION_THRESHOLD = numberFromProtocolValue(
     source.runtime?.GPU_UTILIZATION_THRESHOLD,
-  );
-  config.runtime.MAX_TOKENS = numberFromProtocolValue(
-    source.runtime?.MAX_TOKENS,
   );
 
   Object.keys(config.ports).forEach((key) => {
@@ -821,15 +774,6 @@ const configFromJsonPayload = (payload: unknown): InferenceConfig | null => {
   config.ports.VLLM_OPENAI_PORT = numberFromProtocolValue(
     ports.VLLM_OPENAI_PORT as number | string | undefined,
   );
-  config.ports.INFERENCE_PORT = numberFromProtocolValue(
-    ports.INFERENCE_PORT as number | string | undefined,
-  );
-  config.ports.UI_PORT = numberFromProtocolValue(
-    ports.UI_PORT as number | string | undefined,
-  );
-  config.ports.DATA_ANNOTATION_PORT = numberFromProtocolValue(
-    ports.DATA_ANNOTATION_PORT as number | string | undefined,
-  );
 
   config.env.HOST_IP = stringFromJsonValue(env.HOST_IP);
   config.env.CUDA_VISIBLE_DEVICES = stringFromJsonValue(
@@ -840,7 +784,6 @@ const configFromJsonPayload = (payload: unknown): InferenceConfig | null => {
   config.env.MODEL_PATH = stringFromJsonValue(env.MODEL_PATH);
   config.env.START_SCRIPT = stringFromJsonValue(env.START_SCRIPT);
   config.env.LOG_DIR = stringFromJsonValue(env.LOG_DIR);
-  config.env.TEST_DIR = stringFromJsonValue(env.TEST_DIR);
   config.env.BENCHMARK_DIR = stringFromJsonValue(env.BENCHMARK_DIR);
   config.env.GENERAL_BENCHMARK_DIR = stringFromJsonValue(
     env.GENERAL_BENCHMARK_DIR,
@@ -855,9 +798,6 @@ const configFromJsonPayload = (payload: unknown): InferenceConfig | null => {
   );
   config.runtime.GPU_UTILIZATION_THRESHOLD = numberFromProtocolValue(
     runtime.GPU_UTILIZATION_THRESHOLD as any,
-  );
-  config.runtime.MAX_TOKENS = numberFromProtocolValue(
-    runtime.MAX_TOKENS as number | string | undefined,
   );
 
   Object.keys(config.ports).forEach((key) => {
@@ -916,27 +856,12 @@ const configFromJsonBlocks = (text: string): InferenceConfig | null => {
         context.includes("端口") ||
         hasAnyKey(record, [
           "VLLM_OPENAI_PORT",
-          "INFERENCE_PORT",
-          "UI_PORT",
-          "DATA_ANNOTATION_PORT",
         ])
       ) {
         merged.ports.VLLM_OPENAI_PORT =
           numberFromProtocolValue(
             record.VLLM_OPENAI_PORT as number | string | undefined,
           ) ?? merged.ports.VLLM_OPENAI_PORT;
-        merged.ports.INFERENCE_PORT =
-          numberFromProtocolValue(
-            record.INFERENCE_PORT as number | string | undefined,
-          ) ?? merged.ports.INFERENCE_PORT;
-        merged.ports.UI_PORT =
-          numberFromProtocolValue(
-            record.UI_PORT as number | string | undefined,
-          ) ?? merged.ports.UI_PORT;
-        merged.ports.DATA_ANNOTATION_PORT =
-          numberFromProtocolValue(
-            record.DATA_ANNOTATION_PORT as number | string | undefined,
-          ) ?? merged.ports.DATA_ANNOTATION_PORT;
       } else if (
         contextUpper.includes("RUNTIME") ||
         context.includes("运行时") ||
@@ -945,7 +870,6 @@ const configFromJsonBlocks = (text: string): InferenceConfig | null => {
           "TENSOR_PARALLEL_SIZE",
           "GPU_MEMORY_UTILIZATION",
           "GPU_UTILIZATION_THRESHOLD",
-          "MAX_TOKENS",
         ])
       ) {
         merged.runtime.TENSOR_PARALLEL_SIZE =
@@ -960,10 +884,6 @@ const configFromJsonBlocks = (text: string): InferenceConfig | null => {
           numberFromProtocolValue(
             record.GPU_UTILIZATION_THRESHOLD as any,
           ) ?? merged.runtime.GPU_UTILIZATION_THRESHOLD;
-        merged.runtime.MAX_TOKENS =
-          numberFromProtocolValue(
-            record.MAX_TOKENS as number | string | undefined,
-          ) ?? merged.runtime.MAX_TOKENS;
       } else {
         merged.env.HOST_IP =
           stringFromJsonValue(record.HOST_IP) ?? merged.env.HOST_IP;
@@ -980,8 +900,6 @@ const configFromJsonBlocks = (text: string): InferenceConfig | null => {
           stringFromJsonValue(record.START_SCRIPT) ?? merged.env.START_SCRIPT;
         merged.env.LOG_DIR =
           stringFromJsonValue(record.LOG_DIR) ?? merged.env.LOG_DIR;
-        merged.env.TEST_DIR =
-          stringFromJsonValue(record.TEST_DIR) ?? merged.env.TEST_DIR;
         merged.env.BENCHMARK_DIR =
           stringFromJsonValue(record.BENCHMARK_DIR) ?? merged.env.BENCHMARK_DIR;
         merged.env.GENERAL_BENCHMARK_DIR =
@@ -1066,23 +984,6 @@ const parseInferenceConfigFromReplies = (
         if (vllmPortMatch)
           config.ports.VLLM_OPENAI_PORT = parseInt(vllmPortMatch[1]);
 
-        const inferencePortMatch = normalizedText.match(
-          /[`"]?INFERENCE_PORT[`"]?[:：]\s*(\d+)/,
-        );
-        if (inferencePortMatch)
-          config.ports.INFERENCE_PORT = parseInt(inferencePortMatch[1]);
-
-        const uiPortMatch = normalizedText.match(
-          /[`"]?UI_PORT[`"]?[:：]\s*(\d+)/,
-        );
-        if (uiPortMatch) config.ports.UI_PORT = parseInt(uiPortMatch[1]);
-
-        const dataPortMatch = normalizedText.match(
-          /[`"]?DATA_ANNOTATION_PORT[`"]?[:：]\s*(\d+)/,
-        );
-        if (dataPortMatch)
-          config.ports.DATA_ANNOTATION_PORT = parseInt(dataPortMatch[1]);
-
         const vllmServicePortMatch = text.match(
           /VLLM\s*(?:OpenAI\s*)?服务端口[:：]\s*(\d+)/i,
         );
@@ -1092,29 +993,6 @@ const parseInferenceConfigFromReplies = (
         const vllmOpenApiPortMatch = text.match(/VLLM开放API端口[:：]\s*(\d+)/);
         if (vllmOpenApiPortMatch)
           config.ports.VLLM_OPENAI_PORT = parseInt(vllmOpenApiPortMatch[1], 10);
-
-        const inferenceServicePortMatch =
-          text.match(/推理服务端口[:：]\s*(\d+)/);
-        if (inferenceServicePortMatch)
-          config.ports.INFERENCE_PORT = parseInt(
-            inferenceServicePortMatch[1],
-            10,
-          );
-
-        const uiServicePortMatch = text.match(
-          /(?:UI服务|用户界面)端口[:：]\s*(\d+)/,
-        );
-        if (uiServicePortMatch)
-          config.ports.UI_PORT = parseInt(uiServicePortMatch[1], 10);
-
-        const annotationServicePortMatch = text.match(
-          /数据标注(?:服务)?端口[:：]\s*(\d+)/,
-        );
-        if (annotationServicePortMatch)
-          config.ports.DATA_ANNOTATION_PORT = parseInt(
-            annotationServicePortMatch[1],
-            10,
-          );
 
         // 解析环境配置
         const hostIpMatch = normalizedText.match(
@@ -1156,12 +1034,6 @@ const parseInferenceConfigFromReplies = (
         );
         if (logDirMatch)
           config.env.LOG_DIR = cleanConfigStringValue(logDirMatch[1]);
-
-        const testDirMatch = normalizedText.match(
-          /[`"]?TEST_DIR[`"]?\s*[:：]\s*["']?([^"',\n\r]+)["']?,?/,
-        );
-        if (testDirMatch)
-          config.env.TEST_DIR = cleanConfigStringValue(testDirMatch[1]);
 
         const benchmarkDirMatch = normalizedText.match(
           /[`"]?BENCHMARK_DIR[`"]?\s*[:：]\s*["']?([^"',\n\r]+)["']?,?/,
@@ -1233,10 +1105,6 @@ const parseInferenceConfigFromReplies = (
         if (logDirLabelMatch)
           config.env.LOG_DIR = cleanConfigStringValue(logDirLabelMatch[1]);
 
-        const testDirLabelMatch = text.match(/测试目录[:：]\s*([^\n\r]+)/);
-        if (testDirLabelMatch)
-          config.env.TEST_DIR = cleanConfigStringValue(testDirLabelMatch[1]);
-
         const benchmarkDirLabelMatch = text.match(
           /医疗基准测试目录[:：]\s*([^\n\r]+)/,
         );
@@ -1284,12 +1152,6 @@ const parseInferenceConfigFromReplies = (
           }
         }
 
-        const maxTokensMatch = normalizedText.match(
-          /[`"]?MAX_TOKENS[`"]?[:：]\s*(\d+)/,
-        );
-        if (maxTokensMatch)
-          config.runtime.MAX_TOKENS = parseInt(maxTokensMatch[1]);
-
         const tensorLabelMatch = text.match(
           /张量并行(?:度|数|规模|尺寸|大小)(?:\s*[（(][^）)]*[）)])?[:：]\s*(\d+)/,
         );
@@ -1314,12 +1176,6 @@ const parseInferenceConfigFromReplies = (
             config.runtime.GPU_UTILIZATION_THRESHOLD = parsedThreshold;
           }
         }
-
-        const maxTokensLabelMatch = text.match(
-          /最大\s*(?:上下文令牌数|令牌数|token长度|Token长度|Token数|tokens?(?:限制)?|Tokens?(?:限制)?)[:：]\s*(\d+)/,
-        );
-        if (maxTokensLabelMatch)
-          config.runtime.MAX_TOKENS = parseInt(maxTokensLabelMatch[1], 10);
 
         // 如果解析到了任何配置，返回配置对象
         if (
@@ -1408,6 +1264,10 @@ const selectConfigForNode = (
 const parseStatus = (statusText: string): ServiceStatus["status"] => {
   const normalized = statusText.trim().toUpperCase();
 
+  if (normalized.includes("RESERVED") || normalized.includes("预留")) {
+    return "reserved";
+  }
+
   if (normalized.includes("STARTING") || normalized.includes("启动中")) {
     return "starting";
   }
@@ -1432,7 +1292,7 @@ const parseStatus = (statusText: string): ServiceStatus["status"] => {
 };
 
 const statusTokenPattern =
-  "(正在运行|运行中|启动中|已停止|停止|未运行|未启动|失败|异常|降级|RUNNING|STARTING|STOPPED|FAILED|DEGRADED)";
+  "(正在运行|运行中|启动中|已停止|停止|未运行|未启动|失败|异常|降级|已预留|预留|RUNNING|STARTING|STOPPED|FAILED|DEGRADED|RESERVED)";
 
 const parsePortStatusLine = (
   line: string,
@@ -1502,30 +1362,12 @@ const parseServiceStatusFromReplies = (replies: Reply[]): ServiceStatus[] => {
       name: "VLLM OpenAI API",
       description: "vLLM OpenAI 兼容 API 服务",
     },
-    {
-      portName: "INFERENCE_PORT",
-      name: "推理服务",
-      description: "主推理服务",
-    },
-    {
-      portName: "UI_PORT",
-      name: "UI 服务",
-      description: "Web UI 服务",
-    },
-    {
-      portName: "DATA_ANNOTATION_PORT",
-      name: "数据标注服务",
-      description: "数据标注工具服务",
-    },
   ] as const;
   const portMap: Record<
     (typeof serviceDefinitions)[number]["portName"],
     number | undefined
   > = {
     VLLM_OPENAI_PORT: parsedConfig?.ports.VLLM_OPENAI_PORT ?? 7111,
-    INFERENCE_PORT: parsedConfig?.ports.INFERENCE_PORT ?? 7013,
-    UI_PORT: parsedConfig?.ports.UI_PORT ?? 7860,
-    DATA_ANNOTATION_PORT: parsedConfig?.ports.DATA_ANNOTATION_PORT ?? 7016,
   };
 
   for (let i = replies.length - 1; i >= 0; i--) {
@@ -1692,6 +1534,7 @@ const inferenceStatusLabelKey = (status: ServiceStatus["status"]): string => {
     starting: "inference.statusLabels.starting",
     failed: "inference.statusLabels.failed",
     degraded: "inference.statusLabels.degraded",
+    reserved: "inference.statusLabels.reserved",
   };
   return labels[status];
 };
@@ -2163,58 +2006,20 @@ const InferenceServicePanel = memo<Props>(function InferenceServicePanel({
                           </div>
                           <div className="space-y-1.5">
                             <Label className="text-xs text-muted-foreground">
-                              INFERENCE_PORT
+                              MASTER_PORT
                             </Label>
                             <Input
                               type="number"
-                              value={editingConfig.ports?.INFERENCE_PORT || ""}
+                              value={editingConfig.env?.MASTER_PORT || ""}
                               onChange={(e) =>
                                 handleConfigChange(
-                                  "ports",
-                                  "INFERENCE_PORT",
+                                  "env",
+                                  "MASTER_PORT",
                                   parseInt(e.target.value) || 0,
                                 )
                               }
                               readOnly={!isAdmin}
-                              className={`h-9 font-mono text-xs ${modifiedFields.has("ports.INFERENCE_PORT") ? "border-yellow-500 bg-yellow-50" : ""}`}
-                            />
-                          </div>
-                          <div className="space-y-1.5">
-                            <Label className="text-xs text-muted-foreground">
-                              UI_PORT
-                            </Label>
-                            <Input
-                              type="number"
-                              value={editingConfig.ports?.UI_PORT || ""}
-                              onChange={(e) =>
-                                handleConfigChange(
-                                  "ports",
-                                  "UI_PORT",
-                                  parseInt(e.target.value) || 0,
-                                )
-                              }
-                              readOnly={!isAdmin}
-                              className={`h-9 font-mono text-xs ${modifiedFields.has("ports.UI_PORT") ? "border-yellow-500 bg-yellow-50" : ""}`}
-                            />
-                          </div>
-                          <div className="space-y-1.5">
-                            <Label className="text-xs text-muted-foreground">
-                              DATA_ANNOTATION_PORT
-                            </Label>
-                            <Input
-                              type="number"
-                              value={
-                                editingConfig.ports?.DATA_ANNOTATION_PORT || ""
-                              }
-                              onChange={(e) =>
-                                handleConfigChange(
-                                  "ports",
-                                  "DATA_ANNOTATION_PORT",
-                                  parseInt(e.target.value) || 0,
-                                )
-                              }
-                              readOnly={!isAdmin}
-                              className={`h-9 font-mono text-xs ${modifiedFields.has("ports.DATA_ANNOTATION_PORT") ? "border-yellow-500 bg-yellow-50" : ""}`}
+                              className={`h-9 font-mono text-xs ${modifiedFields.has("env.MASTER_PORT") ? "border-yellow-500 bg-yellow-50" : ""}`}
                             />
                           </div>
                         </div>
@@ -2342,25 +2147,6 @@ const InferenceServicePanel = memo<Props>(function InferenceServicePanel({
                               />
                             </div>
                           )}
-                          {config.env.TEST_DIR !== undefined && (
-                            <div className="space-y-1.5">
-                              <Label className="text-xs text-muted-foreground">
-                                TEST_DIR
-                              </Label>
-                              <Input
-                                value={editingConfig.env?.TEST_DIR || ""}
-                                onChange={(e) =>
-                                  handleConfigChange(
-                                    "env",
-                                    "TEST_DIR",
-                                    e.target.value,
-                                  )
-                                }
-                                readOnly={!isAdmin}
-                                className={`h-9 font-mono text-xs ${modifiedFields.has("env.TEST_DIR") ? "border-yellow-500 bg-yellow-50" : ""}`}
-                              />
-                            </div>
-                          )}
                           {config.env.BENCHMARK_DIR !== undefined && (
                             <div className="space-y-1.5">
                               <Label className="text-xs text-muted-foreground">
@@ -2401,12 +2187,6 @@ const InferenceServicePanel = memo<Props>(function InferenceServicePanel({
                               />
                             </div>
                           )}
-                        {config.env.MASTER_PORT !== undefined && (
-                          <div className="space-y-1.5">
-                            <Label className="text-xs text-muted-foreground">MASTER_PORT</Label>
-                            <Input type="number" value={editingConfig.env?.MASTER_PORT || ""} onChange={(e) => handleConfigChange("env", "MASTER_PORT", parseInt(e.target.value) || 0)} readOnly={!isAdmin} className="h-9 font-mono text-xs" />
-                          </div>
-                        )}
                         </div>
                       </div>
 
@@ -2469,24 +2249,6 @@ const InferenceServicePanel = memo<Props>(function InferenceServicePanel({
                                 <Input type="number" step="1" value={editingConfig.runtime?.GPU_UTILIZATION_THRESHOLD || ""} onChange={(e) => handleConfigChange("runtime", "GPU_UTILIZATION_THRESHOLD", parseFloat(e.target.value) || 0)} readOnly={!isAdmin} className="h-9 font-mono text-xs text-center" />
                               </div>
                             )}
-                          <div className="space-y-1.5">
-                            <Label className="text-xs text-muted-foreground">
-                              Max Tokens
-                            </Label>
-                            <Input
-                              type="number"
-                              value={editingConfig.runtime?.MAX_TOKENS || ""}
-                              onChange={(e) =>
-                                handleConfigChange(
-                                  "runtime",
-                                  "MAX_TOKENS",
-                                  parseInt(e.target.value) || 0,
-                                )
-                              }
-                              readOnly={!isAdmin}
-                              className={`h-9 font-mono text-xs text-center ${modifiedFields.has("runtime.MAX_TOKENS") ? "border-yellow-500 bg-yellow-50" : ""}`}
-                            />
-                          </div>
                         </div>
                       </div>
                     </CardContent>

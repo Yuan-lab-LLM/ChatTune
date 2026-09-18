@@ -21,6 +21,10 @@ import {
   ContentBlocks,
   Status,
   EnvironmentCheckResult,
+  AUDIT_LEVELS,
+  AUDIT_MODULES,
+  AUDIT_OPERATION_TYPES,
+  AUDIT_RESULTS,
 } from "../../../shared/src";
 import { RunDao } from "../dao/Run";
 import { InputRequestDao } from "../dao/InputRequest";
@@ -41,7 +45,9 @@ import { AuthDao, SafeAuthUser } from "../dao/Auth";
 import { UserRole } from "../models/Auth";
 import { ChatSessionDao } from "../dao/ChatSession";
 import { ResourceAccessService } from "../services/resourceAccessService";
+import { ResourceCatalogConfigService } from "../services/resourceCatalogConfigService";
 import { TrainingResourceService } from "../services/trainingResourceService";
+import { TrainingDescriptorService } from "../services/trainingDescriptorService";
 
 const textBlock = z.object({
   text: z.string(),
@@ -682,6 +688,8 @@ const sanitizeResourceItemsForUser = <T extends object>(
         createdAt: item.createdAt,
         checkpoints: item.checkpoints,
         merged: item.merged,
+        artifactType: item.artifactType,
+        artifactTypes: item.artifactTypes,
         nodeId: item.nodeId,
         nodeName: item.nodeName,
         containerName: item.containerName,
@@ -770,6 +778,33 @@ const getInferenceAgentBaseUrl = () => {
   }
   return raw.replace(/\/inference_agent\/?$/, "").replace(/\/$/, "");
 };
+const getInferenceOpsToken = () => {
+  const token = process.env.INFERENCE_OPS_API_TOKEN?.trim();
+  if (!token) {
+    throw new TRPCError({
+      code: "INTERNAL_SERVER_ERROR",
+      message: "INFERENCE_OPS_API_TOKEN is not configured",
+    });
+  }
+  return token;
+};
+const getInferenceOpsAuthMode = () => {
+  const mode =
+    process.env.INFERENCE_OPS_AUTH_MODE?.trim().toLowerCase() ||
+    "trusted_network";
+  if (mode !== "trusted_network" && mode !== "token") {
+    throw new TRPCError({
+      code: "INTERNAL_SERVER_ERROR",
+      message:
+        "INFERENCE_OPS_AUTH_MODE must be one of: trusted_network, token",
+    });
+  }
+  return mode;
+};
+const getInferenceOpsHeaders = (): Record<string, string> =>
+  getInferenceOpsAuthMode() === "token"
+    ? { Authorization: `Bearer ${getInferenceOpsToken()}` }
+    : {};
 
 const inferenceAdminRequest = async <T = unknown>(
   path: string,
@@ -784,6 +819,7 @@ const inferenceAdminRequest = async <T = unknown>(
 
   const response = await fetch(url, {
     method: options.method || "GET",
+    headers: getInferenceOpsHeaders(),
   });
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
@@ -845,6 +881,161 @@ const auditAdminAction = async (
       ...(details || {}),
     },
   );
+};
+
+const resourceAuditFiltersSchema = z.object({
+  resourceId: z.string().min(1).optional(),
+  actorUserId: z.string().min(1).optional(),
+  eventType: z.string().min(1).optional(),
+  result: z.enum(AUDIT_RESULTS).optional(),
+  module: z.enum(AUDIT_MODULES).optional(),
+  level: z.enum(AUDIT_LEVELS).optional(),
+  operationType: z.enum(AUDIT_OPERATION_TYPES).optional(),
+  search: z.string().trim().max(128).optional(),
+  startAt: z.string().min(1).optional(),
+  endAt: z.string().min(1).optional(),
+  limit: z.number().int().min(1).max(5000).optional(),
+});
+const sensitiveAuditKeyPattern = /password|hash|salt|token|secret/i;
+const sanitizeAuditValue = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(sanitizeAuditValue);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([key]) => !sensitiveAuditKeyPattern.test(key))
+      .map(([key, item]) => [key, sanitizeAuditValue(item)]),
+  );
+};
+const stringifyAuditValue = (value: unknown) => {
+  if (value === undefined || value === null) return "";
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(sanitizeAuditValue(value));
+  } catch {
+    return String(value);
+  }
+};
+const csvCell = (value: unknown) => `"${stringifyAuditValue(value).replace(/"/g, '""')}"`;
+const exportAuditEvents = async (
+  input: z.infer<typeof resourceAuditFiltersSchema> & { format: "csv" | "json" },
+) => {
+  const events = await ResourceAccessService.listAuditEvents({
+    ...input,
+    limit: input.limit || 5000,
+  });
+  const exportedAt = new Date().toISOString();
+  const safeEvents = events.map((event) => ({
+    id: event.id,
+    createdAt: event.createdAt,
+    eventType: event.eventType,
+    actorUserId: event.actorUserId || null,
+    resourceId: event.resourceId || null,
+    details: sanitizeAuditValue(event.details || null),
+  }));
+  if (input.format === "json") {
+    return {
+      filename: `resource-audit-${exportedAt.replace(/[:.]/g, "-")}.json`,
+      mimeType: "application/json",
+      content: JSON.stringify({ exportedAt, filters: input, events: safeEvents }, null, 2),
+    };
+  }
+  const header = ["createdAt", "eventType", "actorUserId", "resourceId", "details"];
+  const rows = safeEvents.map((event) =>
+    [
+      event.createdAt instanceof Date ? event.createdAt.toISOString() : event.createdAt,
+      event.eventType,
+      event.actorUserId,
+      event.resourceId,
+      event.details,
+    ].map(csvCell).join(","),
+  );
+  return {
+    filename: `resource-audit-${exportedAt.replace(/[:.]/g, "-")}.csv`,
+    mimeType: "text/csv;charset=utf-8",
+    content: [header.join(","), ...rows].join("\n"),
+  };
+};
+
+const evaluationDatasetQuerySchema = z.object({
+  nodeId: resourceNodeIdSchema,
+  groupId: z.string().trim().optional(),
+  container: z.string().optional().default(""),
+});
+
+const queryEvaluationDatasetSnapshot = async (
+  user: SafeAuthUser,
+  input: z.infer<typeof evaluationDatasetQuerySchema>,
+  refresh: boolean,
+) => {
+  const groupTarget =
+    user.role === UserRole.ADMIN
+      ? await resolveAdminGroupResourceTarget(input.groupId, "medicalTest")
+      : null;
+  const container =
+    groupTarget?.container ??
+    (await ResourceAccessService.resolveEvaluateContainerForUser(
+      user,
+      input.container,
+      getDefaultEvaluateContainerName(),
+    ));
+  const targetNodeId =
+    groupTarget?.nodeId ??
+    (await resolveResourceNodeIdForUser(user, input.nodeId));
+  await assertResourceNodeAccess(user, targetNodeId);
+
+  try {
+    if (user.role === UserRole.ADMIN) {
+      return {
+        success: true,
+        message: refresh
+          ? "Evaluation datasets refreshed"
+          : "Evaluation datasets retrieved",
+        data: await aggregateSnapshots(
+          "medicalTest",
+          container,
+          refresh,
+          user,
+          targetNodeId,
+          !groupTarget,
+        ),
+      };
+    }
+
+    managementRefreshScheduler.registerContainer(
+      "medicalTest",
+      container,
+      targetNodeId,
+    );
+    const snapshot = refresh
+      ? await managementCacheService.refreshMedicalTests(targetNodeId, container)
+      : await managementCacheService.getMedicalTests(targetNodeId, container);
+    snapshot.items = sanitizeResourceItemsForUser(
+      user,
+      "medicalTest",
+      await ResourceAccessService.filterResourceItems(
+        user,
+        "medicalTest",
+        container,
+        snapshot.items,
+      ),
+    ) as typeof snapshot.items;
+    return {
+      success: true,
+      message: refresh
+        ? "Evaluation datasets refreshed"
+        : "Evaluation datasets retrieved",
+      data: snapshot,
+    };
+  } catch (error) {
+    throwIfForbidden(error);
+    return {
+      success: false,
+      message:
+        error instanceof Error
+          ? error.message
+          : "Failed to query evaluation datasets",
+    };
+  }
 };
 
 export const appRouter = t.router({
@@ -1781,6 +1972,30 @@ export const appRouter = t.router({
     data: await ResourceAccessService.listCatalog(ctx.user as SafeAuthUser),
   })),
 
+  queryTrainingMethods: protectedProcedure.query(() => ({
+    success: true,
+    message: "Training methods retrieved",
+    data: { methods: TrainingDescriptorService.listDescriptors() },
+  })),
+
+  queryResourceCatalogConfig: protectedProcedure.query(() => ({
+    success: true,
+    message: "Resource catalog config retrieved",
+    data: ResourceCatalogConfigService.getConfig(),
+  })),
+
+  queryEvaluationDatasets: protectedProcedure
+    .input(evaluationDatasetQuerySchema)
+    .mutation(({ ctx, input }) =>
+      queryEvaluationDatasetSnapshot(ctx.user as SafeAuthUser, input, false),
+    ),
+
+  refreshEvaluationDatasets: protectedProcedure
+    .input(evaluationDatasetQuerySchema)
+    .mutation(({ ctx, input }) =>
+      queryEvaluationDatasetSnapshot(ctx.user as SafeAuthUser, input, true),
+    ),
+
   requestResourcePublication: protectedProcedure
     .input(z.object({ resourceId: z.string().min(1) }))
     .mutation(async ({ ctx, input }) => ({
@@ -1814,11 +2029,23 @@ export const appRouter = t.router({
       ),
     })),
 
-  listResourceAuditEvents: adminProcedure.query(async () => ({
+  listResourceAuditEvents: adminProcedure
+    .input(resourceAuditFiltersSchema.optional())
+    .query(async ({ input }) => ({
     success: true,
     message: "资源审计记录已获取",
-    data: await ResourceAccessService.listAuditEvents(),
+    data: await ResourceAccessService.listAuditEvents(input),
   })),
+
+  exportResourceAuditEvents: adminProcedure
+    .input(resourceAuditFiltersSchema.extend({
+      format: z.enum(["csv", "json"]).default("csv"),
+    }))
+    .mutation(async ({ input }) => ({
+      success: true,
+      message: "资源审计记录已导出",
+      data: await exportAuditEvents(input),
+    })),
 
   getEnvironmentConfig: protectedProcedure.query(async ({ ctx }) => {
     const user = ctx.user as SafeAuthUser;
@@ -2177,7 +2404,7 @@ export const appRouter = t.router({
         message: "Service unavailable",
         data: {
           available: false,
-          name: "MedFlow 智能服务",
+          name: "ChatTune 智能服务",
           description: "服务暂不可用",
           nodeId: null,
         },
@@ -2203,7 +2430,7 @@ export const appRouter = t.router({
       message: sharedRun && nodeAvailable ? "Service available" : "Service unavailable",
       data: {
         available: Boolean(sharedRun && nodeAvailable),
-        name: "MedFlow 智能服务",
+        name: "ChatTune 智能服务",
         description:
           sharedRun && nodeAvailable
             ? "服务已就绪，可以开始使用"
@@ -3979,29 +4206,6 @@ export const appRouter = t.router({
       return { success: true, message: "Inference benchmark stop applied", data } as ResponseBody<unknown>;
     }),
 
-  inferenceAdminListTests: adminProcedure
-    .input(z.object({ limit: z.number().int().positive().max(200).default(20), status: z.string().optional().default(""), instanceId: z.string().optional().default("") }).optional())
-    .query(async ({ input }) => {
-      const data = await inferenceAdminRequest("/admin/tests", {
-        query: { limit: input?.limit || 20, status: input?.status || "", instance_id: input?.instanceId || "" },
-      });
-      return { success: true, message: "Inference tests retrieved", data } as ResponseBody<unknown>;
-    }),
-
-  inferenceAdminStopTestPreview: adminProcedure
-    .input(z.object({ testRunId: z.string().trim().min(1) }))
-    .query(async ({ input }) => {
-      const data = await inferenceAdminRequest(`/admin/tests/${encodeURIComponent(input.testRunId)}/stop/preview`);
-      return { success: true, message: "Inference test stop preview retrieved", data } as ResponseBody<unknown>;
-    }),
-
-  inferenceAdminStopTestApply: adminProcedure
-    .input(z.object({ testRunId: z.string().trim().min(1) }))
-    .mutation(async ({ ctx, input }) => {
-      const data = await inferenceAdminRequest(`/admin/tests/${encodeURIComponent(input.testRunId)}/stop/apply`, { method: "POST" });
-      await auditAdminAction(ctx.user as SafeAuthUser, "inference_admin_test_stopped", { testRunId: input.testRunId, data });
-      return { success: true, message: "Inference test stop applied", data } as ResponseBody<unknown>;
-    }),
   deleteEvaluationResult: adminProcedure
     .input(
       z.object({

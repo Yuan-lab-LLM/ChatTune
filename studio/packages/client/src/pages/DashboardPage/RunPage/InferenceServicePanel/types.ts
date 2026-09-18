@@ -2,9 +2,6 @@
 export interface InferenceConfig {
   ports: {
     VLLM_OPENAI_PORT?: number;
-    INFERENCE_PORT?: number;
-    UI_PORT?: number;
-    DATA_ANNOTATION_PORT?: number;
   };
   env: {
     HOST_IP?: string;
@@ -14,7 +11,6 @@ export interface InferenceConfig {
     MODEL_PATH?: string;
     START_SCRIPT?: string;
     LOG_DIR?: string;
-    TEST_DIR?: string;
     BENCHMARK_DIR?: string;
     GENERAL_BENCHMARK_DIR?: string;
     MASTER_PORT?: number;
@@ -23,7 +19,6 @@ export interface InferenceConfig {
     TENSOR_PARALLEL_SIZE?: number;
     GPU_MEMORY_UTILIZATION?: number;
     GPU_UTILIZATION_THRESHOLD?: number;
-    MAX_TOKENS?: number;
   };
 }
 
@@ -31,7 +26,7 @@ export interface InferenceConfig {
 export interface ServiceStatus {
   name: string;
   port: number;
-  status: 'running' | 'stopped' | 'starting' | 'failed' | 'degraded';
+  status: 'running' | 'stopped' | 'starting' | 'failed' | 'degraded' | 'reserved';
   rawStatus?: string;
   description?: string;
   serviceKey?: string;

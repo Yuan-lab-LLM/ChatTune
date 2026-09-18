@@ -8,7 +8,7 @@ interface FirstTimeGuideContextType {
     showTour: boolean;
     showPostTourChoice: boolean;
     isWaitingForProjectLoad: boolean;
-    startTour: (projectName?: string) => void;
+    startTour: (projectName?: string, runId?: string) => void;
     closeAutoPopup: () => void;
     completeTour: () => void;
     closeTourWithoutCompleting: () => void;
@@ -25,6 +25,7 @@ export function FirstTimeGuideProvider({ children }: { children: ReactNode }) {
     const [showPostTourChoice, setShowPostTourChoice] = useState(false);
     const [isWaitingForProjectLoad, setIsWaitingForProjectLoad] = useState(false);
     const pendingProjectNameRef = useRef<string | null>(null);
+    const pendingRunIdRef = useRef<string | null>(null);
     const checkIntervalRef = useRef<number | null>(null);
 
     // 清理检查定时器
@@ -39,24 +40,25 @@ export function FirstTimeGuideProvider({ children }: { children: ReactNode }) {
     const checkProjectLoaded = useCallback(() => {
         const primaryNav = document.querySelector('[data-runpage-nav="true"]') as HTMLElement;
         const hasPrimaryNav = !!primaryNav && primaryNav.offsetHeight > 0;
-        const runsNavButton = document.querySelector('[data-section="runs"]') as HTMLElement;
-        const hasRunsNavButton = !!runsNavButton && runsNavButton.offsetHeight > 0;
+        const sectionButton = document.querySelector('[data-section="runs"], [data-section="datasets"]') as HTMLElement;
+        const hasSectionButton = !!sectionButton && sectionButton.offsetHeight > 0;
         
         // 检查是否在正确的页面路径（/projects/{name}/runs 或 /projects/{name}）
-        const isOnProjectPath = location.pathname.match(/\/projects\/[^/]+/);
         const isOnRunsPath = location.pathname.includes('/runs') || location.pathname.match(/\/projects\/[^/]+$/);
         
         
-        return hasPrimaryNav && hasRunsNavButton && isOnRunsPath;
+        const hasRunPage = !pendingRunIdRef.current || !!document.querySelector('.quick-start-wrapper');
+        return hasPrimaryNav && hasSectionButton && isOnRunsPath && hasRunPage;
     }, [location.pathname]);
     
-    const startTour = useCallback((projectName?: string) => {
+    const startTour = useCallback((projectName?: string, runId?: string) => {
         const targetProjectName = projectName || pendingProjectNameRef.current;
         pendingProjectNameRef.current = targetProjectName || null;
+        pendingRunIdRef.current = runId || null;
         
         
         if (targetProjectName) {
-            const targetPath = `/projects/${targetProjectName}/runs`;
+            const targetPath = `/projects/${targetProjectName}/runs${runId ? `/${runId}` : ''}`;
             const isAlreadyOnTarget = location.pathname === targetPath;
             
             if (!isAlreadyOnTarget) {
@@ -88,7 +90,7 @@ export function FirstTimeGuideProvider({ children }: { children: ReactNode }) {
     // 监听路由变化，等待页面加载完成
     useEffect(() => {
         if (isWaitingForProjectLoad && pendingProjectNameRef.current) {
-            const expectedPath = `/projects/${pendingProjectNameRef.current}/runs`;
+            const expectedPath = `/projects/${pendingProjectNameRef.current}/runs${pendingRunIdRef.current ? `/${pendingRunIdRef.current}` : ''}`;
             const isOnTargetPath = location.pathname === expectedPath;
             
             
@@ -101,6 +103,7 @@ export function FirstTimeGuideProvider({ children }: { children: ReactNode }) {
                     setShowTour(true);
                     setIsWaitingForProjectLoad(false);
                     pendingProjectNameRef.current = null;
+                    pendingRunIdRef.current = null;
                     return;
                 }
                 
@@ -116,11 +119,13 @@ export function FirstTimeGuideProvider({ children }: { children: ReactNode }) {
                         setShowTour(true);
                         setIsWaitingForProjectLoad(false);
                         pendingProjectNameRef.current = null;
+                        pendingRunIdRef.current = null;
                     } else if (checkCount >= maxChecks) {
                         clearCheckInterval();
                         setShowTour(true);
                         setIsWaitingForProjectLoad(false);
                         pendingProjectNameRef.current = null;
+                        pendingRunIdRef.current = null;
                     }
                 }, 200);
                 

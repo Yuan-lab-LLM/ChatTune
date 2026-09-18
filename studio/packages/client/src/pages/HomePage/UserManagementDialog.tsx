@@ -283,7 +283,7 @@ const UserManagementDialog = ({
 
     return (
         <Dialog open={open} onOpenChange={onOpenChange}>
-            <DialogContent className="max-h-[90vh] overflow-y-auto bg-slate-50/95 sm:max-w-[1180px]">
+            <DialogContent className="max-h-[90vh] min-w-0 overflow-x-hidden overflow-y-auto bg-slate-50/95 sm:max-w-[1180px]">
                 <DialogHeader>
                     <DialogTitle className="flex items-center gap-2">
                         <UserPlusIcon className="size-5" />
@@ -294,7 +294,7 @@ const UserManagementDialog = ({
                     </DialogDescription>
                 </DialogHeader>
 
-                <Tabs defaultValue="users" className="space-y-4">
+                <Tabs defaultValue="users" className="min-w-0 space-y-4">
                     <TabsList className="grid h-auto w-full grid-cols-5">
                         <TabsTrigger value="users">
                             {t('auth.usersTab')}
@@ -862,7 +862,7 @@ const UserManagementDialog = ({
                     <TabsContent value="sharing">
                         <ResourceSharingPanel />
                     </TabsContent>
-                    <TabsContent value="audit">
+                    <TabsContent value="audit" className="min-w-0 max-w-full overflow-x-hidden">
                         <ResourceAuditPanel />
                     </TabsContent>
                     <TabsContent value="training">

@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from .benchmark_status import extract_benchmark_job_id, valid_benchmark_job_id
+
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +25,7 @@ TERMINAL_WORKFLOW_STATUSES = {"finished", "failed", "stopped"}
 TRANSIENT_TIMEOUT_STATUS = "timeout"
 TRANSIENT_TIMEOUT_MESSAGE = "本次状态查询超时，任务可能仍在运行，将继续自动刷新"
 AGENT_EVENT_TYPES = {"start_evaluate", "deploy_model", "start_benchmark", "notify_terminal"}
-WORKFLOW_KEY_VERSION = "workflow:v1"
+WORKFLOW_KEY_VERSION = "workflow:v2"
 
 
 def parse_workflow_control_command(message: str) -> Optional[str]:
@@ -58,6 +60,18 @@ def build_workflow_key(
         value = context.get(key)
         if value is not None and str(value).strip():
             payload[key] = str(value).strip()
+    evaluation_scope = str(context.get("evaluation_scope") or "").strip().lower()
+    if evaluation_scope:
+        payload["evaluation_scope"] = evaluation_scope
+    eval_datasets = context.get("eval_datasets")
+    if isinstance(eval_datasets, str):
+        eval_datasets = [item.strip().lower() for item in eval_datasets.split(",") if item.strip()]
+    elif isinstance(eval_datasets, (list, tuple)):
+        eval_datasets = [str(item).strip().lower() for item in eval_datasets if str(item).strip()]
+    else:
+        eval_datasets = []
+    if eval_datasets:
+        payload["eval_datasets"] = list(dict.fromkeys(eval_datasets))
     resource_group_id = str(context.get("resource_group_id") or "").strip()
     if resource_group_id:
         payload["resource_group_id"] = resource_group_id
@@ -209,13 +223,13 @@ def _benchmark_report_command(result: Dict[str, Any]) -> Optional[str]:
     commands = result.get("commands") if isinstance(result.get("commands"), list) else []
     for command in commands:
         command_text = str(command or "").strip()
-        if command_text.startswith("benchmark_report"):
+        if command_text.startswith("benchmark_report") and valid_benchmark_job_id(_benchmark_job_id_from_report_command(command_text)):
             return command_text
     match = re.search(r'benchmark_report\((?:job_id=)?["\']?([A-Za-z0-9_-]+)["\']?\)', _benchmark_text(result))
-    if match:
+    if match and valid_benchmark_job_id(match.group(1)):
         return f'benchmark_report("{match.group(1)}")'
     job_match = re.search(r"任务ID(?:为|是)?[:：]?\s*`?([A-Za-z0-9_-]+)`?", _benchmark_text(result))
-    if job_match:
+    if job_match and valid_benchmark_job_id(job_match.group(1)):
         return f'benchmark_report("{job_match.group(1)}")'
     return None
 
@@ -224,10 +238,10 @@ def _benchmark_stop_command(result: Dict[str, Any]) -> Optional[str]:
     commands = result.get("commands") if isinstance(result.get("commands"), list) else []
     for command in commands:
         command_text = str(command or "").strip()
-        if command_text.startswith("benchmark_stop"):
+        if command_text.startswith("benchmark_stop") and "submit_locks" not in command_text:
             return command_text
     match = re.search(r'benchmark_stop\((?:job_id=)?["\']?([A-Za-z0-9_-]+)["\']?\)', _benchmark_text(result))
-    if match:
+    if match and valid_benchmark_job_id(match.group(1)):
         return f'benchmark_stop("{match.group(1)}")'
     return None
 
@@ -242,6 +256,12 @@ def _benchmark_enrich_runtime_result(result: Dict[str, Any]) -> Dict[str, Any]:
     explicit_status = _benchmark_explicit_status(enriched)
     if explicit_status:
         enriched["status"] = explicit_status
+    job_id = extract_benchmark_job_id(enriched)
+    if job_id:
+        enriched["benchmark_job_id"] = job_id
+        enriched["status_command"] = f'benchmark_report("{job_id}")'
+        enriched["stop_command"] = f'benchmark_stop("{job_id}")'
+        return enriched
     report_command = _benchmark_report_command(enriched)
     if report_command:
         enriched["status_command"] = report_command
@@ -855,6 +875,10 @@ class WorkflowManager:
                 "train_type": train_type,
                 "dataset_ref": dataset_ref,
                 "benchmark": "2024",
+                "workflow_schema_version": 2,
+                "evaluation_scope": "general",
+                "eval_datasets": ["ceval", "cmmlu"],
+                "evaluation_script": "generic_single_model_eval",
             }
             workflow_context.update(context or {})
             workflow_key = build_workflow_key(user_id, dataset_ref, train_type, workflow_context)
@@ -940,6 +964,11 @@ class WorkflowManager:
                 return workflow or {}
             if workflow["current_stage"] == "train":
                 workflow["context"]["train_started_at"] = time.time()
+            context_updates = fields.pop("context_updates", None)
+            if isinstance(context_updates, dict):
+                workflow["context"].update(
+                    {key: value for key, value in context_updates.items() if value is not None}
+                )
             self._stage_result(workflow, "running", **fields)
             return self._save(workflow)
 
@@ -961,6 +990,34 @@ class WorkflowManager:
             if not workflow or workflow["status"] != "running":
                 return workflow or {}
             self._stage_result(workflow, "starting_external")
+            return self._save(workflow)
+
+    def _defer_benchmark_stage(self, workflow: Dict[str, Any]) -> None:
+        now = time.time()
+        workflow["stages"]["benchmark"] = {"status": "pending", "updated_at": now}
+        deploy = workflow["stages"]["deploy"]
+        deploy.update(
+            status="running",
+            updated_at=now,
+            deployment_step="waiting_service",
+            service_checked=False,
+            all_running=False,
+            service_wait_started_at=now,
+            service_wait_instance_id="",
+            next_service_check_at=now + self.poll_interval,
+            message="模型 API 仍在加载，等待服务就绪后自动运行基准测试",
+        )
+        workflow["current_stage"] = "deploy"
+
+    def defer_benchmark_for_service(self, workflow_id: str) -> Dict[str, Any]:
+        """Return to deployment monitoring when the model is still loading."""
+        with self._lock:
+            workflow = self._get(workflow_id)
+            if not workflow or workflow.get("status") != "running":
+                return workflow or {}
+            if workflow.get("current_stage") != "benchmark":
+                return workflow
+            self._defer_benchmark_stage(workflow)
             return self._save(workflow)
 
     def record_finished_stage(self, workflow_id: str, **fields: Any) -> Dict[str, Any]:
@@ -1489,6 +1546,12 @@ class WorkflowManager:
             stage["status"] = TRANSIENT_TIMEOUT_STATUS
             stage["last_poll_error"] = message
             stage["message"] = TRANSIENT_TIMEOUT_MESSAGE
+        if workflow.get("current_stage") == "benchmark" and isinstance(stage.get("result"), dict):
+            stage["result"].update(
+                eta_status="unavailable",
+                estimated_remaining_seconds=None,
+                eta_calculated_at=None,
+            )
         workflow["status"] = "running"
         workflow["error"] = None
 
@@ -1755,6 +1818,9 @@ class WorkflowManager:
             self._move_next(workflow)
             return
         if result.get("status") in {"failed", "interrupted", "unknown"}:
+            # Keep the failed poll's evidence instead of reporting the previous
+            # running poll's metrics alongside the new error.
+            stage.update({key: value for key, value in result.items() if value is not None})
             raise RuntimeError(result.get("error") or "模型训练失败")
         if result.get("status") != "finished":
             stage.update(result)
@@ -1785,18 +1851,43 @@ class WorkflowManager:
         if stage["status"] in {"pending", "awaiting_agent"}:
             # Evaluation already has a deterministic trained_model_path here; start it directly.
             result = self.dependencies.start_evaluate(workflow)
+            self._update_evaluation_context(workflow, result)
             self._stage_result(workflow, "running", **self._details(result))
             return
         result = self._monitor_with_timeout(workflow, stage, self.dependencies.monitor_evaluate)
         if result is None:
             return
         if result.get("status") in {"failed", "interrupted", "unknown"}:
+            self._update_evaluation_context(workflow, result)
+            stage.update(self._details(result))
             raise RuntimeError(result.get("error") or "单模型评估失败")
         if result.get("status") != "finished":
+            self._update_evaluation_context(workflow, result)
             stage.update(result)
             return
+        self._update_evaluation_context(workflow, result)
         self._stage_result(workflow, "finished", **self._details(result))
         self._move_next(workflow)
+
+    @staticmethod
+    def _update_evaluation_context(workflow: Dict[str, Any], result: Dict[str, Any]) -> None:
+        metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
+        aliases = {
+            "run_id": ("run_id", "runId"),
+            "report_path": ("report_path", "reportPath"),
+            "scores": ("scores",),
+            "score_deltas": ("score_deltas", "scoreDeltas"),
+        }
+        updates: Dict[str, Any] = {}
+        for target, names in aliases.items():
+            for name in names:
+                value = result.get(name)
+                if value is None:
+                    value = metrics.get(name)
+                if value is not None:
+                    updates[target] = value
+                    break
+        workflow.setdefault("context", {}).update(updates)
 
     def _advance_publish(self, workflow: Dict[str, Any], stage: Dict[str, Any]) -> None:
         if not self.is_running(workflow["workflow_id"]):
@@ -1821,9 +1912,32 @@ class WorkflowManager:
             stage.update(result)
 
     def _advance_deploy(self, workflow: Dict[str, Any], stage: Dict[str, Any]) -> None:
+        if (
+            not self.agent_events
+            and stage.get("status") == "running"
+            and stage.get("deployment_step") == "waiting_service"
+            and self.dependencies.monitor_deploy
+        ):
+            result = self.dependencies.monitor_deploy(workflow)
+            if result and result.get("restart_required"):
+                stage["status"] = "pending"
+                stage.pop("service_wait_started_at", None)
+                stage.pop("service_wait_instance_id", None)
+                stage.pop("next_service_check_at", None)
+                stage.pop("restart_required", None)
+                return
+            if result and result.get("status") == "finished":
+                self._stage_result(workflow, "finished", **self._details(result))
+                self._move_next(workflow)
+            elif result and result.get("status") == "failed":
+                raise RuntimeError(result.get("error") or "推理服务启动失败")
+            elif result:
+                stage.update(result)
+            return
         if self.agent_events:
             if (
-                stage["status"] in {"awaiting_agent", "running", "starting_external"}
+                stage["status"] == "running"
+                and stage.get("deployment_step") == "waiting_service"
                 and self.dependencies.monitor_deploy
             ):
                 result = self.dependencies.monitor_deploy(workflow)
@@ -1835,11 +1949,27 @@ class WorkflowManager:
                     result.get("all_running") if isinstance(result, dict) else None,
                     result.get("message") if isinstance(result, dict) else None,
                 )
+                if result and result.get("restart_required"):
+                    stage.pop("service_wait_started_at", None)
+                    stage.pop("service_wait_instance_id", None)
+                    stage.pop("next_service_check_at", None)
+                    stage.pop("restart_required", None)
+                    model_name = Path(workflow["context"]["published_model_path"]).name
+                    self.enqueue_event(workflow, "deploy_model", {"model_name": model_name})
+                    self._stage_result(
+                        workflow,
+                        "awaiting_agent",
+                        deployment_step="awaiting_agent",
+                        service_checked=True,
+                        all_running=False,
+                        message=result.get("message") or "推理服务已停止，等待重新部署",
+                    )
+                    return
                 if result and result.get("status") == "finished":
                     details = self._details(result)
                     self._stage_result(workflow, "finished", **details)
                     self._move_next(workflow)
-                elif result and stage["status"] != "starting_external":
+                elif result:
                     stage.update(result)
                     if result.get("status") == "running":
                         stage["status"] = "running"
@@ -1873,10 +2003,8 @@ class WorkflowManager:
             #restarted = self.dependencies.inference_command("重启推理服务")
             restarted = self.dependencies.inference_command("重启推理服务", workflow)
             #deepseek
-            #checked = self.dependencies.inference_command("查看推理服务状态")
-            checked = self.dependencies.inference_command("查看推理服务状态", workflow)
-            if not restarted.get("success", True) or not checked.get("all_running", False):
-                raise RuntimeError(restarted.get("error") or checked.get("error") or "推理服务重启后未全部运行")
+            if not restarted.get("success", True):
+                raise RuntimeError(restarted.get("error") or "推理服务重启命令失败")
         except Exception:
             if old_model_name_parsed:
                 #deepseek
@@ -1888,11 +2016,18 @@ class WorkflowManager:
             raise
         self._stage_result(
             workflow,
-            "finished",
+            "running",
             model_name=model_name,
             service_log_command="查看推理服务日志",
+            service_wait_started_at=time.time(),
+            service_wait_instance_id="",
+            next_service_check_at=time.time() + self.poll_interval,
+            deployment_step="waiting_service",
+            service_checked=False,
+            all_running=False,
+            message="推理服务重启命令已提交，等待模型 API 就绪",
         )
-        self._move_next(workflow)
+        return
 
     def _advance_benchmark(self, workflow: Dict[str, Any], stage: Dict[str, Any]) -> None:
         previous_result = stage.get("result") if isinstance(stage.get("result"), dict) else {}
@@ -1927,6 +2062,9 @@ class WorkflowManager:
                 #deepseek
                 #result = self.dependencies.inference_command(_benchmark_start_command(workflow))
                 result = self.dependencies.inference_command(_benchmark_start_command(workflow), workflow)
+            if result.get("waiting_service"):
+                self._defer_benchmark_stage(workflow)
+                return
             if not result.get("success", True):
                 raise RuntimeError(result.get("error") or f"{_benchmark_name(workflow)}基准评测启动失败")
             result = _benchmark_enrich_runtime_result({**result, "result_entry": _benchmark_result_entry(workflow)})

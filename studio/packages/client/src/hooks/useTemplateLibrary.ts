@@ -72,7 +72,7 @@ const PRESET_CATEGORY_IDS = ['beginner', 'training', 'assessment', 'evaluation',
 export const PRESET_CATEGORIES = [
     { id: 'beginner', name: 'Beginner', icon: 'BookOpen' },
     { id: 'training', name: '训练', icon: 'Dumbbell' },
-    { id: 'assessment', name: '医疗自建评估', icon: 'BarChart3' },
+    { id: 'assessment', name: '模型评估', icon: 'BarChart3' },
     { id: 'evaluation', name: '评测', icon: 'CheckCircle' },
     { id: 'inference', name: '推理', icon: 'Cpu' },
     { id: 'data', name: '数据', icon: 'Database' },

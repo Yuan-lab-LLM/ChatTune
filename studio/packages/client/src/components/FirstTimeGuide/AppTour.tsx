@@ -4,6 +4,7 @@ import { useLocation, useNavigate } from 'react-router-dom';
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useFirstTimeGuide } from '@/context/FirstTimeGuideContext';
 import { useSocket } from '@/context/SocketContext';
+import { useAuth } from '@/context/AuthContext';
 import { ResponseBody, RunData, SocketEvents, Status } from '@shared/types';
 import { AlertTriangle, RefreshCw } from 'lucide-react';
 
@@ -12,6 +13,7 @@ export function AppTour() {
     const location = useLocation();
     const navigate = useNavigate();
     const socket = useSocket();
+    const { isAdmin } = useAuth();
     const { showTour, isWaitingForProjectLoad, completeTour, closeTourWithoutCompleting } = useFirstTimeGuide();
     const [currentStep, setCurrentStep] = useState(0);
     const [isWaitingForRoute, setIsWaitingForRoute] = useState(false);
@@ -176,7 +178,7 @@ export function AppTour() {
     }, [projectName]);
 
     useEffect(() => {
-        if (!socket || !projectName) {
+        if (!isAdmin || !socket || !projectName) {
             setProjectRuns([]);
             setHasReceivedProjectRuns(false);
             return;
@@ -201,12 +203,12 @@ export function AppTour() {
         return () => {
             socket.off(SocketEvents.server.pushRunsData, handleRunsData);
         };
-    }, [socket, projectName]);
+    }, [isAdmin, socket, projectName]);
     
     // 监听路由变化
     useEffect(() => {
         
-        if (isWaitingForRoute && currentStep === 2) {
+        if ((isWaitingForRoute || !isAdmin) && currentStep === 2) {
             // 检查是否已进入具体 run 页面 (/runs/xxx)
             const isInSpecificRun = location.pathname.match(/\/runs\/[^/]+$/);
             
@@ -279,7 +281,7 @@ export function AppTour() {
                 setStep6Ready(true);
             }, 500);
         }
-    }, [location, isWaitingForRoute, currentStep, activeTab, activateRunPageSection]);
+    }, [location, isWaitingForRoute, currentStep, activeTab, activateRunPageSection, isAdmin]);
     
     // Step 1 -> Step 2 时智能检测表格数据加载
     useEffect(() => {
@@ -443,6 +445,10 @@ export function AppTour() {
     // 检查是否有可用的runs
     // Step 1 点击下一步时的处理
     const handleStep1Next = useCallback(async () => {
+        if (!isAdmin) {
+            setCurrentStep(2);
+            return;
+        }
         setIsCheckingRuns(true);
         const token = ++runCheckTokenRef.current;
 
@@ -463,7 +469,7 @@ export function AppTour() {
         }
 
         setIsCheckingRuns(false);
-    }, [waitForAvailableRuns, activateRunPageSection]);
+    }, [waitForAvailableRuns, activateRunPageSection, isAdmin]);
     
     // 刷新检测runs
     const handleRefreshCheck = useCallback(async () => {
@@ -501,8 +507,12 @@ export function AppTour() {
             {
                 title: isZh ? 'Step 1: 左侧一级菜单' : 'Step 1: Primary Navigation',
                 description: isZh 
-                    ? '这里可以快速切换五大功能模块：运行列表、系统概览、数据管理、模型管理、评测管理。'
-                    : 'Quickly switch between five modules: Run List, System Overview, Data, Models, and Evaluation.',
+                    ? isAdmin
+                        ? '这里可以快速切换五大功能模块：运行列表、系统概览、数据管理、模型管理、评测管理。'
+                        : '这里可以快速切换系统概览、数据管理、模型管理和评测管理。'
+                    : isAdmin
+                        ? 'Quickly switch between five modules: Run List, System Overview, Data, Models, and Evaluation.'
+                        : 'Quickly switch between Overview, Data, Models, and Evaluation.',
                 target: () => document.querySelector('[data-runpage-nav="true"]') as HTMLElement,
                 placement: 'right' as const,
                 prevButtonProps: {
@@ -551,9 +561,9 @@ export function AppTour() {
             {
                 title: (() => {
                     const titles = [
-                        isZh ? 'Step 3-1: 新手引导' : 'Step 3-1: Beginner Guide',
-                        isZh ? 'Step 3-2: 对话输入' : 'Step 3-2: Chat Input',
-                        isZh ? 'Step 3-3: 模板库' : 'Step 3-3: Template Library'
+                        isZh ? `Step ${isAdmin ? 3 : 2}-1: 新手引导` : `Step ${isAdmin ? 3 : 2}-1: Beginner Guide`,
+                        isZh ? `Step ${isAdmin ? 3 : 2}-2: 对话输入` : `Step ${isAdmin ? 3 : 2}-2: Chat Input`,
+                        isZh ? `Step ${isAdmin ? 3 : 2}-3: 模板库` : `Step ${isAdmin ? 3 : 2}-3: Template Library`
                     ];
                     return titles[step3SubStep];
                 })(),
@@ -629,7 +639,7 @@ export function AppTour() {
                 }
             },
             {
-                title: isZh ? 'Step 4: 数据管理' : 'Step 4: Data Management',
+                title: isZh ? `Step ${isAdmin ? 4 : 3}: 数据管理` : `Step ${isAdmin ? 4 : 3}: Data Management`,
                 description: isZh
                     ? '点击左侧一级菜单中的"数据管理"，再点击"查询可用数据集"按钮，输入容器名称即可查询可用数据集。'
                     : 'Open Data Management from the primary navigation, then click "Query Available Datasets" and enter a container name.',
@@ -648,7 +658,7 @@ export function AppTour() {
                 }
             },
             {
-                title: isZh ? 'Step 5: 模型管理' : 'Step 5: Model Management',
+                title: isZh ? `Step ${isAdmin ? 5 : 4}: 模型管理` : `Step ${isAdmin ? 5 : 4}: Model Management`,
                 description: isZh
                     ? '点击左侧一级菜单中的"模型管理"，再点击"查询可用模型"按钮，输入容器名称即可查询可用模型。'
                     : 'Open Model Management from the primary navigation, then click "Query Available Models" and enter a container name.',
@@ -665,7 +675,7 @@ export function AppTour() {
                 }
             },
             {
-                title: isZh ? 'Step 6: 评测管理' : 'Step 6: Evaluation Management',
+                title: isZh ? `Step ${isAdmin ? 6 : 5}: 评测管理` : `Step ${isAdmin ? 6 : 5}: Evaluation Management`,
                 description: isZh
                     ? '点击左侧一级菜单中的"评测管理"，再点击"查询可用评测集"按钮，输入容器名称即可查询可用评测集。'
                     : 'Open Evaluation Management from the primary navigation, then click "Query Available Tests" and enter a container name.',
@@ -684,12 +694,13 @@ export function AppTour() {
         ];
         
         // 如果正在等待路由，只显示前3步
+        const visibleSteps = isAdmin ? baseSteps : baseSteps.filter((_, index) => index !== 1);
         if (isWaitingForRoute) {
-            return baseSteps.slice(0, 3);
+            return visibleSteps.slice(0, isAdmin ? 3 : 2);
         }
-        
-        return baseSteps;
-    }, [isZh, step2Ready, step3Ready, step4Ready, step5Ready, step6Ready, isWaitingForRoute, activeTab, handleStep1Next, handleStep2Next, handleStep3Next, isCheckingRuns, step3SubStep, getVisibleElement]);
+
+        return visibleSteps;
+    }, [isZh, isAdmin, step2Ready, step3Ready, step4Ready, step5Ready, step6Ready, isWaitingForRoute, activeTab, handleStep1Next, handleStep2Next, handleStep3Next, isCheckingRuns, step3SubStep, getVisibleElement]);
     
     const steps = getSteps();
     
@@ -770,8 +781,8 @@ export function AppTour() {
         }
     }, [clearStep4PendingWork, showTour]);
     
-    // 如果引导未开启，不渲染任何内容
-    if (!showTour) return null;
+    // 导航和页面加载期间也显示加载遮罩，避免先露出未选中会话的空页面
+    if (!showTour && !isWaitingForProjectLoad) return null;
     
     // Modal 内容
     const noRunsModalContent = {
@@ -844,18 +855,19 @@ export function AppTour() {
                     }
                 }}
                 onChange={(step) => {
+                    const nextStep = !isAdmin && step >= 1 ? step + 1 : step;
 
                     // Step 3 有 3 个子步骤，完全由 step3SubStep 驱动，忽略 Tour 默认的大步骤推进
-                    if (currentStep === 2 && step >= 3) {
+                    if (currentStep === 2 && nextStep >= 3) {
                         return;
                     }
 
                     // 允许步骤正常变化，包括从step 2前进到其他步骤
-                    if (step !== currentStep) {
-                        setCurrentStep(step);
+                    if (nextStep !== currentStep) {
+                        setCurrentStep(nextStep);
                     }
                 }}
-                current={currentStep}
+                current={!isAdmin && currentStep > 1 ? currentStep - 1 : currentStep}
                 steps={steps}
                 mask={true}
                 type="primary"

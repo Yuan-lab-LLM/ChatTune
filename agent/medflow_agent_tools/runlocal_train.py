@@ -38,14 +38,16 @@ from ._train_monitor_helpers import (
     require_assigned_gpu_env,
 )
 from ._template_policy import (
-    DEFAULT_TEMPLATE,
     MODEL_HINT_KEYS,
     TEMPLATE_PARAM_KEYS,
     first_nonempty,
-    non_qwen3_template_required_issue,
-    normalize_template,
-    template_validation_issue,
-    text_mentions_non_qwen3_model,
+    resolve_model_template,
+    verify_model_template_resolution,
+)
+from ._training_descriptors import (
+    find_training_descriptor,
+    list_training_descriptors,
+    validate_training_descriptors,
 )
 
 
@@ -58,6 +60,7 @@ DEFAULT_DOCKER_CONTAINER = get_default_docker_container()
 MULTINODE_DOCKER_CONTAINER = os.getenv("MULTINODE_DOCKER_CONTAINER", "")
 GRPO_DOCKER_CONTAINER = os.getenv("MEDFLOW_GRPO_DOCKER_CONTAINER", "")
 MULTINODE_SFT_SCRIPT = "train_multinode_sft_pipeline"
+MULTINODE_SFT_FULL_SCRIPT = "train_multinode_sft_full_pipeline"
 MULTINODE_DPO_SCRIPT = "train_multinode_dpo_pipeline"
 PRETRAIN_LORA_SCRIPT = "batch_train_pretrain_lora"
 PRETRAIN_FULL_SCRIPT = "batch_train_pretrain_full"
@@ -75,10 +78,12 @@ MULTINODE_BINARY_FIXED_CLI_ARGS = {
 }
 MULTINODE_BINARY_PATHS = {
     MULTINODE_SFT_SCRIPT: f"{LLAMAFACTORY_BINARY_WORKDIR}/{MULTINODE_SFT_SCRIPT}",
+    MULTINODE_SFT_FULL_SCRIPT: f"{LLAMAFACTORY_BINARY_WORKDIR}/{MULTINODE_SFT_FULL_SCRIPT}",
     MULTINODE_DPO_SCRIPT: f"{LLAMAFACTORY_BINARY_WORKDIR}/{MULTINODE_DPO_SCRIPT}",
 }
 MULTINODE_SOURCE_PATHS = {
     MULTINODE_SFT_SCRIPT: f"{LLAMAFACTORY_SOURCE_WORKDIR}/{MULTINODE_SFT_SCRIPT}.py",
+    MULTINODE_SFT_FULL_SCRIPT: f"{LLAMAFACTORY_SOURCE_WORKDIR}/{MULTINODE_SFT_FULL_SCRIPT}.py",
     MULTINODE_DPO_SCRIPT: f"{LLAMAFACTORY_SOURCE_WORKDIR}/{MULTINODE_DPO_SCRIPT}.py",
 }
 GRPO_BINARY_WORKDIR = "/usr/local/insinfersystem"
@@ -112,7 +117,7 @@ MULTINODE_SFT_CLI_PARAMS = [
     "flash-attn", "torch-empty-cache-steps", "use-liger-kernel", "use-adam-mini",
     "dataloader-num-workers", "group-by-length", "report-to", "use-unsloth-gc",
     "max-steps", "skip-data-analysis", "skip-merge",
-    "export-bin", "merge-cuda-visible-devices",
+    "export-bin", "merge-cuda-visible-devices", "extra-train-args",
     "node-count", "gpus-per-node", "resource-pool-id", "resource-group-id",
 ]
 
@@ -143,6 +148,8 @@ MULTINODE_PARAM_MAPPING = {
     "docker_container": "container",
     "container_name": "container",
     "model_path": "model-path",
+    "模型": "model-path",
+    "基础模型": "model-path",
     "模型路径": "model-path",
     "模型位置": "model-path",
     "基础模型路径": "model-path",
@@ -300,7 +307,134 @@ MULTINODE_PARAM_MAPPING = {
     "export_bin": "export-bin",
     "merge_cuda_visible_devices": "merge-cuda-visible-devices",
     "llamafactory_cli": "llamafactory-cli",
+    "extra_train_args": "extra-train-args",
+    "extra-train-args": "extra-train-args",
+    "额外训练参数": "extra-train-args",
 }
+
+
+def _normalize_descriptor_key(value: Any) -> str:
+    return re.sub(r"[\s_-]+", "", str(value or "").strip().lower())
+
+
+def _training_descriptor_for_script(script_name: str) -> Optional[Dict[str, Any]]:
+    name = str(script_name or "").strip()
+    if not name:
+        return None
+    descriptor = find_training_descriptor(name)
+    if descriptor:
+        return descriptor
+    normalized = _normalize_descriptor_key(name)
+    for item in list_training_descriptors():
+        entry = item.get("entry") or {}
+        source_script = str(entry.get("sourceScript") or "").strip()
+        source_name = os.path.splitext(os.path.basename(source_script))[0]
+        if normalized in {
+            _normalize_descriptor_key(item.get("id")),
+            _normalize_descriptor_key(source_script),
+            _normalize_descriptor_key(source_name),
+        }:
+            return item
+    return None
+
+
+def _training_descriptor_param_keys(param: Dict[str, Any]) -> List[str]:
+    keys = [str(param.get("name") or "").strip()]
+    keys.extend(str(alias or "").strip() for alias in param.get("aliases") or [])
+    return [key for key in dict.fromkeys(keys) if key]
+
+
+def _lookup_descriptor_param_value(
+    param: Dict[str, Any],
+    env_vars: Optional[Dict[str, Any]],
+    cli_args: Optional[Dict[str, Any]],
+) -> Any:
+    aliases = {_normalize_descriptor_key(key) for key in _training_descriptor_param_keys(param)}
+    for source in (cli_args or {}, env_vars or {}):
+        for key, value in source.items():
+            if _normalize_descriptor_key(key) in aliases:
+                return value
+    return None
+
+
+def _has_explicit_training_template(
+    script_name: str,
+    env_vars: Optional[Dict[str, Any]],
+    cli_args: Optional[Dict[str, Any]],
+) -> bool:
+    descriptor = _training_descriptor_for_script(script_name)
+    template_keys = set(TEMPLATE_PARAM_KEYS)
+    if descriptor:
+        for param in descriptor.get("params") or []:
+            if str(param.get("type") or "").strip() == "template":
+                template_keys.update(_training_descriptor_param_keys(param))
+    normalized_keys = {_normalize_descriptor_key(key) for key in template_keys}
+    for source in (cli_args or {}, env_vars or {}):
+        for key, value in source.items():
+            if _normalize_descriptor_key(key) in normalized_keys and str(value or "").strip():
+                return True
+    return False
+
+
+def _descriptor_required_param_issue(
+    script_name: str,
+    container: str,
+    env_vars: Optional[Dict[str, Any]],
+    cli_args: Optional[Dict[str, Any]],
+    script_info: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    descriptor = None
+    if script_info and isinstance(script_info.get("training_descriptor"), dict):
+        descriptor = script_info.get("training_descriptor")
+    descriptor = descriptor or _training_descriptor_for_script(script_name)
+    if not descriptor:
+        return None
+
+    descriptor_id = str(descriptor.get("id") or script_name)
+    entry = descriptor.get("entry") or {}
+    if not entry.get("containerCommand") or not entry.get("invocationStyle"):
+        return {
+            "error_reason": "descriptor_configuration_invalid",
+            "message": f"训练能力 {descriptor_id} 缺少入口配置，已阻止启动。",
+            "container": container,
+            "descriptorId": descriptor_id,
+        }
+    if not (descriptor.get("resourceRequirements") or {}).get("containerRole"):
+        return {
+            "error_reason": "descriptor_configuration_invalid",
+            "message": f"训练能力 {descriptor_id} 缺少资源配置，已阻止启动。",
+            "container": container,
+            "descriptorId": descriptor_id,
+        }
+
+    required_params = [
+        param
+        for param in descriptor.get("params") or []
+        if param.get("required") and not param.get("resourceOnly")
+    ]
+    missing = [
+        str(param.get("name") or "").strip()
+        for param in required_params
+        if _is_placeholder_value(
+            str(param.get("name") or ""),
+            _lookup_descriptor_param_value(param, env_vars, cli_args),
+        )
+    ]
+    missing = [param for param in missing if param]
+    if not missing:
+        return None
+    return {
+        "error_reason": "missing_required_params",
+        "message": (
+            f"训练能力 {descriptor_id} 缺少必需参数，已阻止启动："
+            + "、".join(missing)
+            + "。"
+        ),
+        "container": container,
+        "descriptorId": descriptor_id,
+        "required_params": [str(param.get("name") or "").strip() for param in required_params],
+        "missing_params": missing,
+    }
 def _docker_test_path(container: str, path: str, test_flag: str) -> Tuple[bool, str]:
     try:
         result = subprocess.run(
@@ -514,7 +648,7 @@ def _train_type_text(train_type: Optional[str]) -> Optional[str]:
 
 
 def _is_multinode_train_script(script_name: Optional[str]) -> bool:
-    return str(script_name or "").strip() in {MULTINODE_SFT_SCRIPT, MULTINODE_DPO_SCRIPT}
+    return str(script_name or "").strip() in {MULTINODE_SFT_SCRIPT, MULTINODE_SFT_FULL_SCRIPT, MULTINODE_DPO_SCRIPT}
 
 
 def _resource_request_config(script_info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -1327,8 +1461,8 @@ class ScriptManager:
             "lr":"LR",
             "LR":"LR",
             "learning_rate":"LR",
-            "模型": "TEM",
-            "基础模型": "TEM",
+            "模型": "MODEL_PATH",
+            "基础模型": "MODEL_PATH",
             "tem":"TEM",
             "tem":"TEM",
             "恢复训练": "RESUME",
@@ -1425,7 +1559,6 @@ class ScriptManager:
                     "MBS": "1",
                     "ACC": "8", 
                     "LR": "1e-7",
-                    "TEM": "qwen3",
                 "RESUME": ""
                 },
                 "supported_params": ["MBS", "ACC", "LR", "TEM", "RESUME", "MODEL_PATH", "LOCALHOST_ID", "container", "DATASET_DIR", "DATASET_DATE"],  # 支持修改的参数
@@ -1457,7 +1590,6 @@ class ScriptManager:
                     "MBS": "1",
                     "ACC": "8",
                     "LR": "1e-6",
-                    "TEM": "qwen3",
                 "RESUME": ""
                 },
                 "supported_params": ["MBS", "ACC", "LR", "TEM", "RESUME", "MODEL_PATH", "LOCALHOST_ID", "container", "DATASET_DIR", "DATASET_DATE"],
@@ -1491,7 +1623,6 @@ class ScriptManager:
                     "MBS": "1",
                     "ACC": "8",
                     "LR": "1e-4",
-                    "TEM": "qwen3",
                     "RESUME": "",
                 },
                 "supported_params": ["MBS", "ACC", "LR", "TEM", "RESUME", "MODEL_PATH", "LOCALHOST_ID", "container", "DATASET_DIR", "DATASET_DATE"],
@@ -1524,7 +1655,6 @@ class ScriptManager:
                     "MBS": "1",
                     "ACC": "8",
                     "LR": "5e-5",
-                    "TEM": "qwen3",
                     "RESUME": "",
                 },
                 "supported_params": ["MBS", "ACC", "LR", "TEM", "RESUME", "MODEL_PATH", "LOCALHOST_ID", "container", "DATASET_DIR", "DATASET_DATE"],
@@ -1591,12 +1721,13 @@ class ScriptManager:
                     "model_path": "",
                     "dataset_dir": "",
                     "dataset_name":"",
-                    "template":"qwen3",
                     #"output_dir":""
                     },
                 "supported_cli_params": ["model_path", "dataset_dir","dataset_name","template"],  # 新增：支持的命令行参数
                 "required_cli_params": ["model_path","dataset_dir","dataset_name"],
                 "param_mapping": {  # 新增：命令行参数的中文映射
+                    "模型": "model_path",
+                    "基础模型": "model_path",
                     "模型位置": "model_path",
                     "模型路径": "model_path",
                     "model_path": "model_path",
@@ -1629,6 +1760,39 @@ class ScriptManager:
                 "path": f"{MULTINODE_SFT_SCRIPT}.py",
                 "description": "多机lora批量训练工具",
                 "aliases": ["双机 LoRA SFT", "双机lora sft", "multinode_lora_sft", "multinode lora sft", "multi-node lora sft", "multinode_sft", "multinode sft", "双机lora训练", "双机sft", "多机lora批量训练", "多机lora训练", "多机sft", "多机SFT", "多机SFT LoRA", "多机sft lora训练"],
+                "supports_background": True,
+                "long_running": True,
+                "default_env": {},
+                "supported_params": [],
+                "cli_args_only": True,
+                "default_cli_args": {},
+                "supported_cli_params": MULTINODE_SFT_CLI_PARAMS,
+                "required_cli_params": [],
+                "boolean_cli_params": sorted(MULTINODE_BOOLEAN_CLI_PARAMS),
+                "param_mapping": MULTINODE_PARAM_MAPPING,
+                "default_args": {
+                    "background": True,
+                    "capture_output": False,
+                    "startup_ready_marker": "MEDFLOW_TRAINING_COMMAND_READY",
+                    "startup_ready_timeout": 15,
+                    "startup_poll_interval": 1,
+                },
+                "docker_container": MULTINODE_DOCKER_CONTAINER,
+                "docker_working_dir": "/home/workspace/llamafactory",
+                "docker_executable": "python",
+                "requires_docker": True,
+                "resource_request": {
+                    "enabled": True, "multinode": True, "node_count": 2, "gpus_per_node": 1,
+                },
+            },
+            MULTINODE_SFT_FULL_SCRIPT: {
+                "path": f"{MULTINODE_SFT_FULL_SCRIPT}.py",
+                "description": "多机全参 SFT 训练工具",
+                "aliases": [
+                    "双机全参 SFT", "双机全参SFT", "多机全参 SFT", "多机全参SFT",
+                    "多机全参训练", "multinode_full_sft", "multinode full sft",
+                    "multi-node full sft", "train_multinode_sft_full_pipeline",
+                ],
                 "supports_background": True,
                 "long_running": True,
                 "default_env": {},
@@ -1757,8 +1921,60 @@ class ScriptManager:
             },
         }
         
+        self._apply_training_descriptors()
+
         # 添加脚本配置验证
         self._validate_scripts()
+
+    def _apply_training_descriptors(self):
+        """Use read-only descriptors to backfill training script metadata."""
+        validate_training_descriptors()
+        for descriptor in list_training_descriptors():
+            script_name = str(descriptor.get("id") or "").strip()
+            info = self.scripts.get(script_name)
+            if not info:
+                continue
+            info["training_descriptor"] = descriptor
+
+            aliases = list(info.get("aliases") or [])
+            for alias in [descriptor.get("displayName"), *(descriptor.get("aliases") or [])]:
+                if alias and alias not in aliases:
+                    aliases.append(alias)
+            info["aliases"] = aliases
+
+            params = descriptor.get("params") or []
+            invocation_style = str((descriptor.get("entry") or {}).get("invocationStyle") or "").strip()
+            if invocation_style == "env":
+                supported_params = list(info.get("supported_params") or [])
+                default_env = dict(info.get("default_env") or {})
+                for param in params:
+                    name = str(param.get("name") or "").strip()
+                    if name and name not in supported_params:
+                        supported_params.append(name)
+                    if name and param.get("default") is not None and name not in default_env:
+                        default_env[name] = str(param.get("default"))
+                info["supported_params"] = supported_params
+                info["default_env"] = default_env
+                continue
+
+            supported_cli_params = list(info.get("supported_cli_params") or [])
+            default_cli_args = dict(info.get("default_cli_args") or {})
+            for param in params:
+                for key in _training_descriptor_param_keys(param):
+                    if key and key not in supported_cli_params:
+                        supported_cli_params.append(key)
+                name = str(param.get("name") or "").strip()
+                if name and param.get("default") is not None and name not in default_cli_args:
+                    default_cli_args[name] = str(param.get("default"))
+            required_cli_params = [
+                str(param.get("name") or "").strip()
+                for param in params
+                if param.get("required") and not param.get("resourceOnly")
+            ]
+            if required_cli_params:
+                info["required_cli_params"] = required_cli_params
+            info["supported_cli_params"] = supported_cli_params
+            info["default_cli_args"] = default_cli_args
     
     def _validate_scripts(self):
         """验证脚本配置"""
@@ -1802,6 +2018,9 @@ class ScriptManager:
             if "dpo" in query or "增强" in query:
                 info = self.scripts.get(MULTINODE_DPO_SCRIPT)
                 return {**info, "name": MULTINODE_DPO_SCRIPT} if info else None
+            if "全参" in query or "full" in query:
+                info = self.scripts.get(MULTINODE_SFT_FULL_SCRIPT)
+                return {**info, "name": MULTINODE_SFT_FULL_SCRIPT} if info else None
             if "sft" in query or "lora" in query or "批量" in query:
                 info = self.scripts.get(MULTINODE_SFT_SCRIPT)
                 return {**info, "name": MULTINODE_SFT_SCRIPT} if info else None
@@ -2280,15 +2499,14 @@ def _training_template_value(
     env_vars = env_vars or {}
     cli_args = cli_args or {}
     if script_name in BATCH_TRAIN_SCRIPT_NAMES:
-        return str(env_vars.get("TEM") or DEFAULT_TEMPLATE).strip()
-    if script_name in {MULTINODE_SFT_SCRIPT, "dpo_train_launcher", MULTINODE_DPO_SCRIPT}:
+        return str(env_vars.get("TEM") or "").strip()
+    if script_name in {MULTINODE_SFT_SCRIPT, MULTINODE_SFT_FULL_SCRIPT, "dpo_train_launcher", MULTINODE_DPO_SCRIPT}:
         return first_nonempty(
             [
                 cli_args.get("template"),
                 cli_args.get("TEM"),
                 env_vars.get("template"),
                 env_vars.get("TEM"),
-                DEFAULT_TEMPLATE,
             ]
         )
     return ""
@@ -2311,7 +2529,7 @@ def _training_model_hint(
                 cli_args.get("model_path"),
             ]
         )
-    if script_name in {MULTINODE_SFT_SCRIPT, "dpo_train_launcher", MULTINODE_DPO_SCRIPT}:
+    if script_name in {MULTINODE_SFT_SCRIPT, MULTINODE_SFT_FULL_SCRIPT, "dpo_train_launcher", MULTINODE_DPO_SCRIPT}:
         values.extend(
             [
                 cli_args.get("model_path"),
@@ -2328,9 +2546,6 @@ def _training_template_policy_issue(
     container: str,
     env_vars: Optional[Dict[str, Any]],
     cli_args: Optional[Dict[str, Any]],
-    *,
-    explicit_template: bool,
-    model_hint: str = "",
 ) -> Optional[Dict[str, Any]]:
     if script_name not in {
         "batch_train_lora",
@@ -2339,27 +2554,53 @@ def _training_template_policy_issue(
         PRETRAIN_FULL_SCRIPT,
         "dpo_train_launcher",
         MULTINODE_SFT_SCRIPT,
+        MULTINODE_SFT_FULL_SCRIPT,
         MULTINODE_DPO_SCRIPT,
     }:
         return None
     template = _training_template_value(script_name, env_vars, cli_args)
     param = "TEM" if script_name in BATCH_TRAIN_SCRIPT_NAMES else "template"
-    template_issue = template_validation_issue(template, param=param, container=container)
-    if template_issue:
-        return template_issue
-
-    detected_model_hint = model_hint or _training_model_hint(script_name, env_vars, cli_args)
-    if (
-        not explicit_template
-        and normalize_template(template) == DEFAULT_TEMPLATE
-        and text_mentions_non_qwen3_model(detected_model_hint)
-    ):
-        return non_qwen3_template_required_issue(
-            param=param,
-            container=container,
-            model_hint=detected_model_hint,
-        )
+    if not template:
+        return {
+            "error_reason": "template_resolution_required",
+            "message": "尚未解析出有效的模型模板，已阻止启动。",
+            "container": container,
+            "param": param,
+        }
     return None
+
+
+def _resolve_latest_model_path_in_container(
+    container: str,
+    model_root: str = "/home/workspace/models/base",
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """Pin the same lexicographically latest model directory used by legacy launchers."""
+    try:
+        result = subprocess.run(
+            [
+                "docker", "exec", container, "sh", "-c",
+                'for dir in "$1"/*; do [ -d "$dir" ] || continue; basename "$dir"; done | sort | tail -n 1',
+                "model-resolve", model_root,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, {
+            "error_reason": "model_resolution_unavailable",
+            "message": f"无法自动选择基础模型：{exc}",
+            "container": container,
+        }
+    name = str(result.stdout or "").strip()
+    if result.returncode != 0 or not name:
+        return None, {
+            "error_reason": "model_path_missing",
+            "message": f"基础模型目录中没有可用模型：{model_root}。",
+            "container": container,
+            "modelRoot": model_root,
+        }
+    return f"{model_root.rstrip('/')}/{name}", None
 
 
 def validate_training_inputs_preflight(
@@ -2367,6 +2608,7 @@ def validate_training_inputs_preflight(
     container: str,
     env_vars: Optional[Dict[str, Any]] = None,
     cli_args: Optional[Dict[str, Any]] = None,
+    require_template: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """Validate local training inputs inside Docker before reserving GPUs."""
     env_vars = env_vars or {}
@@ -2380,21 +2622,31 @@ def validate_training_inputs_preflight(
         PRETRAIN_FULL_SCRIPT,
         "dpo_train_launcher",
         MULTINODE_SFT_SCRIPT,
+        MULTINODE_SFT_FULL_SCRIPT,
         MULTINODE_DPO_SCRIPT,
         "grpo_train",
     }
     if script_name not in supported_scripts:
         return None
 
-    template_issue = _training_template_policy_issue(
+    descriptor_issue = _descriptor_required_param_issue(
         script_name,
         container,
         env_vars,
         cli_args,
-        explicit_template=False,
     )
-    if template_issue:
-        return template_issue
+    if descriptor_issue:
+        return descriptor_issue
+
+    if require_template:
+        template_issue = _training_template_policy_issue(
+            script_name,
+            container,
+            env_vars,
+            cli_args,
+        )
+        if template_issue:
+            return template_issue
     def issue(reason: str, message: str, **fields: Any) -> Dict[str, Any]:
         return {
             "error_reason": reason,
@@ -2509,6 +2761,9 @@ def validate_training_inputs_preflight(
         missing_file_names: List[str] = []
         unsafe_file_names: List[str] = []
         missing_dataset_files: List[str] = []
+        multimodal_dataset_names: List[str] = []
+        sample_file_paths: List[str] = []
+        unsupported_file_names: List[str] = []
         for raw_name in selected_names:
             key = str(raw_name).strip()
             if not key:
@@ -2517,13 +2772,30 @@ def validate_training_inputs_preflight(
             if not isinstance(entry, dict):
                 missing_dataset_names.append(key)
                 continue
+            columns = entry.get("columns") if isinstance(entry.get("columns"), dict) else {}
+            media_columns = {
+                str(column_key).strip().lower()
+                for column_key, column_value in columns.items()
+                if str(column_key).strip().lower() in {"image", "images", "video", "videos", "audio", "audios"}
+                or str(column_value).strip().lower() in {"image", "images", "video", "videos", "audio", "audios"}
+            }
+            if media_columns:
+                multimodal_dataset_names.append(f"{key}: {', '.join(sorted(media_columns))}")
             file_name = entry.get("file_name")
             if not isinstance(file_name, str) or not file_name.strip():
                 missing_file_names.append(key)
                 continue
             clean_file_name = file_name.strip()
+            if script_name in PRETRAIN_SCRIPT_NAMES and clean_file_name.lower().endswith(".txt"):
+                unsupported_file_names.append(f"{key}: {clean_file_name}")
+                continue
             parts = [part for part in clean_file_name.split("/") if part]
-            if clean_file_name.startswith("/") or "\\" in clean_file_name or ".." in parts:
+            if (
+                clean_file_name.startswith("/")
+                or "\\" in clean_file_name
+                or ".." in parts
+                or any(ord(char) < 32 for char in clean_file_name)
+            ):
                 unsafe_file_names.append(f"{key}: {clean_file_name}")
                 continue
             file_check = run_shell(f"test -f {shlex.quote(dataset_dir + '/' + clean_file_name)}")
@@ -2531,6 +2803,8 @@ def validate_training_inputs_preflight(
                 return file_check
             if file_check.returncode != 0:
                 missing_dataset_files.append(f"{key}: {clean_file_name}")
+            else:
+                sample_file_paths.append(dataset_dir + "/" + clean_file_name)
 
         if missing_dataset_names:
             return issue(
@@ -2546,6 +2820,22 @@ def validate_training_inputs_preflight(
                 dataset_dir=dataset_dir,
                 missing_dataset_names=missing_file_names,
             )
+        if unsupported_file_names:
+            return issue(
+                "dataset_file_type_unsupported",
+                "PT 资源目录不支持 .txt；请使用已登记的 JSON 或 JSONL 数据集："
+                + ", ".join(unsupported_file_names),
+                dataset_dir=dataset_dir,
+                unsupported_file_names=unsupported_file_names,
+            )
+        if multimodal_dataset_names:
+            return issue(
+                "multimodal_training_not_supported",
+                "当前通用训练一期仅支持文本数据；以下数据集声明了图片、视频或音频列："
+                + ", ".join(multimodal_dataset_names),
+                dataset_dir=dataset_dir,
+                multimodal_datasets=multimodal_dataset_names,
+            )
         if unsafe_file_names:
             return issue(
                 "dataset_info_file_name_invalid",
@@ -2560,13 +2850,131 @@ def validate_training_inputs_preflight(
                 dataset_dir=dataset_dir,
                 missing_dataset_files=missing_dataset_files,
             )
+        inspectable_paths = [
+            path for path in sample_file_paths
+            if os.path.splitext(path)[1].lower() in {".json", ".jsonl", ".csv", ".parquet"}
+        ]
+        if inspectable_paths:
+            sample_code = "\n".join([
+                "import csv,json,os,sys",
+                "media={'image','images','video','videos','audio','audios'}",
+                "bad={}",
+                "limit=32",
+                "def add(path,row):",
+                "    if not isinstance(row,dict): return",
+                "    found={str(key).lower() for key in row.keys() if str(key).lower() in media}",
+                "    if found: bad.setdefault(path,set()).update(found)",
+                "def inspect_json_lines(path):",
+                "    count=0",
+                "    with open(path,'r',encoding='utf-8-sig',errors='replace') as fh:",
+                "        for line in fh:",
+                "            if count>=limit: break",
+                "            line=line.strip()",
+                "            if not line: continue",
+                "            try: value=json.loads(line)",
+                "            except Exception: continue",
+                "            if isinstance(value,list):",
+                "                for row in value[:max(0,limit-count)]: add(path,row); count+=1",
+                "            else:",
+                "                add(path,value); count+=1",
+                "    return count",
+                "def inspect_json_array(path):",
+                "    decoder=json.JSONDecoder(); buf=''; pos=0; count=0; eof=False",
+                "    def fill(fh):",
+                "        nonlocal buf,eof",
+                "        chunk=fh.read(65536)",
+                "        if chunk: buf+=chunk",
+                "        else: eof=True",
+                "    def skip_ws():",
+                "        nonlocal pos",
+                "        while True:",
+                "            while pos<len(buf) and buf[pos] in ' \\t\\r\\n,': pos+=1",
+                "            if pos<len(buf) or eof: return",
+                "            fill(fh)",
+                "    with open(path,'r',encoding='utf-8-sig',errors='replace') as fh:",
+                "        fill(fh); skip_ws()",
+                "        if pos>=len(buf) or buf[pos]!='[': return",
+                "        pos+=1",
+                "        while count<limit:",
+                "            skip_ws()",
+                "            if pos<len(buf) and buf[pos]==']': break",
+                "            while True:",
+                "                try:",
+                "                    row,end=decoder.raw_decode(buf,pos)",
+                "                    break",
+                "                except json.JSONDecodeError:",
+                "                    if eof: return",
+                "                    fill(fh)",
+                "            add(path,row); count+=1; pos=end",
+                "            if pos>1048576: buf=buf[pos:]; pos=0",
+                "def inspect_json(path):",
+                "    if inspect_json_lines(path): return",
+                "    try: inspect_json_array(path)",
+                "    except Exception: pass",
+                "def inspect_csv(path):",
+                "    with open(path,'r',encoding='utf-8-sig',errors='replace',newline='') as fh:",
+                "        reader=csv.DictReader(fh)",
+                "        add(path,{key:None for key in (reader.fieldnames or [])})",
+                "        for index,row in enumerate(reader):",
+                "            if index>=limit: break",
+                "            add(path,row)",
+                "def inspect_parquet(path):",
+                "    try:",
+                "        import pyarrow.parquet as pq",
+                "        names=getattr(pq.read_schema(path),'names',[])",
+                "        found={str(name).lower() for name in names if str(name).lower() in media}",
+                "        if found: bad.setdefault(path,set()).update(found)",
+                "    except Exception: pass",
+                "for path in sys.argv[1:]:",
+                "    ext=os.path.splitext(path)[1].lower()",
+                "    try:",
+                "        if ext in {'.json','.jsonl'}: inspect_json(path)",
+                "        elif ext=='.csv': inspect_csv(path)",
+                "        elif ext=='.parquet': inspect_parquet(path)",
+                "    except Exception: pass",
+                "print(json.dumps({path:sorted(keys) for path,keys in bad.items()},ensure_ascii=False))",
+            ])
+            quoted_paths = " ".join(shlex.quote(path) for path in inspectable_paths)
+            sample_result = run_shell(
+                "PY=$([ -x /opt/conda/bin/python ] && echo /opt/conda/bin/python || command -v python3 || command -v python); "
+                + "$PY -c " + shlex.quote(sample_code) + " " + quoted_paths
+            )
+            if isinstance(sample_result, dict):
+                return sample_result
+            if sample_result.returncode != 0:
+                detail = str(sample_result.stderr or sample_result.stdout or "").strip()
+                return issue(
+                    "dataset_sample_validation_unavailable",
+                    f"无法检查训练数据首批样本结构，已阻止启动：{detail or '样本读取失败'}",
+                    dataset_dir=dataset_dir,
+                )
+            try:
+                sample_output = [
+                    line.strip()
+                    for line in str(sample_result.stdout or "").splitlines()
+                    if line.strip()
+                ]
+                sample_media = json.loads(sample_output[-1] if sample_output else "{}")
+            except (TypeError, ValueError):
+                return issue(
+                    "dataset_sample_validation_unavailable",
+                    "训练数据首批样本结构检查返回了无效结果，已阻止启动。",
+                    dataset_dir=dataset_dir,
+                )
+            if isinstance(sample_media, dict) and sample_media:
+                return issue(
+                    "multimodal_training_not_supported",
+                    "当前通用训练一期仅支持文本数据；首批样本中检测到图片、视频或音频字段。",
+                    dataset_dir=dataset_dir,
+                    multimodal_samples=sample_media,
+                )
         return None
 
     def split_local_files(value: str) -> List[str]:
         return [item.strip() for item in str(value or "").split(",") if item.strip()]
 
     resume_issue = validate_resume_checkpoint()
-    if resume_issue and script_name in BATCH_TRAIN_SCRIPT_NAMES | {MULTINODE_SFT_SCRIPT, MULTINODE_DPO_SCRIPT}:
+    if resume_issue and script_name in BATCH_TRAIN_SCRIPT_NAMES | {MULTINODE_SFT_SCRIPT, MULTINODE_SFT_FULL_SCRIPT, MULTINODE_DPO_SCRIPT}:
         return resume_issue
 
     if script_name in BATCH_TRAIN_SCRIPT_NAMES:
@@ -2591,7 +2999,7 @@ def validate_training_inputs_preflight(
             dataset_dir = f"{base_dataset_path}/{latest_name}"
         return validate_dataset_info_dir(dataset_dir)
 
-    if script_name == MULTINODE_SFT_SCRIPT:
+    if script_name in {MULTINODE_SFT_SCRIPT, MULTINODE_SFT_FULL_SCRIPT}:
         dataset_dir = _cli_arg_value(cli_args, "dataset-dir", "dataset_dir").strip().rstrip("/")
         dataset_date = _cli_arg_value(cli_args, "dataset-date", "dataset_date").strip()
         base_dataset_path = (
@@ -2683,51 +3091,7 @@ def validate_training_inputs_preflight(
             dataset_dir=dataset_dir,
         )
 
-    info: Dict[str, Any] = {}
-    info_result = run_shell(f"cat {shlex.quote(dataset_dir + '/dataset_info.json')} 2>/dev/null")
-    if isinstance(info_result, dict):
-        return info_result
-    if info_result.returncode == 0 and str(info_result.stdout or "").strip():
-        try:
-            decoded = json.loads(info_result.stdout)
-            if isinstance(decoded, dict):
-                info = decoded
-        except (TypeError, ValueError):
-            return issue(
-                "dataset_validation_unavailable",
-                f"dataset_info.json 格式无效：{dataset_dir}/dataset_info.json",
-                dataset_dir=dataset_dir,
-                dataset_name=dataset_name,
-            )
-
-    missing_names: List[str] = []
-    for name in names:
-        candidates = [name] if name.endswith((".json", ".jsonl")) else [f"{name}.json", f"{name}.jsonl"]
-        entry = info.get(name)
-        if isinstance(entry, dict):
-            file_name = entry.get("file_name")
-            if isinstance(file_name, str) and file_name.strip():
-                candidates.insert(0, file_name.strip())
-            elif isinstance(file_name, list):
-                candidates = [str(value).strip() for value in file_name if str(value).strip()] + candidates
-        command = " || ".join(
-            f"test -f {shlex.quote(dataset_dir + '/' + candidate)}"
-            for candidate in dict.fromkeys(candidates)
-        )
-        check = run_shell(command)
-        if isinstance(check, dict):
-            return check
-        if check.returncode != 0:
-            missing_names.append(name)
-    if missing_names:
-        return issue(
-            "dataset_name_missing",
-            f"数据目录 {dataset_dir} 中找不到 dataset_name 对应文件：{', '.join(missing_names)}。",
-            dataset_dir=dataset_dir,
-            dataset_name=dataset_name,
-            missing_dataset_names=missing_names,
-        )
-    return None
+    return validate_dataset_info_dir(dataset_dir, dataset_names=names)
 
 def _training_preflight_issue(reason: str, message: str, **fields: Any) -> Dict[str, Any]:
     return {
@@ -2836,6 +3200,16 @@ def _train_protocol_hint(
         "scriptName": script_for_inference or script_name,
         "content": message,
     }
+    descriptor = _training_descriptor_for_script(script_for_inference or script_name)
+    if descriptor:
+        hint.update({
+            "descriptorId": descriptor.get("id"),
+            "paramSchema": descriptor.get("params") or [],
+            "resourceSelectors": descriptor.get("resourceSelectors") or [],
+            "invocationStyle": (descriptor.get("entry") or {}).get("invocationStyle"),
+            "trainingStage": descriptor.get("stage"),
+            "finetuningType": descriptor.get("finetuningType"),
+        })
     if protocol_type == "need_input":
         required_params = fields.get("requiredParams") or fields.get("required_params") or []
         fields.setdefault("status", "needs_input")
@@ -2983,8 +3357,6 @@ def run_script_by_name_train(
         key for key in MANUAL_GPU_ENV_KEYS
         if resource_request and key in (env_vars or {}) and str((env_vars or {}).get(key) or "").strip()
     ]
-    explicit_template_provided = False
-    non_qwen3_model_hints: List[str] = []
     
      # 修改：为特定脚本添加特殊处理
     if script_name == "create_command_vpn":
@@ -3001,7 +3373,7 @@ def run_script_by_name_train(
         for param_name, param_value in additional_args.items():
             # 批量训练里“数据集/数据集名称=20260506”常被模型写成 dataset_name。
             # LoRA/全参批量训练不使用 dataset_name；日期型值应作为 DATASET_DATE 处理。
-            if script_name in BATCH_TRAIN_SCRIPT_NAMES | {MULTINODE_SFT_SCRIPT}:
+            if script_name in BATCH_TRAIN_SCRIPT_NAMES | {MULTINODE_SFT_SCRIPT, MULTINODE_SFT_FULL_SCRIPT}:
                 pname = str(param_name).strip()
                 pname_lower = pname.lower()
                 pvalue = str(param_value).strip()
@@ -3009,7 +3381,7 @@ def run_script_by_name_train(
                     pname in {"数据集名称", "数据集名"}
                     or pname_lower in {"dataset_name", "data_name"}
                 ) and re.fullmatch(r"20\d{6}(?:_[A-Za-z0-9][A-Za-z0-9_.-]*)?", pvalue):
-                    if script_name == MULTINODE_SFT_SCRIPT:
+                    if script_name in {MULTINODE_SFT_SCRIPT, MULTINODE_SFT_FULL_SCRIPT}:
                         cli_params_to_update["dataset-date"] = pvalue
                     else:
                         params_to_update["DATASET_DATE"] = pvalue
@@ -3018,7 +3390,7 @@ def run_script_by_name_train(
             pname = str(param_name).strip()
             pname_lower = pname.lower()
             normalized_launcher_param = pname_lower.replace("_", "-")
-            template_managed_script = script_name in BATCH_TRAIN_SCRIPT_NAMES | {MULTINODE_SFT_SCRIPT, "dpo_train_launcher", MULTINODE_DPO_SCRIPT}
+            template_managed_script = script_name in BATCH_TRAIN_SCRIPT_NAMES | {MULTINODE_SFT_SCRIPT, MULTINODE_SFT_FULL_SCRIPT, "dpo_train_launcher", MULTINODE_DPO_SCRIPT}
             if _is_multinode_train_script(script_name):
                 multinode_cli_param = script_info.get("param_mapping", {}).get(pname)
                 if not multinode_cli_param:
@@ -3040,7 +3412,6 @@ def run_script_by_name_train(
                         unknown_params.append(f"{param_name} ({multinode_cli_param})")
                     continue
             if template_managed_script and (pname in TEMPLATE_PARAM_KEYS or pname_lower in {"tem", "template"}):
-                explicit_template_provided = True
                 if script_info.get("cli_args_only", False):
                     cli_params_to_update["template"] = str(param_value).strip()
                 else:
@@ -3054,17 +3425,23 @@ def run_script_by_name_train(
                 )
                 if is_batch_model_path:
                     params_to_update["MODEL_PATH"] = hint
-                    if text_mentions_non_qwen3_model(hint):
-                        non_qwen3_model_hints.append(hint)
                     continue
-                if text_mentions_non_qwen3_model(hint):
-                    non_qwen3_model_hints.append(hint)
-                    continue
-                if "qwen3" in hint.lower() or "qwen-3" in hint.lower():
-                    if script_info.get("cli_args_only", False):
-                        cli_params_to_update["template"] = DEFAULT_TEMPLATE
-                    else:
-                        params_to_update["TEM"] = DEFAULT_TEMPLATE
+                mapped_model_param = None
+                if script_info.get("param_mapping"):
+                    mapped_model_param = (
+                        script_info.get("param_mapping", {}).get(pname)
+                        or script_info.get("param_mapping", {}).get(pname_lower)
+                    )
+                if not mapped_model_param and pname in script_info.get("supported_cli_params", []):
+                    mapped_model_param = pname
+                if not mapped_model_param and pname_lower in script_info.get("supported_cli_params", []):
+                    mapped_model_param = pname_lower
+                if mapped_model_param in script_info.get("supported_cli_params", []):
+                    cli_params_to_update[mapped_model_param] = _coerce_cli_value(
+                        script_info,
+                        mapped_model_param,
+                        hint,
+                    )
                     continue
             if normalized_launcher_param in RESOURCE_LAUNCHER_ONLY_PARAMS:
                 launcher_options[normalized_launcher_param] = param_value
@@ -3201,7 +3578,7 @@ def run_script_by_name_train(
             base_dataset_path = "/home/workspace/dataset_pretrain" if script_name in PRETRAIN_SCRIPT_NAMES else "/home/workspace/dataset_batch_train"
             if dataset_date and dataset_dir.endswith(base_dataset_path):
                 params_to_update["DATASET_DIR"] = f"{dataset_dir}/{dataset_date}"
-        elif script_name == MULTINODE_SFT_SCRIPT:
+        elif script_name in {MULTINODE_SFT_SCRIPT, MULTINODE_SFT_FULL_SCRIPT}:
             dataset_date = str(cli_params_to_update.get("dataset-date") or "").strip()
             dataset_dir = str(cli_params_to_update.get("dataset-dir") or "").strip().rstrip("/")
             if dataset_date and dataset_dir.endswith("/dataset_batch_train"):
@@ -3235,15 +3612,124 @@ def run_script_by_name_train(
         or script_info.get("docker_container")
         or DEFAULT_DOCKER_CONTAINER
     )
+    container_issue = _validate_training_container_preflight(normalize_container)
+    if container_issue:
+        return _train_error_response(
+            script_name,
+            str(container_issue["message"]),
+            error_reason=str(container_issue["error_reason"]),
+            required_params=container_issue.get("required_params"),
+            recoverable=True,
+            **{
+                key: value
+                for key, value in container_issue.items()
+                if key not in {"message", "error_reason", "required_params"}
+            },
+        )
     _normalize_dpo_cli_args(script_name, cli_args, normalize_container)
     _normalize_multinode_cli_args(script_name, cli_args)
+
+    resolution_env = {**(env_vars or {}), **params_to_update}
+    descriptor_issue = _descriptor_required_param_issue(
+        script_name,
+        normalize_container,
+        resolution_env,
+        cli_args,
+        script_info,
+    )
+    if descriptor_issue:
+        return _train_error_response(
+            script_name,
+            str(descriptor_issue["message"]),
+            error_reason=str(descriptor_issue["error_reason"]),
+            required_params=descriptor_issue.get("required_params"),
+            missing_params=descriptor_issue.get("missing_params"),
+            recoverable=True,
+            **{
+                key: value
+                for key, value in descriptor_issue.items()
+                if key not in {"message", "error_reason", "required_params", "missing_params"}
+            },
+        )
+
+    template_resolution = None
+    template_managed_script = script_name in BATCH_TRAIN_SCRIPT_NAMES | {
+        MULTINODE_SFT_SCRIPT,
+        MULTINODE_SFT_FULL_SCRIPT,
+        "dpo_train_launcher",
+        MULTINODE_DPO_SCRIPT,
+    }
+    if template_managed_script:
+        model_hint = _training_model_hint(script_name, resolution_env, cli_args)
+        if not model_hint and script_name in BATCH_TRAIN_SCRIPT_NAMES | {MULTINODE_SFT_SCRIPT, MULTINODE_SFT_FULL_SCRIPT}:
+            model_root = (
+                _cli_arg_value(cli_args, "base-model-path", "base_model_path").strip()
+                or "/home/workspace/models/base"
+            )
+            model_hint, model_issue = _resolve_latest_model_path_in_container(
+                normalize_container,
+                model_root,
+            )
+            if model_issue:
+                return _train_error_response(
+                    script_name,
+                    str(model_issue["message"]),
+                    error_reason=str(model_issue["error_reason"]),
+                    recoverable=True,
+                    **{
+                        key: value
+                        for key, value in model_issue.items()
+                        if key not in {"message", "error_reason"}
+                    },
+                )
+            if script_name in BATCH_TRAIN_SCRIPT_NAMES:
+                params_to_update["MODEL_PATH"] = str(model_hint)
+                resolution_env["MODEL_PATH"] = str(model_hint)
+            else:
+                cli_args["model-path"] = str(model_hint)
+
+        explicit_template_value = _training_template_value(script_name, resolution_env, cli_args)
+        template_resolution = resolve_model_template(
+            normalize_container,
+            str(model_hint or ""),
+            str((_training_descriptor_for_script(script_name) or {}).get("stage") or ""),
+            explicit_template_value or None,
+        )
+        if template_resolution.get("status") != "resolved":
+            reason = str(template_resolution.get("error_reason") or "template_resolution_unknown")
+            needs_choice = reason in {"template_resolution_ambiguous", "template_resolution_unknown"}
+            return _train_error_response(
+                script_name,
+                str(template_resolution.get("message") or "无法识别模型模板。"),
+                error_reason=reason,
+                required_params=["template"] if needs_choice else None,
+                missing_params=["template"] if needs_choice else None,
+                recoverable=True,
+                options=template_resolution.get("options") or None,
+                availableOptions=template_resolution.get("availableOptions"),
+                modelHint=model_hint,
+                evidence=template_resolution.get("evidence"),
+                template=template_resolution.get("template"),
+                detail=template_resolution.get("detail"),
+            )
+        resolved_template = str(template_resolution["template"])
+        if script_name in BATCH_TRAIN_SCRIPT_NAMES:
+            params_to_update["TEM"] = resolved_template
+            resolution_env["TEM"] = resolved_template
+        else:
+            cli_args["template"] = resolved_template
+        logger.info(
+            "Resolved LLaMA-Factory template=%s source=%s evidence=%s",
+            resolved_template,
+            template_resolution.get("source"),
+            template_resolution.get("evidence"),
+        )
+
     template_issue = _training_template_policy_issue(
         script_name,
         normalize_container,
-        params_to_update,
+        resolution_env,
         cli_args,
-        explicit_template=explicit_template_provided,
-        model_hint=first_nonempty(non_qwen3_model_hints),
     )
     if template_issue:
         return _train_error_response(
@@ -3536,7 +4022,7 @@ def run_script_by_name_train(
                 },
             )
 
-        if script_name in {MULTINODE_SFT_SCRIPT, MULTINODE_DPO_SCRIPT} and docker_kwargs.get("docker_container"):
+        if script_name in {MULTINODE_SFT_SCRIPT, MULTINODE_SFT_FULL_SCRIPT, MULTINODE_DPO_SCRIPT} and docker_kwargs.get("docker_container"):
             selected_entry, entry_error = _select_multinode_docker_entrypoint(
                 str(docker_kwargs["docker_container"]),
                 script_name,
@@ -3698,6 +4184,9 @@ def run_script_by_name_train(
             if v is not None:
                 run_kwargs[k] = v
 
+        if template_resolution:
+            run_kwargs["template_resolution"] = template_resolution
+
         preflight_args = dict(args)
         if script_name == "grpo_train" and "_grpo_preflight" in launcher_options:
             preflight_args["_grpo_preflight"] = launcher_options["_grpo_preflight"]
@@ -3724,6 +4213,26 @@ def run_script_by_name_train(
                     if key not in {"message", "error_reason", "required_params"}
                 },
             )
+        if template_resolution:
+            changed_issue = verify_model_template_resolution(
+                str(docker_kwargs["docker_container"]),
+                str(model_hint or ""),
+                str((_training_descriptor_for_script(script_name) or {}).get("stage") or ""),
+                template_resolution,
+                explicit_template=explicit_template_value or None,
+            )
+            if changed_issue:
+                return _train_error_response(
+                    script_name,
+                    str(changed_issue["message"]),
+                    error_reason=str(changed_issue["error_reason"]),
+                    recoverable=True,
+                    **{
+                        key: value
+                        for key, value in changed_issue.items()
+                        if key not in {"message", "error_reason"}
+                    },
+                )
         log_file = run_kwargs.get("log_file") or script_info.get("default_args", {}).get("log_file")
         if log_file:
             run_kwargs["log_file"] = log_file
@@ -4134,6 +4643,7 @@ def run_docker_in_background(
     startup_ready_timeout: int = 15,
     startup_poll_interval: float = 1.0,
     startup_stability_seconds: float = 2.0,
+    template_resolution: Optional[Dict[str, Any]] = None,
     **kwargs
 ) -> ToolResponse:
     """
@@ -4428,6 +4938,8 @@ def run_docker_in_background(
                     scriptArgs=script_args or {},
                     envKeys=sorted((env_vars or {}).keys()),
                     launchLogPath=log_file,
+                    templateResolution=template_resolution,
+                    warnings=(template_resolution or {}).get("warnings"),
                 )
 
             response_text = (
@@ -4451,6 +4963,8 @@ def run_docker_in_background(
                     command=" ".join(command),
                     scriptArgs=script_args or {},
                     envKeys=sorted((env_vars or {}).keys()),
+                    templateResolution=template_resolution,
+                    warnings=(template_resolution or {}).get("warnings"),
                 ),
             })
 

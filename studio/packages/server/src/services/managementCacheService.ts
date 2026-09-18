@@ -501,6 +501,8 @@ export class ManagementCacheService {
           version: model.version,
           description: model.description,
           checkpoints: model.checkpoints,
+          artifactType: model.artifactType,
+          artifactTypes: model.artifactTypes,
           ...(typeof model.merged === "boolean"
             ? { merged: model.merged }
             : {}),

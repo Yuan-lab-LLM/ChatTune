@@ -18,21 +18,21 @@
 
 ## 一键工作流
 
-一键工作流用于把一次完整的模型迭代串联起来。用户选择训练数据集和评测集后，系统会依次推进以下阶段：
+一键工作流用于把一次完整的模型迭代串联起来。用户选择训练数据集和部署后基准评测集后，系统会依次推进以下阶段：
 
-1. 模型训练：根据数据位置自动执行 LoRA 批量训练/增强训练。
-2. 医疗评估：对训练产出的模型执行单模型评估。
+1. 模型训练：根据数据类型自动选择训练方式：SFT 数据执行 LoRA SFT，DPO 数据执行增强训练，PT/text 数据固定执行 LoRA PT。
+2. 模型评估：在训练后执行；新建工作流默认使用 LLaMA-Factory 通用评测，范围为 `general`，数据集为 `ceval,cmmlu`。
 3. 模型发布：将训练结果复制到配置的发布目录并形成可部署版本。
 4. 推理部署：更新推理配置、重启推理服务并确认服务状态。
-5. 基准评测：使用选定的评测集运行推理 Benchmark。
+5. 部署后基准评测：使用面板中选定的评测集运行推理 Benchmark。
 
-工作流启动后，页面状态栏会持续显示当前阶段及训练、评估、发布、部署和基准评测的进度。工作流状态会持久化；任务失败时可根据页面显示的原因处理后继续执行。
+工作流启动后，页面状态栏会持续显示当前阶段及训练、模型评估、发布、部署和部署后基准评测的进度。工作流状态会持久化；任务失败时可根据页面显示的原因处理后继续执行。
 
 ### 页面操作步骤
 
 1. 进入项目的运行页面，在右上角区域选择“一键工作流”按钮。
 2. 在右侧“一键工作流”面板中选择训练数据集。训练数据集为必选项；如列表未更新，可点击“刷新数据集”。
-3. 选择评测集。评测集为可选项；未选择时默认使用 `2024.json`。
+3. 选择部署后基准评测集。它只用于部署后的推理 Benchmark，与训练后的模型评估数据集分别配置；未选择时默认使用 `2024.json`。
 4. 检查面板中的命令预览，然后点击“生成命令”。该操作会把命令放入聊天输入框。
 5. 确认生成的命令和数据集无误后，点击聊天框右下角的发送按钮，正式执行一键工作流。
 6. 工作流启动后，通过页面状态栏查看各阶段进度。
@@ -49,6 +49,13 @@
 
 工作流 ID 形如 `wf-YYYYMMDDHHMMSS-xxxxxxxx`，启动后会显示在状态信息中。同时存在多个工作流时，应在控制命令中带上工作流 ID。
 
+新建工作流未指定模型评估配置时，默认使用 `evaluation_scope=general，eval_datasets=ceval,cmmlu`。可修改生成的命令覆盖模型评估配置；面板选择的部署后基准评测集不会更改这些参数。例如：
+
+```text
+我想用20260908这个数据一键训练、部署并评测模型，evaluation_scope=general，eval_datasets=ceval,cmmlu,mmlu
+我想用20260908这个数据一键训练、部署并评测模型，evaluation_scope=medical
+```
+
 ## 数据处理
 
 | 用途 | 自然语言示例 |
@@ -59,7 +66,16 @@
 
 参数不足时，Agent 会继续询问。
 
-数据预处理支持 `sft`、`dpo` 数据格式；针对医疗文本数据支持根据数据用途选择 `inspection`、`diagnosis` 或 `prescription`。
+数据预处理支持 `sft`、`dpo`、`pt`/`text`，可识别 Alpaca、ShareGPT、OpenAI `messages` 和纯文本数据。通用数据不需要 `strategy`；只有识别为原始医疗记录时，才需选择 `inspection`、`diagnosis` 或 `prescription`。
+
+示例：
+
+```text
+执行数据预处理，input_folder=/home/workspace/dataset/domain_corpus，data_type=text
+执行数据高级筛选，input_folder=/home/workspace/dataset/customer_service，threshold=60
+```
+
+当 DPO 源数据没有 `rejected` 回答且需要调用 OpenAI-compatible API 生成时，还需配置 API URL、模型名和 API key。
 
 数据预处理默认直接使用最新日期的数据进行处理，若想使用较旧的数据集，可在左侧数据管理页签下选择想要的数据，并点击 `Preprocess with this` 按钮。
 
@@ -77,7 +93,7 @@
 
 参数不足时，Agent 会继续询问。
 
-当前版本的批量训练与增强训练默认支持 Qwen3 系列的训练和评估。若需使用其他模型，请在执行训练时，通过 TEM 或 template 参数显式指定模型模板，例如：执行lora批量训练，TEM=llama3 或 执行增强训练，template=deepseekr1。
+Agent 会结合模型目录 basename、`config.json` 和 `tokenizer_config.json` 自动解析模板，并以 `TEM` 或 `--template` 显式传给训练脚本。重命名模型、元数据冲突或多候选时会显示模板下拉框，用户也可主动通过 `TEM` 或 `template` 覆盖。
 
 LoRA 批量训练/全参批量训练、PT 预训练默认直接使用/home/workspace/models/base下最新模型进行训练；若想使用其他模型，需显示指定，如`执行lora批量训练，模型在xxxx`
 
@@ -91,21 +107,27 @@ LoRA 批量训练/全参批量训练、PT 预训练默认直接使用最新日�
 | --- | --- |
 | 使用默认资源执行多机 LoRA | `执行多机lora批量训练` |
 | 指定每台 2 张卡执行多机 LoRA | `执行多机lora批量训练，gpus-per-node=2` |
+| 使用默认资源执行多机全参 SFT | `执行多机全参SFT` |
 | 使用默认资源执行多机增强训练 | `执行多机增强训练` |
 
 多机 LoRA默认直接使用/home/workspace/models/base下最新模型进行训练，若想使用其他模型，需显示指定；默认直接使用最新日期的数据进行训练，若想使用其他数据，需显示指定。
 
-## 医疗评估
+## 模型评估
 
 | 用途 | 自然语言示例 |
 | --- | --- |
-| 单模型评估 | `执行单模型评估` |
-| 双模型对比评估 | `执行双模型评估` |
-| Checkpoint 评估 | `执行checkpoint评估` |
+| 医疗单模型评估 | `执行医疗单模型评估` |
+| 通用单模型评估 | `执行通用单模型评估，eval_datasets=ceval,cmmlu` |
+| 医疗双模型评估 | `执行医疗双模型评估` |
+| 通用双模型评估 | `执行通用双模型评估，eval_datasets=mmlu,ceval` |
+| 医疗 Checkpoint 评估 | `执行医疗checkpoint评估` |
+| 通用 Checkpoint 评估 | `执行通用checkpoint评估，eval_datasets=medqa,medmcqa` |
 
 参数不足时，Agent 会继续询问。
 
-Checkpoint 评估默认支持 Qwen3 系列，若评估其他模型的checkpoint，请在评估命令中通过 TEM 或 template 参数指定模板。
+通用评估的数据集支持多选，可选 `ceval`、`cmbsingle`、`cmmlu`、`medmcqa`、`medqa`、`mmlu`。
+
+Checkpoint 评估必须提供 `CKPT_PATH`。Agent 会读取 adapter 的基础模型并自动解析、显式传入同一模板；基础模型不可访问或模板无法唯一判断时会在资源申请前停止并提示补充。
 
 ## 状态和停止任务
 
@@ -119,7 +141,7 @@ Checkpoint 评估默认支持 Qwen3 系列，若评估其他模型的checkpoint�
 
 为避免停止错误任务，同时存在多个任务时应补充任务类型、PID、工作流 ID 或容器名称。启动任务后，建议保留系统返回的 PID、运行 ID 和容器信息，便于后续查询或停止。
 
-## 推理服务、功能测试和基准测试
+## 推理服务和基准测试
 
 推理相关命令会转发给推理 Agent。执行前应确保 `INFERENCE_AGENT_URL` 指向推理 Agent controller 的 `/inference_agent` 接口，controller 和 worker 已启动，并且目标节点已经创建和配置推理 Docker。推理服务 YAML 和节点配置见 [部署指南](DEPLOYMENT_ZH.md)。
 
@@ -152,21 +174,6 @@ Checkpoint 评估默认支持 Qwen3 系列，若评估其他模型的checkpoint�
 
 多机部署时建议在命令中明确节点名称，避免操作错误节点。
 
-### 推理功能测试
-
-普通用户只能查看和操作自己的功能测试任务；查看所有任务或停止其他用户任务需要管理员账号。停止类操作建议先使用预览命令。
-
-| 用途 | 自然语言示例 | 说明 |
-| --- | --- | --- |
-| 查看测试脚本 | `查看可用的推理功能测试脚本` | 返回当前可用脚本。 |
-| 运行测试 | `运行推理功能测试脚本 basicmedicalrecord.sh` | 使用真实脚本名运行测试。 |
-| 查看测试状态 | `查看推理功能测试状态` | 查看当前测试状态。 |
-| 预览停止功能测试 | `预览停止功能测试 test_run_id=20260728_155822_eef19ec3` | 仅检查目标测试状态，不终止进程。 |
-| 确认停止功能测试 | `确认停止功能测试 test_run_id=20260728_155822_eef19ec3` | 普通用户只能停止自己的任务；管理员可停止指定任务。 |
-| 管理员查看所有功能测试任务 | `查看所有功能测试任务` | 返回所有用户功能测试运行记录。 |
-
-应先查看可用脚本，再使用返回的真实脚本名运行测试。
-
 ### 推理基准测试
 
 普通用户只能查看和操作自己的 Benchmark 任务；查看所有任务或停止其他用户任务需要管理员账号。停止类操作建议先使用预览命令。
@@ -184,7 +191,7 @@ Checkpoint 评估默认支持 Qwen3 系列，若评估其他模型的checkpoint�
 | 确认停止 Benchmark | `确认停止推理基准测试 job_id=1785225697_81e359` | 普通用户只能停止自己的任务；管理员可停止指定任务。 |
 | 管理员查看所有 Benchmark 任务 | `查看所有 benchmark 任务` | 返回所有用户 Benchmark 任务。 |
 
-系统支持医疗选择题数据集（如 `2021.json`、`2024.json`、`step1.json`、`step2.json`、`step3.json`）、MedBench 和通用 Benchmark。推理基准评测需要基于开发人员提供的 `tests` 文件夹，包含当前所有已支持的 benchmark。部署前请确认该目录已随 `medflow/` 一起挂载到推理容器中，并且 `service.yaml` 中的 Benchmark 数据目录指向容器内实际路径。实际可用项以“查看可用的推理基准测试”的返回结果为准。
+系统支持医疗选择题数据集（如 `2021.json`、`2024.json`、`step1.json`、`step2.json`、`step3.json`）、MedBench 和通用 Benchmark。Benchmark 数据通过外部目录挂载；部署前请确认 `service.yaml` 中的 `BENCHMARK_DIR` 和 `GENERAL_BENCHMARK_DIR` 指向容器内实际路径。实际可用项以“查看可用的推理基准测试”的返回结果为准。
 
 ### 管理员维护命令
 

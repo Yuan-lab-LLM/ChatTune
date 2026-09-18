@@ -1,0 +1,12 @@
+fastapi==0.115.12
+uvicorn
+pydantic==2.8.2
+PyYAML
+psutil
+langchain==1.2.12
+langchain-openai==1.1.10
+langgraph
+openai>=1.3.7
+pandas
+typing-extensions
+yq==3.4.3

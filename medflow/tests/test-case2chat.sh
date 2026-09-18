@@ -1,17 +1,15 @@
-# 数据标注平台接口测试
+#!/usr/bin/env bash
 
-ip=$1
-port=$2
-if [ -z "$ip" ] || [ -z "$port" ]; then
-    echo "错误：请提供 IP 地址和端口号作为参数。"
-    echo "用法：$0 <IP地址> <端口号>"
-    exit 1
-fi
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=medical-smoke-lib.sh
+source "$SCRIPT_DIR/medical-smoke-lib.sh"
 
-curl -X 'GET' \
-  "http://$ip:$port/train/123456?item_type=case2chat" \
-  -H 'accept: application/json' \
-  -H 'Content-Type: application/json' \
-  -d @data/case2chat.json
+medical_smoke_init
+BASE_URL=$(medical_smoke_base_url "${1:-}" "${2:-}" "${CASE2CHAT_BASE_URL:-}")
 
-  echo -e "\n==================================\n"
+medical_smoke_request \
+    "case2chat compatibility" \
+    GET \
+    "$BASE_URL/train/123456?item_type=case2chat" \
+    "$SCRIPT_DIR/data/case2chat.json" \
+    case2chat

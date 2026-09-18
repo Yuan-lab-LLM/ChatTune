@@ -16,7 +16,6 @@ nh3
 numpy
 prompt_toolkit>=3.0.0
 pydantic==2.8.2
-psutil
 requests
 rich==13.9.4  #>=10.0.0
 shortuuid
@@ -30,9 +29,7 @@ loguru
 pysilero==0.1.1
 websockets
 nemo-toolkit[all]
-langchain==1.2.12
-langchain-openai==1.1.10
-yq==3.4.3
+PyYAML
 absl-py
 langdetect
 nltk

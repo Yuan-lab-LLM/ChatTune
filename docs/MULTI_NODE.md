@@ -53,6 +53,8 @@ bash runtime.sh init --profile center --nodes node-b=http://<worker-b-host>:8099
 | `MEDFLOW_LOCAL_GRPO_CONTAINER` | GRPO/verl container name that exists on the center machine, used for center-local Agent GRPO/verl training tasks. |
 | `MODEL_NAME` / `MODEL_API_KEY` / `MODEL_BASE_URL` | OpenAI-compatible model name, API key, and service URL used by the center-local Agent. |
 | `INFERENCE_AGENT_URL` | Inference Agent controller `/inference_agent` URL used by the center-local Agent. Studio administrator maintenance actions use the Studio login session; restrict Inference Agent `/admin/*` to trusted Studio Server access if enabled. |
+| `INFERENCE_OPS_AUTH_MODE` | Defaults to `trusted_network`; Inference Ops Bearer authentication is enabled only when explicitly set to `token`. |
+| `INFERENCE_OPS_API_TOKEN` | Shared by the center Studio/main Agent and Inference Ops only when `INFERENCE_OPS_AUTH_MODE=token`. |
 | `STUDIO_PUBLIC_URL` | Center Studio URL opened by users in a browser. |
 | `STUDIO_URL` | Center Studio backend URL used by Runtime/Agent callbacks. |
 
@@ -78,6 +80,8 @@ bash runtime.sh init --profile node --node-id node-a --center-url http://<center
 | `MEDFLOW_RUNTIME_NODE_TOKEN` | Runtime node token for this node from the center output; must match this node's value in center `MEDFLOW_STUDIO_RUNTIME_NODE_TOKENS`. |
 | `MODEL_NAME` / `MODEL_API_KEY` / `MODEL_BASE_URL` | OpenAI-compatible model name, API key, and service URL used by this node's Agent. |
 | `INFERENCE_AGENT_URL` | Inference Agent controller `/inference_agent` URL used by tasks on this node. Studio administrator maintenance actions use the Studio login session; restrict Inference Agent `/admin/*` to trusted Studio Server access if enabled. |
+| `INFERENCE_OPS_AUTH_MODE` | Defaults to `trusted_network`; token mode must match the center and Inference Ops configuration. |
+| `INFERENCE_OPS_API_TOKEN` | Copied from the center node only in `token` mode. |
 
 ## Startup Order
 

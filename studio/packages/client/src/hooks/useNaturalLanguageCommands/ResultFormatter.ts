@@ -37,6 +37,9 @@ const getEvaluationTypeName = (test: MedicalTestFile): string => {
   if (test.category === 'general' || test.type === 'general') {
     return getGeneralEvaluationTypeName(test.filename || '');
   }
+  if (test.category === 'custom' || test.type === 'custom') {
+    return '自定义评测';
+  }
 
   const testTypeMap: Record<string, string> = {
     exam2021: '中国执业医师资格考试',
@@ -46,7 +49,7 @@ const getEvaluationTypeName = (test: MedicalTestFile): string => {
     other: '其他',
   };
 
-  return testTypeMap[test.type] || test.type || '未知';
+  return testTypeMap[test.type] || (test.category === 'medical' ? '医疗评测' : '未分类');
 };
 
 /**

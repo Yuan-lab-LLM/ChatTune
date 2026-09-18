@@ -4,7 +4,7 @@ This guide covers administrator workflows in Studio.
 
 ## First-Time Setup Order
 
-Open `STUDIO_PUBLIC_URL` in a browser and log in with the administrator account and the password generated in `runtime.env`.
+Open `STUDIO_PUBLIC_URL` in a browser and log in initially with the administrator account and password generated in `runtime.env`. Studio then stores the password in its database; regenerating `runtime.env` does not change it.
 
 After the first login, configure resources in this order:
 
@@ -30,6 +30,8 @@ Administrators can:
 - Delete users after confirming the impact.
 
 Production deployments should keep at least two named administrator accounts. The initial administrator should be used for setup and emergency recovery only.
+
+If the only administrator password is forgotten, stop Studio on the center server, change only `MEDFLOW_ADMIN_PASSWORD` in `runtime.env`, run `bash runtime.sh reset-admin-password --username admin`, and restart. The command resets only the specified existing administrator and revokes its sessions. Replace `admin` with the actual username. There is no need to regenerate the entire `runtime.env`.
 
 ## User Groups and Docker Containers
 

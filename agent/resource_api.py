@@ -24,37 +24,40 @@ from typing import Any
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
 
+from resource_catalog import load_resource_catalog_config, resource_path_maps
+from utils.benchmark_status import (
+    query_inference_benchmark_status,
+    recover_benchmark_job_id,
+    recover_benchmark_resource_context,
+    valid_benchmark_job_id,
+    workflow_benchmark_result,
+)
+
 
 logger = logging.getLogger(__name__)
 
 
-DATASET_PATHS = {
-    "raw": "/home/workspace/dataset",
-    "sft": "/home/workspace/dataset_batch_train",
-    "dpo": "/home/workspace/dataset_daily_train",
-    "pt": "/home/workspace/dataset_pretrain",
+RESOURCE_CATALOG = load_resource_catalog_config()
+_RESOURCE_PATHS = resource_path_maps(RESOURCE_CATALOG)
+DATASET_PATHS = _RESOURCE_PATHS["datasets"]
+DATASET_DATA_EXTENSIONS = {
+    "raw": (".json",),
+    "sft": (".json",),
+    "dpo": (".json",),
+    "pt": (".json", ".jsonl"),
 }
-MODEL_PATHS = {
-    "base_train": "/home/workspace/models/base",
-    "batch_trained": "/home/workspace/models/batch_train",
-    "pretrain": "/home/workspace/models/pretrain",
-    "daily_trained": "/home/workspace/models/dpo_train/internal/saves",
-    "inference": "/home/workspace/medical_models",
-}
-DPO_MODEL_PATHS = {
-    "saves": "/home/workspace/models/dpo_train/internal/saves",
-    "export": "/home/workspace/models/dpo_train/internal/export",
-}
+MODEL_PATHS = _RESOURCE_PATHS["models"]
+MODEL_TYPE_HINTS = _RESOURCE_PATHS["modelTypes"]
+DPO_MODEL_PATHS = _RESOURCE_PATHS["dpo"]
+EVALUATION_ROOT = _RESOURCE_PATHS["evaluation"]
 TEST_PATHS = {
-    "medical": "/home/workspace/tests/medical/choice",
-    "general": "/home/workspace/tests/general",
+    "medical": f"{EVALUATION_ROOT}/medical/choice",
+    "general": f"{EVALUATION_ROOT}/general",
+    "custom": f"{EVALUATION_ROOT}/custom",
 }
-EVALUATION_LOGS_PATH = "/home/workspace/tests/logs/benchmark"
-BENCHMARK_DATASET_ALIASES = {
-    "truthfulqa": {"truthfulqa", "truthfulqa-generation"},
-}
-GRPO_MODEL_PATH = "/home/workspace/models/grpo_train"
-GRPO_DATA_ROOT = "/home/workspace/verl/examples/data_preprocess/data"
+EVALUATION_LOGS_PATH = f"{EVALUATION_ROOT}/logs/benchmark"
+GRPO_MODEL_PATH = _RESOURCE_PATHS["grpoModel"]
+GRPO_DATA_ROOT = _RESOURCE_PATHS["grpoData"]
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 SAFE_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
 GPU_CACHE_TTL_SECONDS = float(os.getenv("MEDFLOW_RESOURCE_GPU_CACHE_TTL_SECONDS", "30"))
@@ -319,33 +322,6 @@ def _workflow_benchmark_result_entry(context: dict[str, Any]) -> str:
     return f"查看推理基准测试{command_name}结果"
 
 
-def _benchmark_dataset_aliases(benchmark: str) -> list[str]:
-    normalized = _normalize_benchmark_name(benchmark)
-    return sorted(BENCHMARK_DATASET_ALIASES.get(normalized, {normalized}))
-
-
-def _normalize_benchmark_name(value: Any) -> str:
-    text = os.path.basename(str(value or "").strip()).lower()
-    if text.endswith(".json"):
-        text = text[:-5]
-    return text
-
-
-def _workflow_benchmark_job_id(stage: dict[str, Any]) -> str:
-    result = stage.get("result") if isinstance(stage.get("result"), dict) else {}
-    job_id = str(result.get("benchmark_job_id") or "").strip()
-    if job_id:
-        return job_id
-    for key in ("status_command", "message", "result"):
-        match = re.search(
-            r'benchmark_report\((?:job_id=)?["\']?([A-Za-z0-9_-]+)["\']?\)',
-            str(result.get(key) or ""),
-        )
-        if match:
-            return match.group(1)
-    return ""
-
-
 def _workflow_evaluation_container(context: dict[str, Any]) -> str:
     return _container(
         str(
@@ -362,246 +338,53 @@ def _query_structured_benchmark_status(
     context: dict[str, Any],
     stage: dict[str, Any],
 ) -> dict[str, Any]:
-    benchmark = _workflow_benchmark_name(context)
-    job_id = _workflow_benchmark_job_id(stage)
-    container = _workflow_evaluation_container(context)
-    expected_model = os.path.basename(
-        str(context.get("published_model_path") or "").rstrip("/")
+    """Query the actual inference-ops job with the workflow owner's identity."""
+    job_id = recover_benchmark_job_id(stage)
+    if not job_id:
+        return {
+            "status": "running",
+            "benchmark_status": "running",
+            "benchmark_job_id": "",
+            "status_command": "",
+            "stop_command": "",
+            "folder_path": "",
+            "log_dir": "",
+            "log_file": "",
+            "result_path": "",
+            "eta_status": "unavailable",
+            "error": "无法关联 benchmark 任务：启动回执和阶段日志中均未找到有效 Job ID",
+        }
+    resource_context = context.get("inference_resource_context") or recover_benchmark_resource_context(stage)
+    if not isinstance(resource_context, dict):
+        resource_context = {}
+    node = str(
+        context.get("inference_runtime_node_id")
+        or resource_context.get("runtime_node_id")
+        or os.getenv("MEDFLOW_RESOURCE_NODE_ID")
+        or ""
+    ).strip()
+    aliases = context.get("inference_owner_aliases")
+    if isinstance(aliases, str):
+        aliases = [part.strip() for part in aliases.split(",")]
+    if not isinstance(aliases, (list, tuple, set)):
+        aliases = []
+    report = query_inference_benchmark_status(
+        _inference_agent_url(),
+        job_id=job_id,
+        node=node,
+        user_id=str(context.get("inference_owner_user_id") or "workflow-manager"),
+        user_aliases=[str(value) for value in aliases if str(value).strip()],
+        user_role=str(context.get("user_role") or ""),
+        resource_context=resource_context,
+        headers=_inference_ops_request_headers(),
     )
-    print(
-        "[resource_api] workflow benchmark structured query: "
-        f"benchmark={benchmark} job_id={job_id or '<none>'} "
-        f"model={expected_model or '<none>'} container={container}",
-        flush=True,
-    )
-    benchmark_aliases = _benchmark_dataset_aliases(benchmark)
-    script = r"""
-import json
-import os
-import re
-import sys
-
-root, job_id, benchmark, expected_model, aliases_json = sys.argv[1:6]
-benchmark_aliases = set(json.loads(aliases_json or "[]"))
-
-def load(path):
-    try:
-        with open(path, encoding="utf-8") as handle:
-            value = json.load(handle)
-            return value if isinstance(value, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-def norm_name(value):
-    text = os.path.basename(str(value or "").strip()).lower()
-    if text.endswith(".json"):
-        text = text[:-5]
-    return text
-
-def benchmark_matches(dataset_name, target_names):
-    if not dataset_name:
-        return True
-    return dataset_name in target_names
-
-def normalize_status(meta, result):
-    status = str(meta.get("status") or result.get("status") or "").strip().lower()
-    if status:
-        return status
-    if result:
-        return "finished"
-    return "running"
-
-def int_or_none(value):
-    try:
-        if value is None or value == "":
-            return None
-        return int(float(str(value).strip().rstrip("%")))
-    except (TypeError, ValueError):
-        return None
-
-def percent_or_none(value):
-    try:
-        if value is None or value == "":
-            return None
-        text = str(value).strip()
-        percent = float(text.rstrip("%"))
-        if "%" not in text and 0 <= percent <= 1:
-            percent *= 100
-        return round(percent, 1)
-    except (TypeError, ValueError):
-        return None
-
-def progress_text(processed, total, percent):
-    if processed is None or total is None:
-        return None
-    if percent is None and total:
-        percent = round(processed * 100 / total, 1)
-    if percent is None:
-        return f"{processed}/{total}"
-    return f"{processed}/{total} ({percent:.1f}%)"
-
-def progress_from_summary(result):
-    summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
-    if not summary:
-        return {}
-    processed = int_or_none(summary.get("processed") or summary.get("done"))
-    total = int_or_none(summary.get("total"))
-    percent = percent_or_none(summary.get("progress") or summary.get("progress_percent"))
-    text = progress_text(processed, total, percent)
-    payload = {}
-    if processed is not None:
-        payload["processed"] = processed
-    if total is not None:
-        payload["total"] = total
-    if percent is not None:
-        payload["progress_percent"] = percent
-    if text:
-        payload["progress"] = text
-    elif summary.get("progress") is not None:
-        payload["progress"] = str(summary.get("progress"))
-    for key in ("correct", "accuracy", "avg_f1", "invalid", "invalid_rate"):
-        if key in summary:
-            payload[key] = summary[key]
-    metrics = summary.get("metrics")
-    if isinstance(metrics, dict):
-        for key in ("record_only", "executed", "passed", "failed", "timeout", "executor_error", "pass@1"):
-            if key in metrics:
-                payload[key] = metrics[key]
-    return payload
-
-def read_tail(path, max_bytes=65536):
-    try:
-        with open(path, "rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            size = handle.tell()
-            handle.seek(max(0, size - max_bytes), os.SEEK_SET)
-            return handle.read().decode("utf-8", errors="replace")
-    except OSError:
-        return ""
-
-def progress_from_run_log(folder):
-    text = read_tail(os.path.join(folder, "run.log"))
-    matches = re.findall(r"\[(\d+)\s*/\s*(\d+)\]\s*done", text)
-    if not matches:
-        return {}
-    processed = int(matches[-1][0])
-    total = int(matches[-1][1])
-    percent = round(processed * 100 / total, 1) if total else None
-    return {
-        "processed": processed,
-        "total": total,
-        "progress_percent": percent,
-        "progress": progress_text(processed, total, percent),
-    }
-
-def payload_for(folder):
-    meta = load(os.path.join(folder, "meta.json"))
-    result = load(os.path.join(folder, "result.json"))
-    status = normalize_status(meta, result)
-    result_path = os.path.join(folder, "result.json")
-    log_file = os.path.join(folder, "run.log")
-    payload = {
-        "status": status,
-        "benchmark_status": status,
-        "benchmark_job_id": meta.get("job_id") or os.path.basename(folder),
-        "dataset": meta.get("dataset") or meta.get("benchmark") or benchmark,
-        "model": meta.get("model"),
-        "start_time": meta.get("start_time"),
-        "end_time": meta.get("end_time"),
-        "folder_path": folder,
-        "log_dir": folder,
-        "log_file": log_file,
-        "result_path": result_path,
-        "data": {"meta": meta},
-    }
-    if result:
-        payload["data"]["result"] = result
-    summary_progress = progress_from_summary(result)
-    has_structured_progress = (
-        summary_progress.get("processed") is not None
-        and summary_progress.get("total") is not None
-    )
-    log_progress = {} if has_structured_progress else progress_from_run_log(folder)
-    payload.update({**log_progress, **summary_progress})
-    return payload
-folders = []
-skipped = []
-if os.path.isdir(root):
-    if job_id and os.path.isdir(os.path.join(root, job_id)):
-        folders = [os.path.join(root, job_id)]
-    else:
-        target_names = {norm_name(value) for value in benchmark_aliases}
-        for name in os.listdir(root):
-            folder = os.path.join(root, name)
-            if not os.path.isdir(folder):
-                continue
-            meta = load(os.path.join(folder, "meta.json"))
-            dataset = str(meta.get("dataset") or meta.get("benchmark") or "").strip()
-            dataset_name = norm_name(dataset)
-            if benchmark and dataset and not benchmark_matches(dataset_name, target_names):
-                if len(skipped) < 5:
-                    skipped.append({
-                        "folder": folder,
-                        "dataset": dataset,
-                        "model": meta.get("model"),
-                        "status": meta.get("status"),
-                    })
-                continue
-            folders.append(folder)
-        folders.sort(
-            key=lambda path: (
-                norm_name(load(os.path.join(path, "meta.json")).get("model")) == norm_name(expected_model),
-                os.path.getmtime(path),
-            ),
-            reverse=True,
-        )
-
-if not folders:
-    print(json.dumps({
-        "status": "not_found",
-        "benchmark_status": "not_found",
-        "debug": {
-            "root_exists": os.path.isdir(root),
-            "benchmark": benchmark,
-            "normalized_benchmark": norm_name(benchmark),
-            "benchmark_aliases": sorted(target_names),
-            "expected_model": expected_model,
-            "skipped_candidates": skipped,
-        },
-    }, ensure_ascii=False))
-else:
-    print(json.dumps(payload_for(folders[0]), ensure_ascii=False))
-"""
-    output = _docker(
-        container,
-        [
-            "python3",
-            "-c",
-            script,
-            EVALUATION_LOGS_PATH,
-            job_id,
-            benchmark,
-            expected_model,
-            json.dumps(benchmark_aliases),
-        ],
-        timeout=30,
-    ).stdout
-    payload = json.loads(output or "{}")
-    if not isinstance(payload, dict):
-        raise HTTPException(502, "Invalid benchmark status payload")
+    if report.get("status") in {"forbidden", "not_found", "error"}:
+        raise RuntimeError(report.get("error") or f"Benchmark task {job_id} is not accessible")
+    payload = workflow_benchmark_result(report)
+    if resource_context:
+        payload["resource_context"] = resource_context
+    payload["log_dir"] = payload.get("folder_path")
     payload["result_entry"] = _workflow_benchmark_result_entry(context)
-    if payload.get("benchmark_job_id"):
-        payload["status_command"] = f'benchmark_report("{payload["benchmark_job_id"]}")'
-        payload["stop_command"] = f'benchmark_stop("{payload["benchmark_job_id"]}")'
-        payload["log_command"] = payload["status_command"]
-    print(
-        "[resource_api] workflow benchmark structured query result: "
-        f"benchmark={benchmark} job_id={payload.get('benchmark_job_id') or '<none>'} "
-        f"status={payload.get('status') or payload.get('benchmark_status') or '<none>'} "
-        f"folder={payload.get('folder_path') or '<none>'} "
-        f"debug={json.dumps(payload.get('debug') or {}, ensure_ascii=False)[:1000]}",
-        flush=True,
-    )
     return payload
 
 
@@ -649,6 +432,16 @@ def _maybe_refresh_workflow_benchmark_status(
         stage["status"] = "timeout"
         stage["message"] = "本次状态查询超时，任务可能仍在运行，将继续自动刷新"
         stage["last_poll_error"] = str(exc)
+        previous = stage.get("result") if isinstance(stage.get("result"), dict) else {}
+        stage["result"] = {
+            **(previous if valid_benchmark_job_id(previous.get("benchmark_job_id")) else {}),
+            "status": "running",
+            "benchmark_status": "running",
+            "eta_status": "unavailable",
+            "estimated_remaining_seconds": None,
+            "eta_calculated_at": None,
+            "error": str(exc),
+        }
         stage["updated_at"] = datetime.now(timezone.utc).timestamp()
         return stages, workflow
 
@@ -769,6 +562,18 @@ def _workflow_status(workflow_id: str) -> dict[str, Any]:
         "isMultinode",
         "script_name",
         "scriptName",
+        "descriptor_id",
+        "descriptorId",
+        "lifecycle_status",
+        "lifecycleStatus",
+        "sub_stage",
+        "sub_stage_text",
+        "merge_status",
+        "finalizing_after_last_step",
+        "primary_metric",
+        "fallback_metrics",
+        "log_root",
+        "log_files",
         "output_dir",
         "latest_loss",
         "latest_learning_rate",
@@ -796,6 +601,24 @@ def _workflow_status(workflow_id: str) -> dict[str, Any]:
         "output_log_success",
         "error_reason",
         "error_detail",
+        "run_id",
+        "evaluation_scope",
+        "eval_type",
+        "eval_datasets",
+        "models",
+        "current_stage",
+        "current_stages",
+        "completed_stages",
+        "total_stages",
+        "overall_progress_percent",
+        "stage_status_counts",
+        "scores",
+        "macro_average",
+        "score_deltas",
+        "manifest_path",
+        "report_path",
+        "report_text",
+        "artifacts",
     }
     public_stages = {}
     for name, stage in stages.items():
@@ -841,6 +664,12 @@ def _workflow_status(workflow_id: str) -> dict[str, Any]:
         "stages": public_stages,
         "benchmark": context.get("benchmark"),
         "evaluationDatasetName": context.get("evaluation_dataset_name"),
+        "evaluationScope": context.get("evaluation_scope"),
+        "evalDatasets": context.get("eval_datasets"),
+        "runId": context.get("run_id"),
+        "reportPath": context.get("report_path"),
+        "scores": context.get("scores"),
+        "scoreDeltas": context.get("score_deltas"),
         "benchmarkResultEntry": (
             "查看2024基准评测结果"
             if benchmark_entry in ("2024", "2024.json")
@@ -916,7 +745,11 @@ def _filter_status_folder(request: DatasetFilterStatusRequest) -> str:
     normalized = Path(folder).as_posix()
     if not normalized.startswith("/") or ".." in normalized.split("/"):
         raise HTTPException(400, "Invalid filter status folder")
-    if not any(normalized.startswith(prefix) for prefix in DATASET_PATHS.values()):
+    if not any(
+        normalized == prefix.rstrip("/")
+        or normalized.startswith(f"{prefix.rstrip('/')}/")
+        for prefix in DATASET_PATHS.values()
+    ):
         raise HTTPException(400, "Filter status folder must be under a dataset root")
     return normalized
 
@@ -1020,6 +853,75 @@ def _list_model_checkpoints(container: str, model_dir: str) -> list[str]:
     return [line.strip() for line in output.splitlines() if line.strip()]
 
 
+def _model_contains_lora_adapter(container: str, model_dir: str) -> bool:
+    """Detect adapter metadata in the model root or one checkpoint below it."""
+    script = (
+        'if [ ! -d "$1" ]; then exit 0; fi; '
+        'find "$1" -maxdepth 2 -type f -name adapter_config.json '
+        '-print -quit 2>/dev/null'
+    )
+    output = _docker(
+        container,
+        ["sh", "-c", script, "adapter-detect", model_dir],
+    ).stdout
+    return bool(str(output or "").strip())
+
+
+def _model_artifact_types(
+    legacy_type: str,
+    *,
+    merged: bool = False,
+    checkpoints: list[str] | None = None,
+    adapter: bool | None = None,
+    configured_types: list[str] | None = None,
+) -> list[str]:
+    """Return generic artifact classes without changing legacy model types."""
+    configured_types = [str(value) for value in configured_types or []]
+    if legacy_type == "base_train" or configured_types == ["base"]:
+        return ["base"]
+    if legacy_type == "inference" or configured_types == ["inference"]:
+        return ["inference"]
+    if merged:
+        return ["merged"]
+
+    if adapter is False:
+        return ["checkpoint"] if checkpoints else ["custom"]
+    if adapter is None and configured_types and not set(configured_types) & {
+        "adapter",
+        "checkpoint",
+        "merged",
+    }:
+        return configured_types
+
+    artifact_types = ["adapter"]
+    if checkpoints:
+        artifact_types.append("checkpoint")
+    return artifact_types
+
+
+def _annotate_model_artifacts(
+    entry: dict[str, Any],
+    legacy_type: str,
+    *,
+    is_merged_artifact: bool | None = None,
+    is_adapter_artifact: bool | None = None,
+    configured_types: list[str] | None = None,
+) -> None:
+    artifact_types = _model_artifact_types(
+        legacy_type,
+        merged=(
+            bool(entry.get("merged"))
+            if is_merged_artifact is None
+            else is_merged_artifact
+        ),
+        checkpoints=entry.get("checkpoints") or [],
+        adapter=is_adapter_artifact,
+        configured_types=configured_types,
+    )
+    entry["artifactType"] = artifact_types[0]
+    entry["artifactTypes"] = artifact_types
+
+
 def _datasets(container: str) -> dict[str, list[dict[str, Any]]]:
     result: dict[str, list[dict[str, Any]]] = {}
     for kind, path in DATASET_PATHS.items():
@@ -1037,7 +939,9 @@ def _datasets(container: str) -> dict[str, list[dict[str, Any]]]:
                     f"{path}/{entry['name']}",
                 ],
             ).stdout.splitlines()
-            entry["files"] = [name for name in files if _is_dataset_data_file(name)]
+            entry["files"] = [
+                name for name in files if _is_dataset_data_file(name, kind)
+            ]
             if not entry["files"]:
                 continue
             entry["filePreviews"] = []
@@ -1046,13 +950,18 @@ def _datasets(container: str) -> dict[str, list[dict[str, Any]]]:
     return result
 
 
-def _is_dataset_data_file(filename: str) -> bool:
-    return filename not in INTERNAL_DATASET_FILES and filename.lower().endswith((".json", ".jsonl"))
+def _is_dataset_data_file(filename: str, dataset_type: str | None = None) -> bool:
+    extensions = DATASET_DATA_EXTENSIONS.get(
+        dataset_type or "",
+        (".json",),
+    )
+    return filename not in INTERNAL_DATASET_FILES and filename.lower().endswith(extensions)
 
 
 def _extract_dataset_archive(
     archive: Path,
     extract_dir: Path,
+    dataset_type: str,
 ) -> Path:
     extract_root = extract_dir.resolve()
     with tarfile.open(archive) as tar:
@@ -1072,13 +981,25 @@ def _extract_dataset_archive(
     content_root = (
         children[0] if len(children) == 1 and children[0].is_dir() else extract_dir
     )
+    content_entries = list(content_root.iterdir())
+    invalid_entries = [
+        child.name
+        for child in content_entries
+        if not child.is_file() or not child.name.lower().endswith(".json")
+    ]
+    if invalid_entries:
+        raise HTTPException(
+            400,
+            "Dataset archive may only contain .json files at its top level; "
+            f"unsupported entries: {', '.join(sorted(invalid_entries)[:10])}",
+        )
     if not any(
-        child.is_file() and _is_dataset_data_file(child.name)
-        for child in content_root.iterdir()
+        child.is_file() and _is_dataset_data_file(child.name, dataset_type)
+        for child in content_entries
     ):
         raise HTTPException(
             400,
-            "Dataset archive must contain a .json or .jsonl file at its top level",
+            f"Dataset archive must contain a {dataset_type} .json data file at its top level",
         )
     return content_root
 
@@ -1099,6 +1020,21 @@ def _models(container: str) -> dict[str, list[dict[str, Any]]]:
                         container,
                         f"{dpo_path}/{entry['name']}",
                     )
+                    is_adapter = (
+                        False
+                        if merged
+                        else _model_contains_lora_adapter(
+                            container,
+                            f"{dpo_path}/{entry['name']}",
+                        )
+                    )
+                    _annotate_model_artifacts(
+                        entry,
+                        kind,
+                        is_merged_artifact=merged,
+                        is_adapter_artifact=is_adapter,
+                        configured_types=MODEL_TYPE_HINTS.get(kind),
+                    )
                     daily_entries.append(entry)
             result[kind] = daily_entries
             continue
@@ -1116,6 +1052,24 @@ def _models(container: str) -> dict[str, list[dict[str, Any]]]:
                     container,
                     f"{path}/{entry['name']}",
                 )
+            is_current_merged = entry["name"].endswith(("_merged", "-merged"))
+            is_adapter = (
+                False
+                if is_current_merged
+                else _model_contains_lora_adapter(
+                    container,
+                    f"{path}/{entry['name']}",
+                )
+                if kind in {"batch_trained", "pretrain"}
+                else None
+            )
+            _annotate_model_artifacts(
+                entry,
+                kind,
+                is_merged_artifact=is_current_merged,
+                is_adapter_artifact=is_adapter,
+                configured_types=MODEL_TYPE_HINTS.get(kind),
+            )
         result[kind] = entries
     return result
 
@@ -1533,6 +1487,12 @@ def health():
     return _response({"ok": True})
 
 
+@router.get("/catalog", dependencies=[Depends(_authorize)])
+def resource_catalog():
+    """Expose the effective node-local catalog without changing legacy APIs."""
+    return _response(RESOURCE_CATALOG)
+
+
 @router.get("/workflow-status", dependencies=[Depends(_authorize)])
 def workflow_status(workflowId: str):
     return _response(_workflow_status(workflowId))
@@ -1643,7 +1603,6 @@ def rollback_gpu_reservation(request: GpuReservationRequest):
             "released": _remove_reservation(request.reservationId),
         }
     )
-
 
 
 def _runtime_record_started_at(record: dict[str, Any]) -> float:
@@ -2229,6 +2188,29 @@ def _inference_agent_url() -> str:
     return os.getenv("INFERENCE_AGENT_URL", "http://127.0.0.1:8899/inference_agent").strip()
 
 
+def _inference_ops_request_headers() -> dict[str, str]:
+    auth_mode = str(
+        os.getenv("INFERENCE_OPS_AUTH_MODE") or "trusted_network"
+    ).strip().lower()
+    if auth_mode not in {"trusted_network", "token"}:
+        raise HTTPException(
+            500,
+            "INFERENCE_OPS_AUTH_MODE must be one of: trusted_network, token",
+        )
+    headers = {"Content-Type": "application/json"}
+    if auth_mode == "trusted_network":
+        return headers
+    token = str(os.getenv("INFERENCE_OPS_API_TOKEN") or "").strip()
+    if not token:
+        raise HTTPException(
+            503,
+            "INFERENCE_OPS_API_TOKEN is required when "
+            "INFERENCE_OPS_AUTH_MODE=token",
+        )
+    headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
 def _inference_stop_payload(data: Any) -> dict[str, Any]:
     if not isinstance(data, dict):
         return {}
@@ -2287,7 +2269,7 @@ def _stop_inference_service(request: InferenceReservationStopServiceRequest) -> 
         url,
         data=body,
         method="POST",
-        headers={"Content-Type": "application/json"},
+        headers=_inference_ops_request_headers(),
     )
     try:
         with urllib.request.urlopen(http_request, timeout=360) as response:
@@ -2409,7 +2391,7 @@ def medical_tests(container: str | None = None):
                 result.append(
                     {
                         "filename": filename,
-                        "type": "general" if category == "general" else "json",
+                        "type": category if category in {"general", "custom"} else "json",
                         "size": size,
                         "description": "",
                         "category": category,
@@ -2479,7 +2461,12 @@ print(json.dumps(items, ensure_ascii=False))
 def grpo(container: str | None = None):
     target = _container(container or os.getenv("MEDFLOW_GRPO_DOCKER_CONTAINER", ""))
     models_data = [
-        {**item, "type": "grpo_base"}
+        {
+            **item,
+            "type": "grpo_base",
+            "artifactType": "checkpoint",
+            "artifactTypes": ["checkpoint", "reward"],
+        }
         for item in _list_dirs(target, GRPO_MODEL_PATH)
         if str(item.get("size") or "").strip().lower().replace(" ", "") != "0b"
     ]
@@ -2604,7 +2591,8 @@ import os
 import sys
 
 dataset_path = sys.argv[1]
-internal_files = set(sys.argv[2:])
+allowed_extensions = tuple(sys.argv[2].split(","))
+internal_files = set(sys.argv[3:])
 items = []
 if not os.path.isdir(dataset_path):
     print(json.dumps({"error": "not_found"}))
@@ -2612,7 +2600,7 @@ if not os.path.isdir(dataset_path):
 for filename in sorted(os.listdir(dataset_path)):
     if filename in internal_files:
         continue
-    if not filename.endswith(".json"):
+    if not filename.lower().endswith(allowed_extensions):
         continue
     full_path = os.path.join(dataset_path, filename)
     if not os.path.isfile(full_path):
@@ -2629,7 +2617,14 @@ print(json.dumps({"items": items}, ensure_ascii=False))
 """
     output = _docker(
         target,
-        ["python3", "-c", script, dataset_path, *sorted(INTERNAL_DATASET_FILES)],
+        [
+            "python3",
+            "-c",
+            script,
+            dataset_path,
+            ",".join(DATASET_DATA_EXTENSIONS[request.datasetType]),
+            *sorted(INTERNAL_DATASET_FILES),
+        ],
         timeout=60,
     ).stdout
     try:
@@ -2781,7 +2776,7 @@ def download_medical_test(request: MedicalTestRequest):
                     filename, _docker_bytes(target, ["cat", test_path])
                 )
             )
-    raise HTTPException(404, f'Medical test "{filename}" not found')
+    raise HTTPException(404, f'Evaluation dataset "{filename}" not found')
 
 
 @router.post("/evaluation-results/download", dependencies=[Depends(_authorize)])
@@ -2834,7 +2829,11 @@ def upload_dataset(request: UploadDatasetRequest):
         archive.write_bytes(payload)
         extract_dir = Path(temp_dir) / "extracted"
         extract_dir.mkdir()
-        content_root = _extract_dataset_archive(archive, extract_dir)
+        content_root = _extract_dataset_archive(
+            archive,
+            extract_dir,
+            request.datasetType,
+        )
         _docker(target, ["mkdir", "-p", f"{DATASET_PATHS[request.datasetType]}/{name}"])
         _run(
             [

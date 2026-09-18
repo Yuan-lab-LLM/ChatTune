@@ -1,6 +1,15 @@
 import crypto from 'crypto';
 import { EntityManager, In, MoreThan } from 'typeorm';
 import { GPUInfo, ManagementBizType } from '../../../shared/src';
+import {
+    matchesAuditClassification,
+} from '../../../shared/src/types/audit';
+import type {
+    AuditLevel,
+    AuditModule,
+    AuditOperationType,
+    AuditResult,
+} from '../../../shared/src/types/audit';
 import { AuthUserTable, UserRole } from '../models/Auth';
 import {
     GroupNodeAssignmentTable,
@@ -17,6 +26,7 @@ import type { SafeAuthUser } from '../dao/Auth';
 import { remoteResourceClient, resourceNodeRegistry } from './resourceNodeService';
 import {
     GroupResourceQuotaTable,
+    ResourcePoolTable,
     TrainingReservationStatus,
     TrainingReservationTable,
 } from '../models/TrainingResource';
@@ -776,9 +786,22 @@ export class ResourceAccessService {
                 nodeId,
                 containerName,
                 itemKey,
+                visibility: resource.visibility,
                 ownerUserId: resource.ownerUserId || null,
+                groupId: resource.groupId || null,
                 resourceIds,
                 sourcePath: resource.sourcePath || null,
+                before: targets.map((target) => ({
+                    resourceId: target.id,
+                    itemKey: target.itemKey,
+                    nodeId: target.nodeId,
+                    containerName: target.containerName,
+                    ownerUserId: target.ownerUserId || null,
+                    groupId: target.groupId || null,
+                    visibility: target.visibility,
+                    sourcePath: target.sourcePath || null,
+                })),
+                after: null,
             }, manager);
             await manager.delete(ResourceShareScopeTable, { resourceId: In(resourceIds) });
             await manager.delete(ResourcePublicationRequestTable, { resourceId: In(resourceIds) });
@@ -810,7 +833,104 @@ export class ResourceAccessService {
         const requests = user.role === UserRole.ADMIN
             ? await ResourcePublicationRequestTable.find({ order: { updatedAt: 'DESC' } })
             : await ResourcePublicationRequestTable.find({ where: { requesterUserId: user.id }, order: { updatedAt: 'DESC' } });
-        return { resources, requests };
+        const requestResourceIds = requests.map((request) => request.resourceId).filter(Boolean);
+        const requestUserIds = requests
+            .flatMap((request) => [request.requesterUserId, request.reviewedBy])
+            .filter((id): id is string => !!id);
+        const directPublishEvents = user.role === UserRole.ADMIN
+            ? await ResourceAuditEventTable.find({ where: { eventType: 'resource_published' }, order: { createdAt: 'DESC' }, take: 200 })
+            : [];
+        const directPublishResourceIds = directPublishEvents.map((event) => event.resourceId).filter((id): id is string => !!id);
+        const directPublishActorIds = directPublishEvents.map((event) => event.actorUserId).filter((id): id is string => !!id);
+        const historyResourceIds = Array.from(new Set([...requestResourceIds, ...directPublishResourceIds]));
+        const historyUserIds = Array.from(new Set([...requestUserIds, ...directPublishActorIds]));
+        const [historyResources, historyUsers] = await Promise.all([
+            historyResourceIds.length ? ResourceCatalogTable.find({ where: { id: In(historyResourceIds) } }) : Promise.resolve([]),
+            historyUserIds.length ? AuthUserTable.find({ where: { id: In(historyUserIds) } }) : Promise.resolve([]),
+        ]);
+        const resourceById = new Map(historyResources.map((resource) => [resource.id, resource]));
+        const userById = new Map(historyUsers.map((historyUser) => [historyUser.id, historyUser.username]));
+        const approvedRequestResourceIds = new Set(
+            requests
+                .filter((request) => request.status === PublicationStatus.APPROVED)
+                .map((request) => request.resourceId),
+        );
+        const enrichedRequests = requests.map((request) => {
+            const resource = resourceById.get(request.resourceId);
+            return {
+                ...request,
+                requesterUsername: userById.get(request.requesterUserId) || null,
+                reviewerUsername: request.reviewedBy ? userById.get(request.reviewedBy) || null : null,
+                resource: resource ? {
+                    id: resource.id,
+                    bizType: resource.bizType,
+                    nodeId: resource.nodeId,
+                    containerName: resource.containerName,
+                    itemKey: resource.itemKey,
+                    visibility: resource.visibility,
+                    ownerUserId: resource.ownerUserId || null,
+                    groupId: resource.groupId || null,
+                } : null,
+            };
+        });
+        const publicationHistory = [
+            ...enrichedRequests.map((request) => ({
+                id: request.id,
+                kind: 'request',
+                status: request.status,
+                resourceId: request.resourceId,
+                requesterUserId: request.requesterUserId,
+                requesterUsername: request.requesterUsername,
+                actorUserId: request.requesterUserId,
+                actorUsername: request.requesterUsername,
+                reviewerUserId: request.reviewedBy || null,
+                reviewerUsername: request.reviewerUsername,
+                note: request.reviewNote || null,
+                createdAt: request.createdAt,
+                updatedAt: request.updatedAt,
+                resource: request.resource,
+            })),
+            ...directPublishEvents
+                .filter((event) => event.resourceId && !approvedRequestResourceIds.has(event.resourceId))
+                .map((event) => {
+                    const resource = event.resourceId ? resourceById.get(event.resourceId) : null;
+                    return {
+                        id: event.id,
+                        kind: 'direct_publish',
+                        status: PublicationStatus.APPROVED,
+                        resourceId: event.resourceId || null,
+                        requesterUserId: event.actorUserId || null,
+                        requesterUsername: event.actorUserId ? userById.get(event.actorUserId) || null : null,
+                        actorUserId: event.actorUserId || null,
+                        actorUsername: event.actorUserId ? userById.get(event.actorUserId) || null : null,
+                        reviewerUserId: event.actorUserId || null,
+                        reviewerUsername: event.actorUserId ? userById.get(event.actorUserId) || null : null,
+                        note: null,
+                        createdAt: event.createdAt,
+                        updatedAt: event.createdAt,
+                        resource: resource ? {
+                            id: resource.id,
+                            bizType: resource.bizType,
+                            nodeId: resource.nodeId,
+                            containerName: resource.containerName,
+                            itemKey: resource.itemKey,
+                            visibility: resource.visibility,
+                            ownerUserId: resource.ownerUserId || null,
+                            groupId: resource.groupId || null,
+                        } : {
+                            id: event.resourceId || '',
+                            bizType: event.details?.bizType || null,
+                            nodeId: event.details?.nodeId || null,
+                            containerName: event.details?.containerName || null,
+                            itemKey: event.details?.itemKey || event.resourceId || null,
+                            visibility: ResourceVisibility.PUBLIC,
+                            ownerUserId: event.details?.ownerUserId || null,
+                            groupId: event.details?.groupId || event.details?.previousGroupId || null,
+                        },
+                    };
+                }),
+        ].sort((left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime());
+        return { resources, requests: enrichedRequests, publicationHistory };
     }
 
     private static async publishResourceWithManager(
@@ -821,8 +941,25 @@ export class ResourceAccessService {
         const resource = await manager.findOne(ResourceCatalogTable, { where: { id: resourceId } });
         if (!resource) throw new Error('auth.error.resourceNotFound');
         const targets = resource.sourcePath
-            ? await manager.find(ResourceCatalogTable, { where: { bizType: resource.bizType, sourcePath: resource.sourcePath } })
+            ? await manager.createQueryBuilder(ResourceCatalogTable, 'target')
+                .where('target.bizType = :bizType', { bizType: resource.bizType })
+                .andWhere('target.sourcePath = :sourcePath', { sourcePath: resource.sourcePath })
+                .andWhere('target.nodeId = :nodeId', { nodeId: resource.nodeId })
+                .andWhere('target.containerName = :containerName', { containerName: resource.containerName })
+                .andWhere(resource.ownerUserId ? 'target.ownerUserId = :ownerUserId' : 'target.ownerUserId IS NULL', {
+                    ownerUserId: resource.ownerUserId,
+                })
+                .andWhere(resource.groupId ? 'target.groupId = :groupId' : 'target.groupId IS NULL', {
+                    groupId: resource.groupId,
+                })
+                .getMany()
             : [resource];
+        const before = targets.map((target) => ({
+            resourceId: target.id,
+            visibility: target.visibility,
+            groupId: target.groupId || null,
+            ownerUserId: target.ownerUserId || null,
+        }));
         await manager.delete(ResourceShareScopeTable, { resourceId: In(targets.map((target) => target.id)) });
         for (const target of targets) {
             target.visibility = ResourceVisibility.PUBLIC;
@@ -830,7 +967,20 @@ export class ResourceAccessService {
         }
         await manager.save(ResourceCatalogTable, targets);
         await this.recordAuditEvent('resource_published', resource.id, actorUserId, {
+            bizType: resource.bizType,
+            nodeId: resource.nodeId,
+            containerName: resource.containerName,
+            itemKey: resource.itemKey,
+            ownerUserId: resource.ownerUserId || null,
+            previousGroupId: before[0]?.groupId || null,
             resourceIds: targets.map((target) => target.id),
+            before,
+            after: targets.map((target) => ({
+                resourceId: target.id,
+                visibility: ResourceVisibility.PUBLIC,
+                groupId: null,
+                ownerUserId: target.ownerUserId || null,
+            })),
         }, manager);
         return { resource, resourceIds: targets.map((target) => target.id) };
     }
@@ -853,7 +1003,16 @@ export class ResourceAccessService {
         const request = await ResourcePublicationRequestTable.create({
             id: crypto.randomUUID(), resourceId, requesterUserId: userId, status: PublicationStatus.PENDING,
         }).save();
-        await this.recordAuditEvent('publication_requested', resourceId, userId, { requestId: request.id });
+        await this.recordAuditEvent('publication_requested', resourceId, userId, {
+            requestId: request.id,
+            bizType: resource.bizType,
+            nodeId: resource.nodeId,
+            containerName: resource.containerName,
+            itemKey: resource.itemKey,
+            ownerUserId: resource.ownerUserId || null,
+            groupId: resource.groupId || null,
+            visibility: resource.visibility,
+        });
         return request;
     }
 
@@ -877,15 +1036,188 @@ export class ResourceAccessService {
                 approved ? 'publication_approved' : 'publication_rejected',
                 request.resourceId,
                 adminId,
-                { requestId: request.id, note: request.reviewNote || null },
+                {
+                    requestId: request.id,
+                    requesterUserId: request.requesterUserId,
+                    note: request.reviewNote || null,
+                    before: { status: PublicationStatus.PENDING },
+                    after: { status: request.status },
+                },
                 manager,
             );
             return request;
         });
     }
 
-    static async listAuditEvents() {
-        return ResourceAuditEventTable.find({ order: { createdAt: 'DESC' }, take: 200 });
+    static async listAuditEvents(filters?: {
+        resourceId?: string;
+        actorUserId?: string;
+        eventType?: string;
+        result?: AuditResult;
+        module?: AuditModule;
+        level?: AuditLevel;
+        operationType?: AuditOperationType;
+        search?: string;
+        startAt?: string;
+        endAt?: string;
+        limit?: number;
+    }) {
+        const limit = Math.min(Math.max(filters?.limit || 200, 1), 5000);
+        const query = ResourceAuditEventTable.createQueryBuilder('event')
+            .orderBy('event.createdAt', 'DESC')
+            .take(limit);
+        if (filters?.resourceId) {
+            query.andWhere('event.resourceId = :resourceId', { resourceId: filters.resourceId });
+        }
+        if (filters?.actorUserId) {
+            query.andWhere('event.actorUserId = :actorUserId', { actorUserId: filters.actorUserId });
+        }
+        if (filters?.eventType) {
+            query.andWhere('event.eventType = :eventType', { eventType: filters.eventType });
+        }
+        const classificationFilters = {
+            result: filters?.result,
+            module: filters?.module,
+            level: filters?.level,
+            operationType: filters?.operationType,
+        };
+        const hasClassificationFilter = Object.values(classificationFilters).some(Boolean);
+        if (hasClassificationFilter) {
+            if (filters?.eventType) {
+                if (!matchesAuditClassification(filters.eventType, classificationFilters)) return [];
+            } else {
+                const eventTypes = await ResourceAuditEventTable.createQueryBuilder('event')
+                    .select('event.eventType', 'eventType')
+                    .distinct(true)
+                    .getRawMany<{ eventType: string }>();
+                const matchingEventTypes = eventTypes
+                    .map(({ eventType }) => eventType)
+                    .filter((eventType) => matchesAuditClassification(eventType, classificationFilters));
+                if (!matchingEventTypes.length) return [];
+                query.andWhere('event.eventType IN (:...classificationEventTypes)', {
+                    classificationEventTypes: matchingEventTypes,
+                });
+            }
+        }
+        if (filters?.startAt) {
+            query.andWhere('datetime(event.createdAt) >= datetime(:startAt)', { startAt: filters.startAt });
+        }
+        if (filters?.endAt) {
+            query.andWhere('datetime(event.createdAt) <= datetime(:endAt)', { endAt: filters.endAt });
+        }
+        const search = filters?.search?.trim();
+        if (search) {
+            query.andWhere(
+                '(event.eventType like :search or event.resourceId like :search or event.actorUserId like :search or event.details like :search)',
+                { search: `%${search}%` },
+            );
+        }
+        const events = await query.getMany();
+        const userIds = Array.from(new Set(events.flatMap((event) => {
+            const details = event.details || {};
+            return [
+                event.actorUserId,
+                typeof details.targetUserId === 'string' ? details.targetUserId : null,
+                typeof details.requesterUserId === 'string' ? details.requesterUserId : null,
+                typeof details.ownerUserId === 'string' ? details.ownerUserId : null,
+            ].filter(Boolean) as string[];
+        })));
+        const explicitGroupIds = Array.from(new Set(events.flatMap((event) => {
+            const details = event.details || {};
+            return [
+                typeof details.groupId === 'string' ? details.groupId : null,
+                typeof details.previousGroupId === 'string' ? details.previousGroupId : null,
+            ].filter(Boolean) as string[];
+        })));
+        const poolIds = Array.from(new Set(events.flatMap((event) => {
+            const details = event.details || {};
+            return [typeof details.poolId === 'string' ? details.poolId : null].filter(Boolean) as string[];
+        })));
+        const nodeIds = Array.from(new Set(events.flatMap((event) => {
+            const details = event.details || {};
+            return [
+                typeof details.nodeId === 'string' ? details.nodeId : null,
+                typeof details.homeNodeId === 'string' ? details.homeNodeId : null,
+            ].filter(Boolean) as string[];
+        })));
+        const users = userIds.length
+            ? await AuthUserTable.find({ where: { id: In(userIds) } })
+            : [];
+        const memberships = userIds.length
+            ? await UserGroupMemberTable.find({ where: { userId: In(userIds) } })
+            : [];
+        const actorGroupIds = memberships.map((membership) => membership.groupId);
+        const groupIds = Array.from(new Set([...explicitGroupIds, ...actorGroupIds]));
+        const groups = groupIds.length
+            ? await UserGroupTable.find({ where: { id: In(groupIds) } })
+            : [];
+        const pools = poolIds.length
+            ? await ResourcePoolTable.find({ where: { id: In(poolIds) } })
+            : [];
+        const usernames = new Map(users.map((user) => [user.id, user.username]));
+        const userRoles = new Map(users.map((user) => [user.id, user.role]));
+        const groupNames = new Map(groups.map((group) => [group.id, group.name]));
+        const actorGroupIdsByUserId = new Map(memberships.map((membership) => [membership.userId, membership.groupId]));
+        const poolNames = new Map(pools.map((pool) => [pool.id, pool.name]));
+        const nodeNames = new Map(resourceNodeRegistry.list().map((node) => [node.id, node.name]));
+        return events.map((event) => ({
+            ...event,
+            details: {
+                ...(event.details || {}),
+                actorUsername: event.details?.actorUsername ||
+                    (event.actorUserId ? usernames.get(event.actorUserId) : undefined),
+                actorRole: event.details?.actorRole ||
+                    (event.actorUserId ? userRoles.get(event.actorUserId) : undefined),
+                actorGroupId: event.details?.actorGroupId ||
+                    (event.actorUserId ? actorGroupIdsByUserId.get(event.actorUserId) : undefined),
+                actorGroupName: event.details?.actorGroupName ||
+                    (event.actorUserId
+                        ? groupNames.get(actorGroupIdsByUserId.get(event.actorUserId) || '')
+                        : undefined),
+                targetUsername: event.details?.targetUsername ||
+                    (typeof event.details?.targetUserId === 'string'
+                        ? usernames.get(event.details.targetUserId)
+                        : undefined),
+                targetRole: event.details?.targetRole ||
+                    (typeof event.details?.targetUserId === 'string'
+                        ? userRoles.get(event.details.targetUserId)
+                        : undefined),
+                requesterUsername: event.details?.requesterUsername ||
+                    (typeof event.details?.requesterUserId === 'string'
+                        ? usernames.get(event.details.requesterUserId)
+                        : undefined),
+                ownerUsername: event.details?.ownerUsername ||
+                    (typeof event.details?.ownerUserId === 'string'
+                        ? usernames.get(event.details.ownerUserId)
+                        : undefined),
+                groupName: event.details?.groupName ||
+                    (typeof event.details?.groupId === 'string'
+                        ? groupNames.get(event.details.groupId)
+                        : undefined),
+                previousGroupName: event.details?.previousGroupName ||
+                    (typeof event.details?.previousGroupId === 'string'
+                        ? groupNames.get(event.details.previousGroupId)
+                        : undefined),
+                poolName: event.details?.poolName ||
+                    (typeof event.details?.poolId === 'string'
+                        ? poolNames.get(event.details.poolId)
+                        : undefined),
+                nodeName: event.details?.nodeName ||
+                    (typeof event.details?.nodeId === 'string'
+                        ? nodeNames.get(event.details.nodeId)
+                        : undefined),
+                homeNodeName: event.details?.homeNodeName ||
+                    (typeof event.details?.homeNodeId === 'string'
+                        ? nodeNames.get(event.details.homeNodeId)
+                        : undefined),
+                nodeNames: event.details?.nodeNames ||
+                    (Array.isArray(event.details?.nodeIds)
+                        ? event.details.nodeIds
+                            .filter((nodeId): nodeId is string => typeof nodeId === 'string')
+                            .map((nodeId) => nodeNames.get(nodeId) || nodeId)
+                        : undefined),
+            },
+        }));
     }
 
     static async recordAuditEvent(

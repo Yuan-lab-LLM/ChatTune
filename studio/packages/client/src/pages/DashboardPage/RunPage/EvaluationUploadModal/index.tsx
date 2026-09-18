@@ -147,7 +147,7 @@ const EvaluationUploadModal = ({
                     <Input
                         value={testType}
                         onChange={(e) => setTestType(e.target.value)}
-                        placeholder={t('evaluation.upload.test-type-placeholder') || '请输入评测类型，如：中国执业医师资格考试'}
+                        placeholder={t('evaluation.upload.test-type-placeholder') || '请输入评测分类，如 general、medical 或 custom'}
                         disabled={isUploading}
                     />
                 </Form.Item>

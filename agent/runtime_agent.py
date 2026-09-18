@@ -32,6 +32,18 @@ from medflow_agent_tools._dataset_candidates import (
 
 # 导入配置和内存管理模块
 from utils import SessionState, get_current_config, get_memory_manager, init_config
+from utils.request_sections import (
+    extract_request_section,
+    request_kind_from_protocol_kind,
+    request_kind_from_text,
+)
+from utils.benchmark_status import (
+    format_benchmark_remaining,
+    query_inference_benchmark_status,
+    recover_benchmark_job_id,
+    recover_benchmark_resource_context,
+    workflow_benchmark_result,
+)
 from utils.workflow_manager import (
     STAGES,
     WorkflowDependencies,
@@ -246,6 +258,11 @@ from medflow_agent_tools import (
     run_script_by_name_assessment_monitor,
     run_script_by_name_evaluate_monitor
 )
+from medflow_agent_tools.runlocal_evaluate import (
+    GENERIC_EVAL_DATASETS,
+    _normalize_evaluation_scope,
+    _normalize_generic_eval_datasets,
+)
 from medflow_agent_tools.runlocal_train import (
     _local_gpu_snapshot_for_runtime_request,
     _release_resource_allocation,
@@ -360,11 +377,11 @@ class Toolkit(AgentScopeToolkit):
             "_call_dataprocessor": "Use when the user asks for data preprocessing or advanced data filtering.",
             "_call_trainer": "Use when the user asks to start or schedule model training, including LoRA SFT, full SFT, LoRA PT, full PT, enhanced training, GRPO, or multinode training.",
             "_call_evaluator": "Use when the user asks for model evaluation, single-model evaluation, dual-model evaluation, checkpoint evaluation, or benchmark-style assessment.",
-            "_call_inference": "Use when the user asks about inference service operations, inference configuration, node operations, function tests, or inference benchmarks.",
+            "_call_inference": "Use when the user asks about vLLM service operations, inference configuration, node operations, or inference benchmarks.",
             "_call_monitor": "Use when the user asks for training, evaluation, or process monitoring/status.",
             "_call_analysis": "Use when the user asks to analyze training curves or training metrics.",
             "_workflow_control": "Use only for explicit workflow control commands such as continue, skip, retry, or workflow status.",
-            "_run_inference_agent_command": "Use for all real inference service, node operation, function-test, and benchmark requests. Pass the user's original request as command.",
+            "_run_inference_agent_command": "Use for all real vLLM service, node operation, and benchmark requests. Pass the user's original request as command.",
         }
         hint = usage_hints.get(name)
         policy = (
@@ -544,10 +561,6 @@ BACKGROUND_TASK_REGISTRY = RUNTIME_DIR / "background_task_registry.jsonl"
 WORKFLOW_LOG_DIR = RUNTIME_DIR / "workflow_logs"
 DEFAULT_DOCKER_CONTAINER = config.environment.default_docker_container
 DEFAULT_EVALUATE_DOCKER_CONTAINER = config.environment.default_evaluate_docker_container
-BENCHMARK_LOGS_PATH = "/home/workspace/tests/logs/benchmark"
-BENCHMARK_DATASET_ALIASES = {
-    "truthfulqa": {"truthfulqa", "truthfulqa-generation"},
-}
 REQUEST_TRAINING_CONTAINER: ContextVar[str] = ContextVar(
     "request_training_container",
     default=DEFAULT_DOCKER_CONTAINER,
@@ -591,21 +604,137 @@ INFERENCE_RESOURCE_HEARTBEATS: Dict[str, threading.Event] = {}
 INFERENCE_RESOURCE_HEARTBEATS_LOCK = threading.Lock()
 
 
-def _inference_gpus_per_node() -> int:
+def _positive_inference_gpu_count(value: Any, source: str) -> int:
+    if isinstance(value, bool):
+        raise RuntimeError(f"{source} 必须是正整数")
+    if isinstance(value, int):
+        parsed = value
+    else:
+        text = str(value or "").strip()
+        if not re.fullmatch(r"\+?\d+", text):
+            raise RuntimeError(f"{source} 必须是正整数，当前值={value!r}")
+        parsed = int(text)
+    if parsed < 1:
+        raise RuntimeError(f"{source} 必须大于 0，当前值={value!r}")
+    return parsed
+
+
+def _inference_worker_tool_url() -> str:
+    configured_url = str(config.agents.inference.inference_agent_url or "").strip().rstrip("/")
+    if not configured_url:
+        raise RuntimeError("INFERENCE_AGENT_URL 未配置，无法读取当前用户推理配置")
+    if configured_url.endswith("/worker/tool"):
+        return configured_url
+    if configured_url.endswith("/inference_agent"):
+        return configured_url[: -len("/inference_agent")] + "/worker/tool"
+    return configured_url + "/worker/tool"
+
+
+def _default_inference_gpus_per_node() -> int:
+    """Strict legacy fallback for internal callers that do not have a user identity."""
+    configured_path = str(os.getenv("INFERENCE_OPS_SERVICE_CONFIG") or "").strip()
+    service_config = (
+        Path(configured_path)
+        if configured_path
+        else Path(__file__).resolve().parent.parent / "inference-ops" / "config" / "service.yaml"
+    )
+    try:
+        payload = yaml.safe_load(service_config.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        raise RuntimeError(f"无法读取推理配置 {service_config}: {exc}") from exc
+    runtime = payload.get("RUNTIME") if isinstance(payload.get("RUNTIME"), dict) else {}
+    if "TENSOR_PARALLEL_SIZE" not in runtime:
+        raise RuntimeError(
+            f"推理配置 {service_config} 缺少 RUNTIME.TENSOR_PARALLEL_SIZE"
+        )
+    return _positive_inference_gpu_count(
+        runtime.get("TENSOR_PARALLEL_SIZE"),
+        f"{service_config} 中的 RUNTIME.TENSOR_PARALLEL_SIZE",
+    )
+
+
+def _inference_gpus_per_node(
+    *,
+    owner_user_id: str = "",
+    owner_aliases: Any = None,
+    user_role: str = "",
+    thread_id: str = "",
+) -> int:
     for env_name in ("MEDFLOW_INFERENCE_GPUS_PER_NODE", "AGENT3_INFERENCE_GPUS_PER_NODE"):
         raw_value = str(os.getenv(env_name) or "").strip()
         if raw_value:
-            try:
-                return max(1, int(raw_value))
-            except ValueError:
-                logger.warning("Ignore invalid %s=%s", env_name, raw_value)
-    service_config = Path(__file__).resolve().parent.parent / "medflow" / "agent" / "config" / "service.yaml"
+            return _positive_inference_gpu_count(raw_value, env_name)
+
+    resolved_user_id = str(owner_user_id or "").strip()
+    if not resolved_user_id:
+        return _default_inference_gpus_per_node()
+
+    aliases = [
+        str(item).strip()
+        for item in (owner_aliases or [])
+        if str(item or "").strip()
+    ]
+    request_payload = {
+        "tool": "config_show",
+        "args": {},
+        "user_id": resolved_user_id,
+        "user_aliases": aliases,
+        "user_role": str(user_role or "").strip().lower(),
+        "thread_id": str(thread_id or f"user:{resolved_user_id}:inference-config").strip(),
+    }
     try:
-        payload = yaml.safe_load(service_config.read_text(encoding="utf-8")) or {}
-        runtime = payload.get("RUNTIME") if isinstance(payload.get("RUNTIME"), dict) else {}
-        return max(1, int(runtime.get("TENSOR_PARALLEL_SIZE") or 1))
-    except Exception:
-        return 1
+        response = requests.post(
+            _inference_worker_tool_url(),
+            json=request_payload,
+            headers=_inference_ops_headers(),
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        raise RuntimeError(
+            f"读取当前用户推理配置失败 user_id={resolved_user_id}: {exc}"
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("当前用户推理配置返回格式无效")
+    status = str(payload.get("status") or "").strip().lower()
+    if status != "ok":
+        detail = str(payload.get("result") or payload.get("message") or status or "unknown error")
+        raise RuntimeError(f"读取当前用户推理配置失败: {detail}")
+
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    config_draft = data.get("config_draft") if isinstance(data.get("config_draft"), dict) else {}
+    values = config_draft.get("values") if isinstance(config_draft.get("values"), dict) else {}
+    runtime = values.get("RUNTIME") if isinstance(values.get("RUNTIME"), dict) else {}
+    if "TENSOR_PARALLEL_SIZE" not in runtime:
+        raise RuntimeError(
+            "当前用户推理配置缺少 "
+            "data.config_draft.values.RUNTIME.TENSOR_PARALLEL_SIZE"
+        )
+    return _positive_inference_gpu_count(
+        runtime.get("TENSOR_PARALLEL_SIZE"),
+        "当前用户推理配置 RUNTIME.TENSOR_PARALLEL_SIZE",
+    )
+
+
+def _inference_ops_headers() -> Dict[str, str]:
+    auth_mode = str(
+        os.getenv("INFERENCE_OPS_AUTH_MODE") or "trusted_network"
+    ).strip().lower()
+    if auth_mode not in {"trusted_network", "token"}:
+        raise RuntimeError(
+            "INFERENCE_OPS_AUTH_MODE must be one of: trusted_network, token"
+        )
+    if auth_mode == "trusted_network":
+        return {}
+    token = str(os.getenv("INFERENCE_OPS_API_TOKEN") or "").strip()
+    if not token:
+        raise RuntimeError(
+            "INFERENCE_OPS_API_TOKEN is required when "
+            "INFERENCE_OPS_AUTH_MODE=token"
+        )
+    return {"Authorization": f"Bearer {token}"}
 
 
 def _inference_command_needs_resource_context(command: str) -> bool:
@@ -718,11 +847,19 @@ def _inference_request_resource_context(
     *,
     resource_group_id: str = "",
     training_pool_id: str = "",
+    owner_user_id: str = "",
+    owner_aliases: Any = None,
+    user_role: str = "",
+    thread_id: str = "",
 ) -> Optional[Dict[str, Any]]:
     prepared = _prepare_inference_resource_context(
         command,
         resource_group_id=resource_group_id,
         training_pool_id=training_pool_id,
+        owner_user_id=owner_user_id,
+        owner_aliases=owner_aliases,
+        user_role=user_role,
+        thread_id=thread_id,
     )
     
     if prepared:
@@ -737,6 +874,10 @@ def _prepare_inference_resource_context(
     *,
     resource_group_id: str = "",
     training_pool_id: str = "",
+    owner_user_id: str = "",
+    owner_aliases: Any = None,
+    user_role: str = "",
+    thread_id: str = "",
 ) -> Optional[Dict[str, Any]]:
     resource_group_id = str(resource_group_id or _current_resource_group_id() or "").strip()
     training_pool_id = str(training_pool_id or _current_training_pool_id() or "").strip()
@@ -747,7 +888,12 @@ def _prepare_inference_resource_context(
     if not runtime_node_id:
         raise RuntimeError("资源池已启用但缺少 MEDFLOW_RESOURCE_NODE_ID，无法为推理服务申请资源")
 
-    gpus_per_node = _inference_gpus_per_node()
+    gpus_per_node = _inference_gpus_per_node(
+        owner_user_id=owner_user_id,
+        owner_aliases=owner_aliases,
+        user_role=user_role,
+        thread_id=thread_id,
+    )
     request_data: Dict[str, Any] = {
         "groupId": resource_group_id,
         "runtimeNodeId": runtime_node_id,
@@ -804,11 +950,127 @@ def _inference_reservation_heartbeat_seconds() -> int:
         return 60
 
 
+def _inference_startup_status_seconds() -> int:
+    try:
+        return max(1, int(os.getenv("MEDFLOW_INFERENCE_STARTUP_STATUS_SECONDS", "5")))
+    except ValueError:
+        return 5
+
+
 def _inference_reservation_max_heartbeat_failures() -> int:
     try:
         return max(1, int(os.getenv("MEDFLOW_INFERENCE_RESERVATION_MAX_HEARTBEAT_FAILURES", "3")))
     except ValueError:
         return 3
+
+
+def _inference_payload_item_reservation_id(item: Any) -> str:
+    if not isinstance(item, dict):
+        return ""
+    resource = item.get("resource") if isinstance(item.get("resource"), dict) else {}
+    resource_context = item.get("resource_context") if isinstance(item.get("resource_context"), dict) else {}
+    return str(
+        item.get("reservation_id")
+        or item.get("reservationId")
+        or resource.get("reservation_id")
+        or resource.get("reservationId")
+        or resource_context.get("reservation_id")
+        or resource_context.get("reservationId")
+        or ""
+    ).strip()
+
+
+def _inference_response_sources(payload: Any) -> List[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    sources: List[Dict[str, Any]] = []
+    for source in (
+        payload,
+        payload.get("data"),
+        payload.get("protocol"),
+    ):
+        if isinstance(source, dict):
+            sources.append(source)
+    for source in list(sources):
+        nodes = source.get("nodes")
+        if not isinstance(nodes, dict):
+            continue
+        sources.extend(
+            node_payload
+            for node_payload in nodes.values()
+            if isinstance(node_payload, dict)
+        )
+    return sources
+
+
+def _inference_instance_for_reservation(
+    payload: Any,
+    reservation_id: str,
+) -> Optional[Dict[str, Any]]:
+    reservation_id = str(reservation_id or "").strip()
+    if not reservation_id:
+        return None
+    for source in _inference_response_sources(payload):
+        service_start = source.get("service_start")
+        if (
+            isinstance(service_start, dict)
+            and service_start.get("submitted") is True
+            and _inference_payload_item_reservation_id(service_start) == reservation_id
+        ):
+            return service_start
+        service_instances = source.get("service_instances")
+        items = service_instances.get("items") if isinstance(service_instances, dict) else None
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if (
+                isinstance(item, dict)
+                and _inference_payload_item_reservation_id(item) == reservation_id
+            ):
+                return item
+    return None
+
+
+def _query_inference_service_instance(
+    instance_id: str,
+    resource_context: Dict[str, Any],
+    *,
+    owner_user_id: str = "",
+    owner_aliases: Any = None,
+    user_role: str = "",
+    thread_id: str = "",
+) -> Dict[str, Any]:
+    request_payload = {
+        "tool": "service_instance_status",
+        "args": {"instance_id": instance_id},
+        "user_id": str(owner_user_id or "").strip(),
+        "user_aliases": [
+            str(item).strip()
+            for item in (owner_aliases or [])
+            if str(item or "").strip()
+        ],
+        "user_role": str(user_role or "").strip().lower(),
+        "thread_id": str(thread_id or "").strip(),
+        "resource_context": resource_context,
+    }
+    response = requests.post(
+        _inference_worker_tool_url(),
+        json=request_payload,
+        headers=_inference_ops_headers(),
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("推理实例状态返回格式无效")
+    if str(payload.get("status") or "").strip().lower() != "ok":
+        detail = str(payload.get("result") or payload.get("message") or "unknown error")
+        raise RuntimeError(f"查询推理实例状态失败: {detail}")
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    instance = data.get("service_instance")
+    if not isinstance(instance, dict):
+        raise RuntimeError("推理实例状态缺少 data.service_instance")
+    return instance
 
 
 def _stop_inference_resource_heartbeat(reservation_id: str) -> None:
@@ -821,7 +1083,111 @@ def _stop_inference_resource_heartbeat(reservation_id: str) -> None:
         stop_event.set()
 
 
-def _start_inference_resource_heartbeat(resource_context: Optional[Dict[str, Any]]) -> None:
+def _run_inference_resource_heartbeat(
+    resource_context: Dict[str, Any],
+    stop_event: threading.Event,
+    *,
+    instance_id: str = "",
+    owner_user_id: str = "",
+    owner_aliases: Any = None,
+    user_role: str = "",
+    thread_id: str = "",
+) -> None:
+    reservation_id = str(resource_context.get("reservation_id") or "").strip()
+    runtime_node_id = str(resource_context.get("runtime_node_id") or "").strip()
+    interval = _inference_reservation_heartbeat_seconds()
+    startup_interval = _inference_startup_status_seconds()
+    max_failures = _inference_reservation_max_heartbeat_failures()
+    renewal_failures = 0
+    not_found_count = 0
+    last_status = "starting" if instance_id else "unknown"
+    next_renewal_at = time.monotonic()
+    try:
+        while True:
+            wait_seconds = startup_interval if last_status == "starting" else interval
+            if stop_event.wait(wait_seconds):
+                return
+            with INFERENCE_RESOURCE_RESERVATIONS_LOCK:
+                active_context = INFERENCE_RESOURCE_RESERVATIONS.get(reservation_id)
+            if active_context is not resource_context and active_context != resource_context:
+                return
+
+            if instance_id:
+                try:
+                    instance = _query_inference_service_instance(
+                        instance_id,
+                        resource_context,
+                        owner_user_id=owner_user_id,
+                        owner_aliases=owner_aliases,
+                        user_role=user_role,
+                        thread_id=thread_id,
+                    )
+                    last_status = str(instance.get("status") or "unknown").strip().lower()
+                    if last_status == "not_found":
+                        not_found_count += 1
+                    else:
+                        not_found_count = 0
+                    terminal = last_status in {"failed", "stopped"}
+                    terminal = terminal or not_found_count >= max_failures
+                    if terminal:
+                        logger.info(
+                            "Releasing inference GPU reservation after instance %s reached %s",
+                            instance_id,
+                            last_status,
+                        )
+                        _release_inference_resource_context(resource_context)
+                        return
+                except Exception:
+                    logger.exception(
+                        "Failed to inspect inference service instance %s for reservation %s",
+                        instance_id,
+                        reservation_id,
+                    )
+
+            if time.monotonic() < next_renewal_at:
+                continue
+            try:
+                renewal = _runtime_training_resource_request(
+                    "renewTrainingResourcesForRuntime",
+                    {
+                        "reservationId": reservation_id,
+                        "runtimeNodeId": runtime_node_id,
+                    },
+                )
+                if isinstance(renewal, dict):
+                    resource_context["expires_at"] = (
+                        renewal.get("expiresAt")
+                        or renewal.get("expires_at")
+                        or resource_context.get("expires_at")
+                    )
+                renewal_failures = 0
+                next_renewal_at = time.monotonic() + interval
+            except Exception:
+                renewal_failures += 1
+                logger.exception("Failed to renew inference GPU reservation %s", reservation_id)
+                if renewal_failures >= max_failures:
+                    logger.error(
+                        "Releasing inference GPU reservation after %s consecutive renewal failures",
+                        renewal_failures,
+                    )
+                    _release_inference_resource_context(resource_context)
+                    return
+    finally:
+        with INFERENCE_RESOURCE_HEARTBEATS_LOCK:
+            existing = INFERENCE_RESOURCE_HEARTBEATS.get(reservation_id)
+            if existing is stop_event:
+                INFERENCE_RESOURCE_HEARTBEATS.pop(reservation_id, None)
+
+
+def _start_inference_resource_heartbeat(
+    resource_context: Optional[Dict[str, Any]],
+    *,
+    response_payload: Any = None,
+    owner_user_id: str = "",
+    owner_aliases: Any = None,
+    user_role: str = "",
+    thread_id: str = "",
+) -> None:
     if not isinstance(resource_context, dict):
         return
     reservation_id = str(resource_context.get("reservation_id") or "").strip()
@@ -833,47 +1199,29 @@ def _start_inference_resource_heartbeat(resource_context: Optional[Dict[str, Any
             return
         stop_event = threading.Event()
         INFERENCE_RESOURCE_HEARTBEATS[reservation_id] = stop_event
-
-    interval = _inference_reservation_heartbeat_seconds()
-    max_failures = _inference_reservation_max_heartbeat_failures()
-
-    def heartbeat() -> None:
-        failures = 0
-        try:
-            while not stop_event.wait(interval):
-                with INFERENCE_RESOURCE_RESERVATIONS_LOCK:
-                    active_context = INFERENCE_RESOURCE_RESERVATIONS.get(reservation_id)
-                if active_context is not resource_context and active_context != resource_context:
-                    return
-                try:
-                    renewal = _runtime_training_resource_request(
-                        "renewTrainingResourcesForRuntime",
-                        {
-                            "reservationId": reservation_id,
-                            "runtimeNodeId": runtime_node_id,
-                        },
-                    )
-                    if isinstance(renewal, dict):
-                        resource_context["expires_at"] = renewal.get("expiresAt") or renewal.get("expires_at") or resource_context.get("expires_at")
-                    failures = 0
-                except Exception:
-                    failures += 1
-                    logger.exception("Failed to renew inference GPU reservation %s", reservation_id)
-                    if failures >= max_failures:
-                        logger.error(
-                            "Releasing inference GPU reservation after %s consecutive renewal failures",
-                            failures,
-                        )
-                        _release_inference_resource_context(resource_context)
-                        return
-        finally:
-            with INFERENCE_RESOURCE_HEARTBEATS_LOCK:
-                existing = INFERENCE_RESOURCE_HEARTBEATS.get(reservation_id)
-                if existing is stop_event:
-                    INFERENCE_RESOURCE_HEARTBEATS.pop(reservation_id, None)
+    instance = _inference_instance_for_reservation(response_payload, reservation_id)
+    instance_id = str(
+        (instance or {}).get("instance_id")
+        or (instance or {}).get("instanceId")
+        or (instance or {}).get("run_id")
+        or ""
+    ).strip()
+    if not instance_id:
+        logger.warning(
+            "Inference reservation %s has no structured instance_id; heartbeat will renew without status supervision",
+            reservation_id,
+        )
 
     threading.Thread(
-        target=heartbeat,
+        target=_run_inference_resource_heartbeat,
+        args=(resource_context, stop_event),
+        kwargs={
+            "instance_id": instance_id,
+            "owner_user_id": owner_user_id,
+            "owner_aliases": owner_aliases,
+            "user_role": user_role,
+            "thread_id": thread_id,
+        },
         name=f"medflow-inference-reservation-{reservation_id[:8]}",
         daemon=True,
     ).start()
@@ -941,6 +1289,7 @@ def _is_multinode_training_query(script_query: str) -> bool:
         keyword in normalized
         for keyword in [
             "train_multinode_sft_pipeline",
+            "train_multinode_sft_full_pipeline",
             "train_multinode_dpo_pipeline",
             "多机",
             "双机",
@@ -1328,7 +1677,53 @@ def _workflow_response_payload(response: ToolResponse) -> Dict[str, Any]:
         "error": metrics.get("error_detail") or hint.get("errorReason") or metrics.get("error_reason"),
         "metrics": metrics,
         "message": hint.get("message") or text,
+        "script_name": hint.get("scriptName") or hint.get("script") or metrics.get("script_name"),
+        "run_id": hint.get("runId") or metrics.get("run_id"),
+        "report_path": hint.get("reportPath") or metrics.get("report_path"),
+        "eval_datasets": hint.get("evalDatasets") or metrics.get("eval_datasets"),
+        "scores": hint.get("scores") or metrics.get("scores"),
+        "score_deltas": hint.get("scoreDeltas") or metrics.get("score_deltas"),
     }
+
+
+def _workflow_evaluation_scope(workflow: Dict[str, Any]) -> str:
+    """Old persisted workflows stay medical; new workflows carry an explicit scope."""
+    context = workflow.get("context") or {}
+    if context.get("evaluation_scope") is None:
+        return "medical"
+    return _normalize_evaluation_scope(context.get("evaluation_scope"))
+
+
+def _workflow_eval_datasets(workflow: Dict[str, Any]) -> List[str]:
+    if _workflow_evaluation_scope(workflow) != "general":
+        return []
+    return _normalize_generic_eval_datasets((workflow.get("context") or {}).get("eval_datasets"))
+
+
+def _workflow_evaluation_script(workflow: Dict[str, Any]) -> str:
+    context = workflow.get("context") or {}
+    expected = (
+        "generic_single_model_eval"
+        if _workflow_evaluation_scope(workflow) == "general"
+        else "single_model_evaluation_vpn"
+    )
+    configured = str(context.get("evaluation_script") or "").strip()
+    if configured and configured != expected:
+        raise ValueError(
+            f"工作流评测脚本与范围不匹配：evaluation_scope={_workflow_evaluation_scope(workflow)}, "
+            f"evaluation_script={configured}"
+        )
+    return expected
+
+
+def _workflow_evaluation_run_id(workflow: Dict[str, Any]) -> str:
+    stage = (workflow.get("stages") or {}).get("evaluate") or {}
+    context = workflow.get("context") or {}
+    existing = str(stage.get("run_id") or context.get("run_id") or "").strip()
+    if existing:
+        return existing
+    workflow_id = str(workflow.get("workflow_id") or "workflow").strip()
+    return f"{workflow_id}-eval-{uuid.uuid4().hex[:8]}"
 
 
 def _workflow_evaluate_result_matches_workflow(
@@ -1343,6 +1738,33 @@ def _workflow_evaluate_result_matches_workflow(
         return True
 
     metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
+    if _workflow_evaluation_scope(workflow) == "general":
+        stage = (workflow.get("stages") or {}).get("evaluate") or {}
+        expected_run_id = str(stage.get("run_id") or context.get("run_id") or "").strip()
+        actual_run_id = str(result.get("run_id") or metrics.get("run_id") or "").strip()
+        if not expected_run_id or actual_run_id != expected_run_id:
+            return False
+        try:
+            expected_datasets = _workflow_eval_datasets(workflow)
+            actual_datasets = _normalize_generic_eval_datasets(
+                result.get("eval_datasets") or metrics.get("eval_datasets")
+            )
+        except ValueError:
+            return False
+        if actual_datasets != expected_datasets:
+            return False
+        actual_scope = str(metrics.get("evaluation_scope") or "").strip()
+        if actual_scope not in {"general", "llamafactoryBuiltin"}:
+            return False
+        expected_path = target_path.rstrip("/")
+        models = metrics.get("models") if isinstance(metrics.get("models"), list) else []
+        return any(
+            isinstance(model, dict)
+            and str(model.get("role") or "") == "model_fir"
+            and str(model.get("path") or "").rstrip("/") == expected_path
+            for model in models
+        )
+
     monitor_model_name = str(metrics.get("model_name") or "").strip()
     if monitor_model_name and monitor_model_name != target_name:
         return False
@@ -1892,9 +2314,22 @@ def _workflow_check_existing_stage_output(workflow: Dict[str, Any], stage_name: 
 
 
 def _workflow_start_evaluate(workflow: Dict[str, Any]) -> Dict[str, Any]:
+    evaluation_scope = _workflow_evaluation_scope(workflow)
+    evaluation_script = _workflow_evaluation_script(workflow)
+    eval_datasets = _workflow_eval_datasets(workflow)
+    run_id = _workflow_evaluation_run_id(workflow) if evaluation_scope == "general" else None
+    additional_args: Dict[str, Any] = {
+        "model_fir": workflow["context"]["trained_model_path"],
+        "evaluation_scope": evaluation_scope,
+    }
+    if evaluation_scope == "general":
+        additional_args.update({
+            "eval_datasets": ",".join(eval_datasets),
+            "run_id": run_id,
+        })
     response = run_script_by_name_evaluate(
-        "单模型评估",
-        additional_args={"model_fir": workflow["context"]["trained_model_path"]},
+        evaluation_script,
+        additional_args=additional_args,
         env_vars={
             "container": _workflow_single_model_evaluation_container(workflow),
             "MEDFLOW_RESOURCE_GROUP_ID": str(
@@ -1909,18 +2344,43 @@ def _workflow_start_evaluate(workflow: Dict[str, Any]) -> Dict[str, Any]:
     result = _workflow_response_payload(response)
     if not (response.metadata or {}).get("success", False):
         raise RuntimeError(result.get("message") or "单模型评估启动失败")
-    return result
+    report_path = f"/home/workspace/eval/llamafactory/{run_id}/summary.txt" if run_id else None
+    return {
+        **result,
+        "script_name": evaluation_script,
+        "evaluation_scope": evaluation_scope,
+        "eval_datasets": eval_datasets,
+        "run_id": run_id,
+        "report_path": report_path,
+    }
 
 
 def _workflow_monitor_evaluate(workflow: Dict[str, Any]) -> Dict[str, Any]:
     stage = workflow["stages"]["evaluate"]
+    evaluation_scope = _workflow_evaluation_scope(workflow)
+    evaluation_script = _workflow_evaluation_script(workflow)
+    eval_datasets = _workflow_eval_datasets(workflow)
+    run_id = str(stage.get("run_id") or (workflow.get("context") or {}).get("run_id") or "").strip()
+    monitor_args = {"run_id": run_id} if evaluation_scope == "general" else None
     response = run_script_by_name_evaluate_monitor(
-        "single_model_evaluation_vpn",
+        evaluation_script,
+        additional_args=monitor_args,
         container_name=stage.get("container") or _workflow_single_model_evaluation_container(workflow),
         pid=stage.get("pid"),
         model_fir=workflow["context"]["trained_model_path"],
     )
     result = _workflow_response_payload(response)
+    if evaluation_scope == "general":
+        metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
+        result.update({
+            "script_name": evaluation_script,
+            "evaluation_scope": evaluation_scope,
+            "eval_datasets": metrics.get("eval_datasets") or eval_datasets,
+            "run_id": metrics.get("run_id") or run_id,
+            "report_path": metrics.get("report_path") or result.get("report_path"),
+            "scores": metrics.get("scores") or result.get("scores"),
+            "score_deltas": metrics.get("score_deltas") or result.get("score_deltas"),
+        })
     if result.get("status") == "finished" and not _workflow_evaluate_result_matches_workflow(workflow, result):
         metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
         metrics = {
@@ -1931,7 +2391,7 @@ def _workflow_monitor_evaluate(workflow: Dict[str, Any]) -> Dict[str, Any]:
         return {
             **result,
             "status": "running" if stage.get("pid") or metrics.get("pid_alive") else "unknown",
-            "message": "检测到已有评估报告，但未匹配当前工作流模型，继续等待当前模型评估结果",
+            "message": "检测到已有评估报告，但未匹配当前工作流的 runId、模型或数据集，继续等待当前评估结果",
             "metrics": metrics,
         }
     return result
@@ -2161,18 +2621,6 @@ def _workflow_model_identifier(value: Optional[str]) -> str:
     return os.path.basename(str(value or "").rstrip("/")).strip()
 
 
-def _normalize_benchmark_dataset_name(value: Any) -> str:
-    text = os.path.basename(str(value or "").strip()).lower()
-    if text.endswith(".json"):
-        text = text[:-5]
-    return text
-
-
-def _workflow_benchmark_dataset_aliases(benchmark: str) -> List[str]:
-    normalized = _normalize_benchmark_dataset_name(benchmark)
-    return sorted(BENCHMARK_DATASET_ALIASES.get(normalized, {normalized}))
-
-
 def _workflow_inference_matches_target(current: Dict[str, Any], target_model_path: str) -> bool:
     target_path = str(target_model_path or "").rstrip("/")
     target_name = _workflow_model_identifier(target_path)
@@ -2209,7 +2657,16 @@ def _workflow_deployed_model_status(
         })
     current = _workflow_inference_command("查看推理配置", evaluation_container, **inference_kwargs)
     checked = _workflow_inference_command("查看推理服务状态", evaluation_container, **inference_kwargs)
-    if not checked.get("all_running"):
+    target = _workflow_target_service_instance(checked, target_model_path)
+    if target is None or str(target.get("status") or "").lower() != "running":
+        return None
+    if not _workflow_inference_service_matches_resource(
+        checked,
+        None,
+        resource_group_id=resource_group_id,
+        training_pool_id=training_pool_id,
+        target_model_path=target_model_path,
+    ):
         return None
     if not _workflow_inference_matches_target(current, target_model_path):
         return None
@@ -2233,6 +2690,7 @@ def _workflow_deploy_service_status(workflow: Dict[str, Any]) -> Dict[str, Any]:
     context = workflow.get("context") or {}
     stage = (workflow.get("stages") or {}).get("deploy", {})
     target_model_path = str(context.get("published_model_path") or "").strip()
+    wait_started_at = float(stage.get("service_wait_started_at") or time.time())
     next_check_at = float(stage.get("next_service_check_at") or 0)
     if next_check_at and time.time() < next_check_at:
         return {
@@ -2245,6 +2703,7 @@ def _workflow_deploy_service_status(workflow: Dict[str, Any]) -> Dict[str, Any]:
             "deployment_step": "waiting_service",
             "deploy_progress": "4/4",
             "next_service_check_at": next_check_at,
+            "service_wait_started_at": wait_started_at,
             "message": "推理服务重启命令已提交，等待下一次服务状态检查",
             **_workflow_stage_log_fields(workflow, "deploy"),
         }
@@ -2255,7 +2714,55 @@ def _workflow_deploy_service_status(workflow: Dict[str, Any]) -> Dict[str, Any]:
         training_pool_id=str(context.get("training_pool_id") or "").strip(),
             **_workflow_inference_owner_kwargs(context),
     )
-    all_running = checked.get("all_running") is True
+    target = _workflow_target_service_instance(checked, target_model_path)
+    target_status = str((target or {}).get("status") or "").lower()
+    target_instance_id = str((target or {}).get("instance_id") or "")
+    if target_instance_id and target_instance_id != str(stage.get("service_wait_instance_id") or ""):
+        # A resumed workflow may observe a new service instance while its
+        # persisted wait timestamp still belongs to the previous attempt.
+        wait_started_at = time.time()
+    if target_status == "failed":
+        raise RuntimeError(
+            "推理服务启动失败："
+            + str((target or {}).get("error") or f"instance_id={target.get('instance_id', '')}")
+        )
+    # An already-running launcher may still be using an older start script.
+    # The status command includes the service log diagnosis when available.
+    status_details = str(checked.get("result") or "")
+    if (
+        target_status == "starting"
+        and target_instance_id
+        and target_instance_id in status_details
+        and "'_IncludedRouter' object has no attribute 'path'" in status_details
+    ):
+        raise RuntimeError(
+            "推理服务 API 持续返回 500：prometheus_fastapi_instrumentator 与 FastAPI 路由不兼容。"
+            "请使用包含 vLLM 路由兼容补丁的启动脚本重启服务；"
+            f"instance_id={target_instance_id}，详见 vllm.log"
+        )
+    if target_status == "stopped":
+        return {
+            "status": "running",
+            "restart_required": True,
+            "model_path": target_model_path,
+            "model_name": _workflow_model_identifier(target_model_path),
+            "service_checked": True,
+            "all_running": False,
+            "deployment_step": "waiting_service",
+            "message": "目标推理服务已停止，准备重新启动后继续工作流",
+        }
+    all_running = target_status == "running" and _workflow_inference_service_matches_resource(
+        checked,
+        _workflow_context_inference_resource_context(context),
+        resource_group_id=str(context.get("resource_group_id") or "").strip(),
+        training_pool_id=str(context.get("training_pool_id") or "").strip(),
+        target_model_path=target_model_path,
+    )
+    if not all_running and time.time() - wait_started_at > 1900:
+        raise RuntimeError(
+            "推理服务启动超时："
+            f"instance_id={target_instance_id or 'unknown'} 等待模型 API 就绪超过 1900 秒，请检查启动日志"
+        )
     payload = {
         "model_path": target_model_path,
         "model_name": _workflow_model_identifier(target_model_path),
@@ -2264,6 +2771,9 @@ def _workflow_deploy_service_status(workflow: Dict[str, Any]) -> Dict[str, Any]:
         "service_log_command": "查看推理服务日志",
         "deployment_step": "service_checked" if all_running else "waiting_service",
         "deploy_progress": "4/4",
+        "service_wait_started_at": wait_started_at,
+        "service_wait_instance_id": target_instance_id,
+        "next_service_check_at": time.time() + config.workflow.poll_interval,
         "message": "推理服务状态查询完成" if all_running else "服务重启任务已启动，等待推理服务全部运行",
     }
     log_fields = _append_workflow_stage_log(
@@ -2290,271 +2800,62 @@ def _workflow_monitor_deploy(workflow: Dict[str, Any]) -> Dict[str, Any]:
     return _workflow_deploy_service_status(workflow)
 
 
-def _workflow_benchmark_job_id(workflow: Dict[str, Any]) -> str:
-    stage = (workflow.get("stages") or {}).get("benchmark", {})
-    result = stage.get("result") if isinstance(stage.get("result"), dict) else {}
-    job_id = str(result.get("benchmark_job_id") or "").strip()
-    if job_id:
-        return job_id
-    match = re.search(r'benchmark_report\((?:job_id=)?["\']?([A-Za-z0-9_-]+)["\']?\)', str(result.get("status_command") or ""))
-    return match.group(1) if match else ""
-
-
 def _workflow_structured_benchmark_query(
     workflow: Dict[str, Any],
     *,
     require_result: bool = False,
 ) -> Dict[str, Any]:
-    """Read benchmark status from node-local files instead of an LLM turn."""
-    benchmark = _benchmark_name(workflow)
-    job_id = _workflow_benchmark_job_id(workflow)
-    container = _workflow_evaluation_container(workflow)
-    expected_model = os.path.basename(str((workflow.get("context") or {}).get("published_model_path") or "").rstrip("/"))
-    benchmark_aliases = _workflow_benchmark_dataset_aliases(benchmark)
-    script = r"""
-import json
-import os
-import re
-import sys
-
-root, job_id, benchmark, require_result_text, expected_model, aliases_json = sys.argv[1:7]
-require_result = require_result_text == "1"
-benchmark_aliases = set(json.loads(aliases_json or "[]"))
-
-def load(path):
-    try:
-        with open(path, encoding="utf-8") as handle:
-            value = json.load(handle)
-            return value if isinstance(value, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-def norm_name(value):
-    text = os.path.basename(str(value or "").strip()).lower()
-    if text.endswith(".json"):
-        text = text[:-5]
-    return text
-
-def benchmark_matches(dataset_name, target_names):
-    if not dataset_name:
-        return True
-    return dataset_name in target_names
-
-def normalize_status(meta, result):
-    status = str(meta.get("status") or result.get("status") or "").strip().lower()
-    if status:
-        return status
-    if result:
-        return "finished"
-    return "running"
-
-def int_or_none(value):
-    try:
-        if value is None or value == "":
-            return None
-        return int(float(str(value).strip().rstrip("%")))
-    except (TypeError, ValueError):
-        return None
-
-def percent_or_none(value):
-    try:
-        if value is None or value == "":
-            return None
-        text = str(value).strip()
-        percent = float(text.rstrip("%"))
-        if "%" not in text and 0 <= percent <= 1:
-            percent *= 100
-        return round(percent, 1)
-    except (TypeError, ValueError):
-        return None
-
-def progress_text(processed, total, percent):
-    if processed is None or total is None:
-        return None
-    if percent is None and total:
-        percent = round(processed * 100 / total, 1)
-    if percent is None:
-        return f"{processed}/{total}"
-    return f"{processed}/{total} ({percent:.1f}%)"
-
-def progress_from_summary(result):
-    summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
-    if not summary:
-        return {}
-    processed = int_or_none(summary.get("processed") or summary.get("done"))
-    total = int_or_none(summary.get("total"))
-    percent = percent_or_none(summary.get("progress") or summary.get("progress_percent"))
-    text = progress_text(processed, total, percent)
-    payload = {}
-    if processed is not None:
-        payload["processed"] = processed
-    if total is not None:
-        payload["total"] = total
-    if percent is not None:
-        payload["progress_percent"] = percent
-    if text:
-        payload["progress"] = text
-    elif summary.get("progress") is not None:
-        payload["progress"] = str(summary.get("progress"))
-    for key in ("correct", "accuracy", "avg_f1", "invalid", "invalid_rate"):
-        if key in summary:
-            payload[key] = summary[key]
-    metrics = summary.get("metrics")
-    if isinstance(metrics, dict):
-        for key in ("record_only", "executed", "passed", "failed", "timeout", "executor_error", "pass@1"):
-            if key in metrics:
-                payload[key] = metrics[key]
-    return payload
-
-def read_tail(path, max_bytes=65536):
-    try:
-        with open(path, "rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            size = handle.tell()
-            handle.seek(max(0, size - max_bytes), os.SEEK_SET)
-            return handle.read().decode("utf-8", errors="replace")
-    except OSError:
-        return ""
-
-def progress_from_run_log(folder):
-    text = read_tail(os.path.join(folder, "run.log"))
-    matches = re.findall(r"\[(\d+)\s*/\s*(\d+)\]\s*done", text)
-    if not matches:
-        return {}
-    processed = int(matches[-1][0])
-    total = int(matches[-1][1])
-    percent = round(processed * 100 / total, 1) if total else None
-    return {
-        "processed": processed,
-        "total": total,
-        "progress_percent": percent,
-        "progress": progress_text(processed, total, percent),
-    }
-
-def payload_for(folder):
-    meta = load(os.path.join(folder, "meta.json"))
-    result = load(os.path.join(folder, "result.json"))
-    status = normalize_status(meta, result)
-    result_path = os.path.join(folder, "result.json")
-    log_file = os.path.join(folder, "run.log")
-    payload = {
-        "status": status,
-        "benchmark_status": status,
-        "benchmark_job_id": meta.get("job_id") or os.path.basename(folder),
-        "model": meta.get("model"),
-        "dataset": meta.get("dataset") or benchmark,
-        "start_time": meta.get("start_time"),
-        "end_time": meta.get("end_time"),
-        "folder_path": folder,
-        "log_dir": folder,
-        "log_file": log_file,
-        "result_path": result_path,
-        "data": {"meta": meta},
-    }
-    if result:
-        payload["data"]["result"] = result
-    summary_progress = progress_from_summary(result)
-    has_structured_progress = (
-        summary_progress.get("processed") is not None
-        and summary_progress.get("total") is not None
+    """Read the exact owner's job from inference-ops instead of scanning a container directory."""
+    stage = (workflow.get("stages") or {}).get("benchmark", {})
+    context = workflow.get("context") or {}
+    recover_stage = {**stage, "log_path": stage.get("log_path") or str(_workflow_stage_log_path(workflow, "benchmark"))}
+    job_id = recover_benchmark_job_id(recover_stage)
+    if not job_id:
+        return {
+            "status": "running",
+            "benchmark_status": "running",
+            "benchmark_job_id": "",
+            "status_command": "",
+            "stop_command": "",
+            "folder_path": "",
+            "log_dir": "",
+            "log_file": "",
+            "result_path": "",
+            "eta_status": "unavailable",
+            "error": "无法关联 benchmark 任务：启动回执和阶段日志中均未找到有效 Job ID",
+            "result_entry": _benchmark_result_entry(workflow),
+        }
+    owner = _workflow_inference_owner_kwargs(context)
+    resource_context = _workflow_context_inference_resource_context(context) or recover_benchmark_resource_context(recover_stage)
+    node = str(
+        context.get("inference_runtime_node_id")
+        or resource_context.get("runtime_node_id")
+        or os.getenv("MEDFLOW_RESOURCE_NODE_ID")
+        or ""
+    ).strip()
+    report = query_inference_benchmark_status(
+        config.agents.inference.inference_agent_url,
+        job_id=job_id,
+        node=node,
+        user_id=owner["owner_user_id"],
+        user_aliases=owner["owner_aliases"],
+        user_role=str(context.get("user_role") or ""),
+        resource_context=resource_context,
+        headers=_inference_ops_headers(),
     )
-    log_progress = {} if has_structured_progress else progress_from_run_log(folder)
-    payload.update({**log_progress, **summary_progress})
-    return payload
-
-folders = []
-skipped = []
-target_names = {norm_name(value) for value in benchmark_aliases}
-if os.path.isdir(root):
-    if job_id and os.path.isdir(os.path.join(root, job_id)):
-        folders = [os.path.join(root, job_id)]
-    else:
-        for name in os.listdir(root):
-            folder = os.path.join(root, name)
-            if not os.path.isdir(folder):
-                continue
-            meta = load(os.path.join(folder, "meta.json"))
-            dataset = str(meta.get("dataset") or meta.get("benchmark") or "").strip()
-            dataset_name = norm_name(dataset)
-            if benchmark and dataset and dataset_name not in target_names:
-                if len(skipped) < 5:
-                    skipped.append({
-                        "folder": folder,
-                        "dataset": dataset,
-                        "model": meta.get("model"),
-                        "status": meta.get("status"),
-                    })
-                continue
-            folders.append(folder)
-        folders.sort(
-            key=lambda path: (
-                norm_name(load(os.path.join(path, "meta.json")).get("model")) == norm_name(expected_model),
-                os.path.getmtime(path),
-            ),
-            reverse=True,
-        )
-
-if not folders:
-    print(json.dumps({
-        "status": "not_found",
-        "benchmark_status": "not_found",
-        "debug": {
-            "root_exists": os.path.isdir(root),
-            "benchmark": benchmark,
-            "normalized_benchmark": norm_name(benchmark),
-            "benchmark_aliases": sorted(target_names),
-            "expected_model": expected_model,
-            "skipped_candidates": skipped,
-        },
-    }, ensure_ascii=False))
-    raise SystemExit(0)
-
-payload = payload_for(folders[0])
-if require_result and not payload.get("data", {}).get("result") and payload.get("status") not in {"failed", "stopped"}:
-    payload["status"] = "running"
-    payload["benchmark_status"] = "running"
-print(json.dumps(payload, ensure_ascii=False))
-"""
-    process = subprocess.run(
-        [
-            "docker",
-            "exec",
-            container,
-            "python3",
-            "-c",
-            script,
-            BENCHMARK_LOGS_PATH,
-            job_id,
-            benchmark,
-            "1" if require_result else "0",
-            expected_model,
-            json.dumps(benchmark_aliases),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    if process.returncode != 0:
-        raise RuntimeError(process.stderr.strip() or "结构化 benchmark 状态查询失败")
-    try:
-        payload = json.loads(process.stdout or "{}")
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("结构化 benchmark 状态返回无效 JSON") from exc
-    if not isinstance(payload, dict):
-        raise RuntimeError("结构化 benchmark 状态返回无效 payload")
+    if report.get("status") in {"forbidden", "not_found", "error"}:
+        raise RuntimeError(report.get("error") or f"Benchmark task {job_id} is not accessible")
+    payload = workflow_benchmark_result(report)
+    if resource_context:
+        payload["resource_context"] = resource_context
     payload["result_entry"] = _benchmark_result_entry(workflow)
-    if payload.get("benchmark_job_id"):
-        payload["status_command"] = f'benchmark_report("{payload["benchmark_job_id"]}")'
-        payload["stop_command"] = f'benchmark_stop("{payload["benchmark_job_id"]}")'
-        payload["log_command"] = payload["status_command"]
-    payload.update(
-        _append_workflow_stage_log(
-            workflow,
-            "benchmark",
-            "查询 benchmark 运行状态" if not require_result else "查询 benchmark 结果",
-            payload,
-        )
-    )
+    payload["log_dir"] = payload.get("folder_path")
+    payload.update(_append_workflow_stage_log(
+        workflow,
+        "benchmark",
+        "查询 benchmark 结果" if require_result else "查询 benchmark 运行状态",
+        payload,
+    ))
     return payload
 
 
@@ -2650,6 +2951,36 @@ def _workflow_payload_active_service_items(payload: Dict[str, Any]) -> List[Dict
     return items
 
 
+def _workflow_target_service_instance(
+    status_result: Dict[str, Any], target_model_path: str
+) -> Optional[Dict[str, Any]]:
+    """Find the newest visible instance for the model being deployed."""
+    target_model = os.path.basename(str(target_model_path or "").rstrip("/"))
+    if not target_model:
+        return None
+    items: List[Dict[str, Any]] = []
+    seen: set[int] = set()
+
+    def collect(source: Any) -> None:
+        if not isinstance(source, dict) or id(source) in seen:
+            return
+        seen.add(id(source))
+        instances = source.get("service_instances")
+        if isinstance(instances, dict):
+            for item in instances.get("items") or []:
+                if isinstance(item, dict) and str(item.get("model") or "") == target_model:
+                    items.append(item)
+        nodes = source.get("nodes")
+        if isinstance(nodes, dict):
+            for node in nodes.values():
+                collect(node)
+
+    collect(status_result)
+    collect(status_result.get("protocol"))
+    collect(status_result.get("data"))
+    return max(items, key=lambda item: str(item.get("started_at") or ""), default=None)
+
+
 def _workflow_payload_item_gpu_ids(item: Dict[str, Any]) -> set[str]:
     values: set[str] = set()
     nested_sources = [item]
@@ -2701,8 +3032,14 @@ def _workflow_inference_service_matches_resource(
     *,
     resource_group_id: str = "",
     training_pool_id: str = "",
+    target_model_path: str = "",
 ) -> bool:
-    if not status_result.get("all_running"):
+    target = None
+    if target_model_path:
+        target = _workflow_target_service_instance(status_result, target_model_path)
+        if target is None or str(target.get("status") or "").lower() != "running":
+            return False
+    elif not status_result.get("all_running"):
         return False
     expected_resource_group_id = str(resource_group_id or "").strip()
     expected_training_pool_id = str(training_pool_id or "").strip()
@@ -2720,7 +3057,7 @@ def _workflow_inference_service_matches_resource(
     )
     if not resource_scoped:
         return True
-    for item in _workflow_payload_active_service_items(status_result):
+    for item in ([target] if target is not None else _workflow_payload_active_service_items(status_result)):
         if expected_reservation_id and _reservation_id_from_payload_item(item) == expected_reservation_id:
             return True
         if expected_gpus:
@@ -2752,13 +3089,24 @@ def _workflow_ensure_benchmark_inference_ready(workflow: Dict[str, Any]) -> Dict
         training_pool_id=training_pool_id,
         **owner_kwargs,
     )
-    if _workflow_inference_service_matches_resource(
+    target = _workflow_target_service_instance(
+        status_result, str(context.get("published_model_path") or "")
+    )
+    if target is not None and str(target.get("status") or "").lower() == "running" and _workflow_inference_service_matches_resource(
         status_result,
         resource_context,
         resource_group_id=resource_group_id,
         training_pool_id=training_pool_id,
+        target_model_path=str(context.get("published_model_path") or ""),
     ):
         return status_result
+
+    if str((target or {}).get("status") or "").lower() == "starting":
+        return {"waiting_service": True, "success": True}
+    if str((target or {}).get("status") or "").lower() == "failed":
+        raise RuntimeError(
+            "推理服务启动失败：" + str(target.get("error") or f"instance_id={target.get('instance_id', '')}")
+        )
 
     if not resource_context:
         try:
@@ -2766,6 +3114,8 @@ def _workflow_ensure_benchmark_inference_ready(workflow: Dict[str, Any]) -> Dict
                 "重启推理服务",
                 resource_group_id=resource_group_id,
                 training_pool_id=training_pool_id,
+                user_role=str(context.get("user_role") or "").strip(),
+                **owner_kwargs,
             )
         except Exception as e:
             raise RuntimeError(f"申请推理服务 GPU 资源失败: {e}")
@@ -2796,6 +3146,7 @@ def _workflow_ensure_benchmark_inference_ready(workflow: Dict[str, Any]) -> Dict
             resource_context,
             resource_group_id=resource_group_id,
             training_pool_id=training_pool_id,
+            target_model_path=str(context.get("published_model_path") or ""),
         ):
             return check
     raise RuntimeError("推理服务启动超时，请检查容器日志和资源配置")
@@ -2807,7 +3158,9 @@ def _workflow_start_benchmark(workflow: Dict[str, Any]) -> Dict[str, Any]:
     resource_group_id = str(context.get("resource_group_id") or "").strip()
     training_pool_id = str(context.get("training_pool_id") or "").strip()
     owner_kwargs = _workflow_inference_owner_kwargs(context)
-    _workflow_ensure_benchmark_inference_ready(workflow)
+    ready = _workflow_ensure_benchmark_inference_ready(workflow)
+    if ready.get("waiting_service"):
+        return ready
 
     result = _workflow_inference_command(
         _benchmark_start_command(workflow),
@@ -2916,10 +3269,10 @@ def _workflow_service_statuses_from_nodes(nodes: Any) -> List[str]:
         statuses.extend(_workflow_service_statuses_from_services(node_payload.get("services")))
     return statuses
 #deepseek
-CORE_INFERENCE_PORTS = {"vllm", "inference", "ui", "case2chat"}
+CORE_INFERENCE_PORTS = {"vllm"}
 #deepseek
 def _workflow_are_degraded_ports_healthy(payload: Dict[str, Any]) -> bool:
-    """检测所有 degraded 实例的四个核心端口是否都 running。"""
+    """检测所有 degraded 实例的 vLLM 核心端口是否 running。"""
     protocol = payload.get("protocol") if isinstance(payload.get("protocol"), dict) else {}
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
 
@@ -3033,19 +3386,7 @@ def _workflow_all_running_from_payload(payload: Dict[str, Any], result: str = ""
 
 
 def _reservation_id_from_payload_item(item: Any) -> str:
-    if not isinstance(item, dict):
-        return ""
-    resource = item.get("resource") if isinstance(item.get("resource"), dict) else {}
-    resource_context = item.get("resource_context") if isinstance(item.get("resource_context"), dict) else {}
-    return str(
-        item.get("reservation_id")
-        or item.get("reservationId")
-        or resource.get("reservation_id")
-        or resource.get("reservationId")
-        or resource_context.get("reservation_id")
-        or resource_context.get("reservationId")
-        or ""
-    ).strip()
+    return _inference_payload_item_reservation_id(item)
 
 
 def _service_start_matches_reservation(service_start: Any, reservation_id: str) -> bool:
@@ -3224,6 +3565,12 @@ def _workflow_inference_command(
 
     release_known_reservations = globals().get("_release_known_inference_reservations", lambda: None)
     command_may_stop_service = globals().get("_inference_command_may_stop_service", lambda _command: False)
+
+    current_owner = globals().get("_current_inference_owner_user_id")
+    current_aliases = globals().get("_current_inference_owner_aliases")
+    alias_parser = globals().get("_owner_aliases_from_any", lambda value: list(value or []) if isinstance(value, (list, tuple, set)) else [item.strip() for item in str(value or "").split(",") if item.strip()])
+    resolved_owner_user_id = str(owner_user_id or (current_owner() if callable(current_owner) else "") or "workflow-manager").strip()
+    resolved_owner_aliases = alias_parser(owner_aliases) or (current_aliases() if callable(current_aliases) else [])
     
     ##deepseek
     # 如果未提供 resource_context，则自动申请
@@ -3234,6 +3581,10 @@ def _workflow_inference_command(
                     command,
                     resource_group_id=resource_group_id,
                     training_pool_id=training_pool_id,
+                    owner_user_id=resolved_owner_user_id,
+                    owner_aliases=resolved_owner_aliases,
+                    user_role=user_role,
+                    thread_id="workflow-manager",
                 )
         except Exception:
             release_resource_context(resource_context)
@@ -3245,11 +3596,6 @@ def _workflow_inference_command(
             resource_context = {}
 
     try:
-        current_owner = globals().get("_current_inference_owner_user_id")
-        current_aliases = globals().get("_current_inference_owner_aliases")
-        alias_parser = globals().get("_owner_aliases_from_any", lambda value: list(value or []) if isinstance(value, (list, tuple, set)) else [item.strip() for item in str(value or "").split(",") if item.strip()])
-        resolved_owner_user_id = str(owner_user_id or (current_owner() if callable(current_owner) else "") or "workflow-manager").strip()
-        resolved_owner_aliases = alias_parser(owner_aliases) or (current_aliases() if callable(current_aliases) else [])
         request_payload: Dict[str, Any] = {
             "command": command,
             "user_id": resolved_owner_user_id,
@@ -3264,6 +3610,7 @@ def _workflow_inference_command(
         response = requests.post(
             config.agents.inference.inference_agent_url,
             json=request_payload,
+            headers=_inference_ops_headers(),
             timeout=360,
         )
         response.raise_for_status()
@@ -3278,8 +3625,18 @@ def _workflow_inference_command(
     result = str(payload.get("result") or payload.get("message") or "")
     if isinstance(resource_context, dict) and resource_context.get("reservation_id"):
         if _inference_response_holds_resource_reservation(command, payload, result, resource_context):
-            start_resource_heartbeat = globals().get("_start_inference_resource_heartbeat", lambda _context: None)
-            start_resource_heartbeat(resource_context)
+            start_resource_heartbeat = globals().get(
+                "_start_inference_resource_heartbeat",
+                lambda _context, **_kwargs: None,
+            )
+            start_resource_heartbeat(
+                resource_context,
+                response_payload=payload,
+                owner_user_id=resolved_owner_user_id,
+                owner_aliases=resolved_owner_aliases,
+                user_role=user_role,
+                thread_id="workflow-manager",
+            )
         else:
             release_resource_context(resource_context)
     ###deepseek
@@ -3378,6 +3735,36 @@ def _workflow_stop_task(workflow: Dict[str, Any]) -> Dict[str, Any]:
         _workflow_stop_host_process(pid)
     else:
         # Docker 容器内进程
+        if stage_name == "evaluate" and _workflow_evaluation_scope(workflow) == "general":
+            quoted_pid = shlex.quote(pid)
+            stop_command = f"""
+collect_descendants() {{
+    parent="$1"
+    for child in $(ps -eo pid=,ppid= | awk -v p="$parent" '$2 == p {{print $1}}'); do
+        collect_descendants "$child"
+        echo "$child"
+    done
+}}
+pid={quoted_pid}
+descendants=$(collect_descendants "$pid")
+pgid=$(ps -p "$pid" -o pgid= 2>/dev/null | tr -d ' ')
+if [ -n "$pgid" ] && [ "$pgid" = "$pid" ]; then
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+else
+    [ -n "$descendants" ] && kill -TERM $descendants 2>/dev/null || true
+    kill -TERM "$pid" 2>/dev/null || true
+fi
+"""
+            subprocess.run(
+                ["docker", "exec", container, "sh", "-c", stop_command],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            return {
+                "run_id": stage.get("run_id") or (workflow.get("context") or {}).get("run_id"),
+                "message": "已按工作流注册 PID/进程组终止 LLaMA-Factory 通用评测进程及其子进程",
+            }
         cleanup_patterns = []
         if stage_name == "evaluate":
             model_path = str(workflow.get("context", {}).get("trained_model_path") or "").strip()
@@ -3887,6 +4274,8 @@ class OrchestratorSystem:
             "training_type": "确认训练方式",
             "assessment_type": "确认评估方式",
             "evaluation_type": "确认评估方式",
+            "evaluation_scope": "确认评测范围",
+            "evaluation_datasets": "选择内置评测集",
             "advanced_filter_choice": "确认高级筛选",
             "data_preprocess_params": "补充预处理参数",
             "input_folder": "补充数据路径",
@@ -3946,12 +4335,17 @@ class OrchestratorSystem:
                 "evaluator": "assessment_type",
             }.get(agent_name)
 
+        if request_kind == "scope" and agent_name == "evaluator":
+            return "evaluation_scope"
+
         if request_kind == "choice":
             if agent_name == "dataprocessor":
                 return "advanced_filter_choice"
             return "choice"
 
         if params:
+            if agent_name == "evaluator" and params == {"eval_datasets"}:
+                return "evaluation_datasets"
             if agent_name == "evaluator" and params & {"model_fir", "model_sec"}:
                 return "evaluation_params"
             if "schedule_time" in params and agent_name == "trainer":
@@ -3980,6 +4374,8 @@ class OrchestratorSystem:
                 return "schedule_time"
             return "training_params"
         if agent_name == "evaluator":
+            if request_kind == "scope" or "评测范围" in content or "evaluation_scope" in content:
+                return "evaluation_scope"
             if request_kind == "type" or "评估类型" in content:
                 return "evaluation_type"
             if "CKPT_PATH" in content:
@@ -4003,9 +4399,13 @@ class OrchestratorSystem:
 
     def _schema_options_for_kind(self, agent_name: str, kind: str) -> List[str]:
         if kind == "training_type":
-            return ["LoRA SFT", "全参 SFT", "LoRA PT", "全参 PT", "增强训练", "GRPO", "双机 LoRA SFT", "双机增强训练"]
+            return ["LoRA SFT", "全参 SFT", "LoRA PT", "全参 PT", "增强训练", "GRPO", "双机 LoRA SFT", "双机全参 SFT", "双机增强训练"]
         if kind in {"assessment_type", "evaluation_type"}:
             return ["双模型", "单模型", "ckpt评估"]
+        if kind == "evaluation_scope":
+            return ["医疗评测", "通用评测"]
+        if kind == "evaluation_datasets":
+            return ["ceval", "cmbsingle", "cmmlu", "medmcqa", "medqa", "mmlu"]
         if kind == "data_preprocess_params" and agent_name == "dataprocessor":
             return ["SFT", "DPO", "PT"]
         if kind == "advanced_filter_choice" and agent_name == "dataprocessor":
@@ -4051,6 +4451,26 @@ class OrchestratorSystem:
             fields["requiredParams"] = required_params
         if missing_params:
             fields["missingParams"] = missing_params
+        if agent_name == "evaluator" and required_params:
+            param_schema = []
+            for param in required_params:
+                if param == "eval_datasets":
+                    param_schema.append({
+                        "name": param,
+                        "label": "内置评测集",
+                        "type": "enum",
+                        "required": True,
+                        "multiple": True,
+                        "options": ["ceval", "cmbsingle", "cmmlu", "medmcqa", "medqa", "mmlu"],
+                    })
+                elif param in {"model_fir", "model_sec"}:
+                    param_schema.append({"name": param, "label": "模型路径", "type": "model", "required": True})
+                elif param == "CKPT_PATH":
+                    param_schema.append({"name": param, "label": "Checkpoint 路径", "type": "checkpoint", "required": True})
+            if param_schema:
+                fields["paramSchema"] = param_schema
+            if "eval_datasets" in required_params:
+                fields["evaluationScope"] = "llamafactoryBuiltin"
         return self._with_protocol(
             "need_input",
             agent_name,
@@ -4139,6 +4559,14 @@ class OrchestratorSystem:
             or "偏好优化" in text
         ):
             return "enhanced"
+        if (
+            "train_multinode_sft_full_pipeline" in content
+            or "多机全参" in text
+            or "双机全参" in text
+            or "multinode_full_sft" in content
+            or "multi-node full sft" in content
+        ):
+            return "full"
         if (
             "train_multinode_sft_pipeline" in content
             or "多机lora批量训练" in content
@@ -4271,7 +4699,7 @@ class OrchestratorSystem:
     def _infer_train_type(self, text: str) -> Optional[str]:
         content = (text or "").lower()
         explicit_type_match = re.search(
-            r"(?:训练类型|train_type|training_type|trainType)\s*(?:是|为|=|:|：)?\s*([A-Za-z0-9_\-]+|双机增强训练|双机\s*LoRA\s*SFT|增强训练|全参\s*PT|全参预训练|LoRA\s*PT|LoRA预训练|继续预训练|预训练|全参\s*SFT|全参训练|全参批量训练|定时训练|日常训练|LoRA\s*SFT|lora训练|lora批量训练)",
+            r"(?:训练类型|train_type|training_type|trainType)\s*(?:是|为|=|:|：)?\s*([A-Za-z0-9_\-]+|双机增强训练|双机\s*全参\s*SFT|双机\s*LoRA\s*SFT|增强训练|全参\s*PT|全参预训练|LoRA\s*PT|LoRA预训练|继续预训练|预训练|全参\s*SFT|全参训练|全参批量训练|定时训练|日常训练|LoRA\s*SFT|lora训练|lora批量训练)",
             text or "",
             re.IGNORECASE,
         )
@@ -4323,6 +4751,9 @@ class OrchestratorSystem:
                 "multinode_lora_sft": "lora",
                 "multinodelorasft": "lora",
                 "双机lorasft": "lora",
+                "multinode_full_sft": "full",
+                "multinodefullsft": "full",
+                "双机全参sft": "full",
                 "multinode_enhanced": "enhanced",
                 "multinodeenhanced": "enhanced",
                 "双机增强训练": "enhanced",
@@ -4334,6 +4765,8 @@ class OrchestratorSystem:
         # Prefer concrete script names / explicit user-facing train modes over broad
         # context words. Tool prompts may mention "增强训练" as an example even when
         # the actual launched script is batch_train_lora.
+        if "train_multinode_sft_full_pipeline" in content or "双机全参" in content or "多机全参" in content or "multinode_full_sft" in content:
+            return "full"
         if "train_multinode_sft_pipeline" in content or "双机lora" in content or "双机 sft" in content or "多机lora批量训练" in content or "多机sft" in content:
             return "lora"
         if "train_multinode_dpo_pipeline" in content or "双机增强训练" in content or "双机dpo" in content or "多机增强训练" in content or "多机dpo" in content:
@@ -4421,6 +4854,12 @@ class OrchestratorSystem:
 
     def _infer_eval_type(self, text: str) -> Optional[str]:
         content = (text or "").lower()
+        if "generic_single_model_eval" in content:
+            return "single_model"
+        if "generic_compare_models_eval" in content:
+            return "compare_between_models"
+        if "generic_ckpt_eval" in content:
+            return "ckpt"
         if "single_model_evaluation_vpn" in content or "单模型" in text:
             return "single_model"
         if "compare_between_models_vpn" in content or "双模型" in text:
@@ -4625,6 +5064,12 @@ class OrchestratorSystem:
                 "stages": stages,
                 "benchmark": context.get("benchmark"),
                 "evaluationDatasetName": context.get("evaluation_dataset_name"),
+                "evaluationScope": context.get("evaluation_scope"),
+                "evalDatasets": context.get("eval_datasets"),
+                "runId": context.get("run_id"),
+                "reportPath": context.get("report_path"),
+                "scores": context.get("scores"),
+                "scoreDeltas": context.get("score_deltas"),
                 "benchmarkResultEntry": _benchmark_result_entry(workflow),
             }
         elif stage_name:
@@ -4652,6 +5097,8 @@ class OrchestratorSystem:
 
     def _normalize_inference_status(self, status_text: str) -> str:
         text = (status_text or "").strip().lower()
+        if any(keyword in text for keyword in ["预留", "reserved"]):
+            return "reserved"
         if any(keyword in text for keyword in ["启动中", "starting"]):
             return "starting"
         if any(keyword in text for keyword in ["降级", "degraded"]):
@@ -4696,7 +5143,6 @@ class OrchestratorSystem:
             "启动脚本": "START_SCRIPT",
             "启动脚本路径": "START_SCRIPT",
             "日志目录": "LOG_DIR",
-            "测试目录": "TEST_DIR",
             "医疗基准目录": "BENCHMARK_DIR",
             "医疗基准测试目录": "BENCHMARK_DIR",
             "通用基准目录": "GENERAL_BENCHMARK_DIR",
@@ -4711,7 +5157,6 @@ class OrchestratorSystem:
             "GPU内存利用率": "GPU_MEMORY_UTILIZATION",
             "GPU显存利用率": "GPU_MEMORY_UTILIZATION",
             "GPU利用率阈值": "GPU_UTILIZATION_THRESHOLD",
-            "最大上下文长度": "MAX_TOKENS",
         }
         if re.fullmatch(r"[A-Za-z0-9_]+", normalized):
             return normalized
@@ -4744,8 +5189,8 @@ class OrchestratorSystem:
             return "runtime"
         if "ENV" in upper_context or "环境" in context:
             return "env"
-        port_keys = {"VLLM_OPENAI_PORT", "INFERENCE_PORT", "UI_PORT", "DATA_ANNOTATION_PORT"}
-        runtime_keys = {"TENSOR_PARALLEL_SIZE", "GPU_MEMORY_UTILIZATION", "GPU_UTILIZATION_THRESHOLD", "MAX_TOKENS"}
+        port_keys = {"VLLM_OPENAI_PORT"}
+        runtime_keys = {"TENSOR_PARALLEL_SIZE", "GPU_MEMORY_UTILIZATION", "GPU_UTILIZATION_THRESHOLD"}
         keys = {str(key) for key in payload.keys()}
         if keys & port_keys:
             return "ports"
@@ -4806,9 +5251,9 @@ class OrchestratorSystem:
             if not key:
                 continue
             value = self._normalize_inference_config_value(match.group(2).strip())
-            if key in {"TENSOR_PARALLEL_SIZE", "GPU_MEMORY_UTILIZATION", "GPU_UTILIZATION_THRESHOLD", "MAX_TOKENS"}:
+            if key in {"TENSOR_PARALLEL_SIZE", "GPU_MEMORY_UTILIZATION", "GPU_UTILIZATION_THRESHOLD"}:
                 config_data["runtime"][key] = value
-            elif key in {"VLLM_OPENAI_PORT", "INFERENCE_PORT", "UI_PORT", "DATA_ANNOTATION_PORT"}:
+            elif key == "VLLM_OPENAI_PORT":
                 config_data["ports"][key] = value
             else:
                 if isinstance(value, str) and "=" in value:
@@ -4846,14 +5291,6 @@ class OrchestratorSystem:
             "vLLM OpenAI 兼容 API": "VLLM_OPENAI_PORT",
             "VLLM服务": "VLLM_OPENAI_PORT",
             "vLLM 服务": "VLLM_OPENAI_PORT",
-            "Inference Server": "INFERENCE_PORT",
-            "推理服务": "INFERENCE_PORT",
-            "Web UI": "UI_PORT",
-            "UI 服务": "UI_PORT",
-            "UI服务": "UI_PORT",
-            "Case2Chat": "DATA_ANNOTATION_PORT",
-            "Data Annotation": "DATA_ANNOTATION_PORT",
-            "数据标注服务": "DATA_ANNOTATION_PORT",
         }
         display_pattern = re.compile(
             r"^\s*-?\s*(?:[^\w\s(（:：-]+\s*)?(.+?)\s*[（(]\s*(\d+)\s*(?:端口|port)?\s*[）)]\s*[：:]\s*(.+?)\s*$",
@@ -4938,6 +5375,9 @@ class OrchestratorSystem:
             name = item.get("name")
             if not name:
                 continue
+            normalized_name = re.sub(r"[\s_-]+", "", str(name)).lower()
+            if normalized_name in {"master", "masterport"}:
+                continue
             service = {
                 "name": str(name),
                 "port": item.get("port"),
@@ -4967,6 +5407,9 @@ class OrchestratorSystem:
             port = item.get("port")
             if not name or port in (None, ""):
                 continue
+            normalized_name = re.sub(r"[\s_-]+", "", name).lower()
+            if normalized_name in {"master", "masterport"}:
+                continue
             status = self._normalize_inference_status(item.get("status"))
             if status == "unknown":
                 status = self._normalize_inference_status(fallback_status)
@@ -4983,18 +5426,19 @@ class OrchestratorSystem:
         if port_statuses or not isinstance(fallback_ports, dict):
             return port_statuses
         fallback = self._normalize_inference_status(fallback_status)
-        for name in ("vllm", "inference", "ui", "case2chat"):
+        for name in ("vllm",):
             port = fallback_ports.get(name)
             if port in (None, ""):
                 continue
+            normalized_status = fallback if fallback != "unknown" else "stopped"
             port_statuses.append(
                 {
                     "key": name,
                     "name": name,
                     "displayName": name,
                     "port": port,
-                    "status": fallback if fallback != "unknown" else "stopped",
-                    "rawStatus": fallback if fallback != "unknown" else "stopped",
+                    "status": normalized_status,
+                    "rawStatus": normalized_status,
                 }
             )
         return port_statuses
@@ -5005,6 +5449,28 @@ class OrchestratorSystem:
         if not isinstance(payload, dict):
             return None
         normalized = dict(payload)
+        for snake_key, camel_key in (
+            ("services", "services"),
+            ("template_services", "templateServices"),
+            ("port_statuses", "portStatuses"),
+        ):
+            source = payload.get(snake_key)
+            if not isinstance(source, list):
+                source = payload.get(camel_key)
+            if isinstance(source, list):
+                normalized[snake_key] = self._normalize_inference_port_statuses_payload(
+                    source
+                )
+                if camel_key != snake_key:
+                    normalized.pop(camel_key, None)
+        ports = payload.get("ports")
+        if isinstance(ports, dict):
+            normalized["ports"] = {
+                key: value
+                for key, value in ports.items()
+                if re.sub(r"[\s_-]+", "", str(key)).lower()
+                not in {"master", "masterport"}
+            }
         items = payload.get("items")
         if not isinstance(items, list):
             return normalized
@@ -5070,7 +5536,7 @@ class OrchestratorSystem:
             if isinstance(service_instance, dict):
                 node_info["service_instance"] = service_instance
 
-            for structured_key in ("test_runs", "test_run_stop", "admin_cleanup", "benchmark_stop"):
+            for structured_key in ("admin_cleanup", "benchmark_stop"):
                 structured_value = node_payload.get(structured_key)
                 if isinstance(structured_value, dict):
                     node_info[structured_key] = structured_value
@@ -5192,8 +5658,6 @@ class OrchestratorSystem:
         benchmark_reports: Optional[List[Dict[str, Any]]] = None,
         benchmark_jobs: Optional[Dict[str, Any]] = None,
         benchmark_stop: Optional[Dict[str, Any]] = None,
-        test_runs: Optional[Dict[str, Any]] = None,
-        test_run_stop: Optional[Dict[str, Any]] = None,
         admin_cleanup: Optional[Dict[str, Any]] = None,
         service_start: Optional[Dict[str, Any]] = None,
     ) -> str:
@@ -5215,12 +5679,6 @@ class OrchestratorSystem:
         if isinstance(admin_cleanup, dict):
             operation = str(admin_cleanup.get("operation") or "").strip().lower()
             return "admin_cleanup_apply" if operation == "apply" else "admin_cleanup_preview"
-        if isinstance(test_run_stop, dict):
-            operation = str(test_run_stop.get("operation") or "").strip().lower()
-            return "test_stop" if operation == "apply" else "test_stop_preview"
-        if isinstance(test_runs, dict):
-            operation = str(test_runs.get("operation") or "").strip().lower()
-            return "test_running_list" if operation == "list_running" else "test_list"
         if isinstance(benchmark_stop, dict):
             operation = str(benchmark_stop.get("operation") or "").strip().lower()
             return "benchmark_stop_preview" if operation == "preview" else "benchmark_stop"
@@ -5292,10 +5750,6 @@ class OrchestratorSystem:
             if any(keyword in combined for keyword in ["running", "stopped", "finished", "failed"]):
                 return "benchmark_status"
             return "benchmark"
-        if any(keyword in combined for keyword in ["测试脚本", "功能测试", "basicmedicalrecord", "test script"]):
-            if any(keyword in task for keyword in ["运行", "执行", "run"]):
-                return "test_run"
-            return "test_list"
         if any(keyword in task for keyword in ["状态", "status"]):
             return "service_status"
         if any(keyword in task for keyword in ["重启", "restart"]):
@@ -5335,8 +5789,6 @@ class OrchestratorSystem:
         service_stop = response_data.get("service_stop") if isinstance(response_data, dict) else None
         service_start = response_data.get("service_start") if isinstance(response_data, dict) else None
         benchmark_stop = response_data.get("benchmark_stop") if isinstance(response_data, dict) else None
-        test_runs = response_data.get("test_runs") if isinstance(response_data, dict) else None
-        test_run_stop = response_data.get("test_run_stop") if isinstance(response_data, dict) else None
         admin_cleanup = response_data.get("admin_cleanup") if isinstance(response_data, dict) else None
         if not isinstance(service_instances, dict):
             service_instances = self._first_inference_service_instances_from_nodes(nodes)
@@ -5354,10 +5806,6 @@ class OrchestratorSystem:
             benchmark_jobs = self._first_inference_benchmark_jobs_from_nodes(nodes)
         if not isinstance(benchmark_stop, dict):
             benchmark_stop = self._first_inference_structured_from_nodes(nodes, "benchmark_stop")
-        if not isinstance(test_runs, dict):
-            test_runs = self._first_inference_structured_from_nodes(nodes, "test_runs")
-        if not isinstance(test_run_stop, dict):
-            test_run_stop = self._first_inference_structured_from_nodes(nodes, "test_run_stop")
         if not isinstance(admin_cleanup, dict):
             admin_cleanup = self._first_inference_structured_from_nodes(nodes, "admin_cleanup")
         action = self._infer_inference_action(
@@ -5372,8 +5820,6 @@ class OrchestratorSystem:
             benchmark_reports=benchmark_reports if isinstance(benchmark_reports, list) else None,
             benchmark_jobs=benchmark_jobs if isinstance(benchmark_jobs, dict) else None,
             benchmark_stop=benchmark_stop if isinstance(benchmark_stop, dict) else None,
-            test_runs=test_runs if isinstance(test_runs, dict) else None,
-            test_run_stop=test_run_stop if isinstance(test_run_stop, dict) else None,
             admin_cleanup=admin_cleanup if isinstance(admin_cleanup, dict) else None,
         )
         if _inference_service_start_payload_submitted(response_data):
@@ -5400,10 +5846,6 @@ class OrchestratorSystem:
                 if benchmark_stop_job_id is not None:
                     fields.setdefault("jobId", benchmark_stop_job_id)
                     fields.setdefault("job_id", benchmark_stop_job_id)
-        if isinstance(test_runs, dict):
-            fields["test_runs"] = test_runs
-        if isinstance(test_run_stop, dict):
-            fields["test_run_stop"] = test_run_stop
         if isinstance(admin_cleanup, dict):
             fields["admin_cleanup"] = admin_cleanup
         if isinstance(benchmark_reports, list) and benchmark_reports:
@@ -5417,6 +5859,9 @@ class OrchestratorSystem:
                     ("model", "model"),
                     ("dataset", "dataset"),
                     ("result_path", "resultPath"),
+                    ("eta_status", "etaStatus"),
+                    ("estimated_remaining_seconds", "estimatedRemainingSeconds"),
+                    ("eta_calculated_at", "etaCalculatedAt"),
                 ):
                     if first_report.get(source_key) is not None:
                         fields.setdefault(protocol_key, first_report.get(source_key))
@@ -5513,17 +5958,6 @@ class OrchestratorSystem:
             return self._with_protocol("inference_benchmark_progress", "inference", result, jobType="inference_benchmark", **fields)
         if action == "benchmark_list":
             return self._with_protocol("inference_benchmark_list", "inference", result, jobType="inference_benchmark", **fields)
-        if action == "test_run":
-            return self._with_protocol("inference_test_result", "inference", result, jobType="inference_test", **fields)
-        if action == "test_stop_preview":
-            return self._with_protocol("inference_test_stop_preview", "inference", result, jobType="inference_test", **fields)
-        if action == "test_stop":
-            protocol_type = "job_stopped" if isinstance(test_run_stop, dict) and test_run_stop.get("stopped") is True else "inference_test_stop_result"
-            return self._with_protocol(protocol_type, "inference", result, jobType="inference_test", **fields)
-        if action == "test_running_list":
-            return self._with_protocol("inference_test_running_list", "inference", result, jobType="inference_test", **fields)
-        if action == "test_list":
-            return self._with_protocol("inference_test_list", "inference", result, jobType="inference_test", **fields)
         if action == "admin_cleanup_preview":
             return self._with_protocol("inference_admin_cleanup_preview", "inference", result, jobType="inference_admin_cleanup", **fields)
         if action == "admin_cleanup_apply":
@@ -5552,12 +5986,8 @@ class OrchestratorSystem:
                 errorReason="assigned_gpu_preflight_failed",
                 errorRecoverable=True,
             )
-        if any(tag in clean_text for tag in ["[参数请求]", "[类型请求]", "[等待用户选择]"]):
-            request_kind = "param"
-            if "[类型请求]" in clean_text:
-                request_kind = "type"
-            elif "[等待用户选择]" in clean_text:
-                request_kind = "choice"
+        request_kind = request_kind_from_text(clean_text)
+        if request_kind:
             friendly_text = self._friendly_request_text(agent_name, clean_text)
             required_params = []
             if request_kind == "param":
@@ -5637,8 +6067,9 @@ class OrchestratorSystem:
     def _friendly_request_text(self, agent_name: str, response_text: str) -> str:
         text = (response_text or "").strip()
         decision_text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
-        plain_text = re.sub(r"\[[^\]]+\]\s*", "", decision_text).strip()
-        bullets = self._extract_bullet_items(decision_text)
+        request_kind = request_kind_from_text(decision_text)
+        plain_text = extract_request_section(decision_text, request_kind) if request_kind else re.sub(r"\[[^\]]+\]\s*", "", decision_text).strip()
+        bullets = self._extract_bullet_items(plain_text)
 
         if "[类型请求]" in text:
             if "训练类型" in text:
@@ -5646,6 +6077,9 @@ class OrchestratorSystem:
             if "评估类型" in text:
                 return self._wrap_user_waiting_message("评估类型", plain_text)
             return self._wrap_user_waiting_message("类型补充", plain_text)
+
+        if "[范围请求]" in text:
+            return self._wrap_user_waiting_message("评测范围", plain_text)
 
         if "[参数请求]" in text:
             if "需要参数：" in text:
@@ -6140,6 +6574,7 @@ class OrchestratorSystem:
 
     def _format_monitor_status_text(self, protocol: Dict[str, Any], fallback: str = "") -> str:
         status_map = {
+            "pending": "等待中",
             "preparing": "准备中",
             "starting": "启动中",
             "running": "运行中",
@@ -6160,6 +6595,7 @@ class OrchestratorSystem:
             "enhanced": "增强训练",
             "grpo": "GRPO",
             "multinode_lora_sft": "双机 LoRA SFT",
+            "multinode_full_sft": "双机全参 SFT",
             "multinode_enhanced": "双机增强训练",
         }
         status_raw = str(protocol.get("status") or "unknown").strip().lower()
@@ -6173,12 +6609,33 @@ class OrchestratorSystem:
         train_type_raw = str(protocol.get("trainTypeEn") or protocol.get("trainType") or "").strip()
         train_type = train_type_text_raw or train_type_map.get(train_type_raw.lower(), train_type_raw)
         assessment_type_raw = str(
-            protocol.get("assessmentTypeText")
-            or protocol.get("evalTypeText")
-            or protocol.get("assessmentType")
+            protocol.get("assessmentType")
             or protocol.get("evalType")
+            or protocol.get("assessmentTypeText")
+            or protocol.get("evalTypeText")
             or ""
         ).strip()
+        assessment_type_map = {
+            "single_model": "单模型评测",
+            "compare_between_models": "双模型对比评测",
+            "compare_models": "双模型对比评测",
+            "ckpt": "Checkpoint 评测",
+            "ckpt_eval": "Checkpoint 评测",
+        }
+        assessment_type = assessment_type_map.get(assessment_type_raw.lower(), assessment_type_raw)
+        assessment_scope_raw = str(protocol.get("evaluationScope") or "").strip()
+        assessment_scope_map = {
+            "llamafactorybuiltin": "通用评测（LLaMA-Factory 内置数据集）",
+            "legacymedical": "医疗评测",
+            "general": "通用评测",
+            "medical": "医疗评测",
+        }
+        assessment_scope = assessment_scope_map.get(assessment_scope_raw.lower(), assessment_scope_raw)
+        script_name = str(protocol.get("script") or protocol.get("scriptName") or "").strip()
+        is_generic_assessment = is_assessment and (
+            assessment_scope_raw.lower() == "llamafactorybuiltin"
+            or script_name.startswith("generic_")
+        )
 
         subject_parts = []
         if container:
@@ -6206,6 +6663,34 @@ class OrchestratorSystem:
                 return [value]
             return []
 
+        role_fallback_labels = {
+            "model_fir": "主模型",
+            "model_sec": "对比模型",
+            "base": "基础模型",
+            "checkpoint": "检查点模型",
+        }
+        assessment_model_entries = []
+        assessment_model_name_counts = {}
+        for model in _mapping_items(protocol.get("models")):
+            role = _as_non_empty_text(model.get("role"))
+            path = _as_non_empty_text(model.get("path"))
+            normalized_path = path.rstrip("/\\").replace("\\", "/")
+            name = normalized_path.rsplit("/", 1)[-1] if normalized_path else ""
+            if not role:
+                continue
+            assessment_model_entries.append((role, name))
+            if name:
+                key = name.casefold()
+                assessment_model_name_counts[key] = assessment_model_name_counts.get(key, 0) + 1
+
+        assessment_role_names = {}
+        for role, name in assessment_model_entries:
+            fallback_label = role_fallback_labels.get(role, role)
+            display_name = name or fallback_label
+            if name and assessment_model_name_counts.get(name.casefold(), 0) > 1:
+                display_name = f"{name}（{fallback_label}）"
+            assessment_role_names[role] = display_name
+
         def _format_percent(value: Any) -> str:
             if value is None:
                 return ""
@@ -6227,27 +6712,112 @@ class OrchestratorSystem:
                 return str(int(value)) if value.is_integer() else str(value)
             return str(value)
 
+        def _assessment_role_text(value: Any) -> str:
+            raw = _as_non_empty_text(value)
+            return assessment_role_names.get(raw, role_fallback_labels.get(raw, raw))
+
+        def _assessment_result_text(result: Any) -> str:
+            if result is None:
+                return ""
+            if not isinstance(result, dict):
+                return _format_score_value(result)
+            labels = {
+                "average": "平均分",
+                "accuracy": "准确率",
+                "acc": "准确率",
+                "score": "分数",
+                "mean_fuzziness": "平均模糊度",
+            }
+            compact_parts = []
+            for key in ("average", "accuracy", "acc", "score", "mean_fuzziness"):
+                if result.get(key) is not None:
+                    compact_parts.append(f"{labels[key]} {_format_score_value(result.get(key))}")
+            if compact_parts:
+                return "，".join(compact_parts)
+            scalar_items = [
+                (key, value)
+                for key, value in result.items()
+                if value is not None and not isinstance(value, (dict, list))
+            ]
+            if 0 < len(scalar_items) <= 3:
+                return "，".join(
+                    f"{key} {_format_score_value(value)}" for key, value in scalar_items
+                )
+            return ""
+
         def _assessment_score_lines(scores: Any) -> list:
             if not isinstance(scores, dict):
                 return []
             score_lines = []
             for name, result in scores.items():
-                stage_name = _as_non_empty_text(name)
-                if not stage_name:
+                parent_name = _as_non_empty_text(name)
+                if not parent_name:
                     continue
-                if isinstance(result, dict):
-                    if result.get("average") is not None:
-                        score_lines.append(f"- **{stage_name}**：平均分 {_format_score_value(result.get('average'))}")
-                        continue
-                    compact_parts = []
-                    for key in ("accuracy", "mean_fuzziness"):
-                        if result.get(key) is not None:
-                            compact_parts.append(f"{key} {_format_score_value(result.get(key))}")
-                    if compact_parts:
-                        score_lines.append(f"- **{stage_name}**：{'，'.join(compact_parts)}")
-                elif result is not None:
-                    score_lines.append(f"- **{stage_name}**：{_format_score_value(result)}")
+                direct_text = _assessment_result_text(result)
+                if direct_text:
+                    score_lines.append(f"- **{_assessment_role_text(parent_name)}**：{direct_text}")
+                    continue
+                if not isinstance(result, dict):
+                    continue
+                for child_name, child_result in result.items():
+                    child_text = _assessment_result_text(child_result)
+                    if child_text:
+                        score_lines.append(
+                            f"- **{_assessment_role_text(parent_name)} / {child_name}**：{child_text}"
+                        )
             return score_lines
+
+        def _assessment_stage_lines(stages: Any) -> list:
+            status_labels = {
+                "finished": "已完成",
+                "completed": "已完成",
+                "running": "运行中",
+                "failed": "失败",
+                "pending": "等待中",
+                "starting": "启动中",
+            }
+            stage_lines = []
+            stage_items = _mapping_items(stages)
+            for stage in stage_items[:12]:
+                model = _assessment_role_text(stage.get("model"))
+                dataset = _as_non_empty_text(stage.get("dataset"))
+                name = " / ".join(item for item in (model, dataset) if item)
+                if not name:
+                    name = _as_non_empty_text(stage.get("name")) or "未命名阶段"
+                stage_status_raw = _as_non_empty_text(stage.get("status")).lower()
+                stage_status = status_labels.get(stage_status_raw, stage_status_raw or "未知")
+                result_text = _assessment_result_text(stage.get("result"))
+                result_suffix = f"，{result_text}" if result_text else ""
+                stage_lines.append(f"- **{name}**：{stage_status}{result_suffix}")
+            if len(stage_items) > 12:
+                stage_lines.append(f"- 其余 {len(stage_items) - 12} 个阶段已省略")
+            return stage_lines
+
+        def _assessment_model_lines(models: Any) -> list:
+            model_lines = []
+            for model in _mapping_items(models):
+                role = _assessment_role_text(model.get("role")) or "模型"
+                path = _as_non_empty_text(model.get("path"))
+                if path:
+                    model_lines.append(f"- **{role}**：{path}")
+            return model_lines
+
+        def _assessment_artifact_lines(artifacts: Any) -> list:
+            artifact_labels = {
+                "manifest": "任务清单",
+                "summary_json": "结果汇总 JSON",
+                "summary": "最终报告",
+            }
+            artifact_lines = []
+            for artifact in _mapping_items(artifacts):
+                name = _as_non_empty_text(artifact.get("name")) or "结果文件"
+                label = artifact_labels.get(name, name)
+                exists = artifact.get("exists") is True
+                path = _as_non_empty_text(artifact.get("path"))
+                state_text = "已生成" if exists else "待生成"
+                path_suffix = f"（{path}）" if exists and path else ""
+                artifact_lines.append(f"- **{label}**：{state_text}{path_suffix}")
+            return artifact_lines
 
         def _assessment_running_detail_lines(details: Any) -> list:
             running_lines = []
@@ -6325,6 +6895,9 @@ class OrchestratorSystem:
                 "container_unknown": "无法确定训练容器，请提供容器名称。",
                 "multiple_containers": "检测到多个运行容器，请指定要查询的训练容器。",
                 "assigned_gpu_preflight_failed": "训练启动前的 GPU 检查未通过，请检查 GPU 分配或资源占用。",
+                "generic_eval_failed": "通用评测失败，请查看错误信息或评测日志。",
+                "manifest_missing": "评测进程已结束，但没有生成任务清单。",
+                "run_id_required": "评测启动记录缺少 Run ID，无法定位本次评测结果。",
                 "unknown": "训练未正常完成，暂时无法从日志判断具体原因。",
             }.get(reason, "")
 
@@ -6338,13 +6911,162 @@ class OrchestratorSystem:
                 exit_code = reason.removeprefix("wandb_exitcode_")
                 return f"训练进程返回非零退出码 {exit_code}，未能正常完成。"
             if reason:
-                return _monitor_error_reason_text(reason) or "训练未正常完成，暂时无法从日志判断具体原因。"
+                fallback_reason = (
+                    "评估任务未正常完成，暂时无法从日志判断具体原因。"
+                    if is_assessment
+                    else "训练未正常完成，暂时无法从日志判断具体原因。"
+                )
+                return _monitor_error_reason_text(reason) or fallback_reason
             return ""
+
+        if is_generic_assessment:
+            def _display_assessment_stage(value: Any) -> str:
+                stage_value = _as_non_empty_text(value)
+                if ":" in stage_value:
+                    role, dataset = stage_value.split(":", 1)
+                    return f"{_assessment_role_text(role)} / {dataset}"
+                return stage_value
+
+            generic_error_summary = _monitor_error_summary()
+            if generic_error_summary and status_raw in {"failed", "interrupted", "unknown", "stopped"}:
+                lines.append(f"\n**失败原因：** {generic_error_summary}")
+
+            identity_lines = []
+            if assessment_scope:
+                identity_lines.append(f"- **评测范围**：{assessment_scope}")
+            if assessment_type:
+                identity_lines.append(f"- **评估类型**：{assessment_type}")
+            eval_datasets = protocol.get("evalDatasets")
+            if isinstance(eval_datasets, list) and eval_datasets:
+                identity_lines.append(f"- **评测数据集**：{'、'.join(str(item) for item in eval_datasets)}")
+            run_id = _as_non_empty_text(protocol.get("runId"))
+            if run_id:
+                identity_lines.append(f"- **Run ID**：{run_id}")
+            if identity_lines:
+                lines.append("\n**任务信息：**")
+                lines.extend(identity_lines)
+
+            progress_lines = []
+            current_stage = _as_non_empty_text(
+                protocol.get("currentStage") or protocol.get("currentLogicalStage")
+            )
+            if current_stage:
+                current_stage_text = {
+                    "evaluating": "评测执行中",
+                    "preparing": "准备中",
+                    "finished": "已完成",
+                }.get(current_stage.lower(), current_stage)
+                progress_lines.append(f"- **当前阶段**：{current_stage_text}")
+            current_stages = protocol.get("currentStages")
+            if isinstance(current_stages, list) and current_stages:
+                displayed_stages = [
+                    _display_assessment_stage(value)
+                    for value in current_stages
+                    if _display_assessment_stage(value)
+                ]
+                if displayed_stages:
+                    progress_lines.append(f"- **当前评测项**：{'、'.join(displayed_stages)}")
+            completed_stages = protocol.get("completedStages")
+            total_stages = protocol.get("totalStages")
+            overall_percent = _format_percent(protocol.get("overallProgressPercent"))
+            if completed_stages is not None and total_stages is not None:
+                overall_suffix = f"（{overall_percent}）" if overall_percent else ""
+                progress_lines.append(
+                    f"- **整体进度**：已完成 {completed_stages}/{total_stages}{overall_suffix}"
+                )
+
+            current_detail = _first_mapping(protocol.get("currentStageDetails"))
+            progress_summary = (
+                current_detail.get("progress_summary")
+                if isinstance(current_detail.get("progress_summary"), dict)
+                else {}
+            )
+            step_name = _as_non_empty_text(progress_summary.get("step_name"))
+            step_current = progress_summary.get("step_current")
+            step_total = progress_summary.get("step_total")
+            local_percent = _format_percent(progress_summary.get("local_progress_percent"))
+            if status_raw == "running":
+                local_parts = []
+                if step_name:
+                    local_parts.append(step_name)
+                if step_current is not None and step_total is not None:
+                    local_parts.append(f"{step_current}/{step_total}")
+                if local_percent:
+                    local_parts.append(f"局部 {local_percent}")
+                if local_parts:
+                    progress_lines.append(f"- **当前项局部进度**：{'，'.join(local_parts)}")
+                else:
+                    progress_lines.append(
+                        "- **当前项局部进度**：当前项已运行，暂未读取到可量化的局部进度"
+                    )
+                latest_line = _truncate_log_line(progress_summary.get("latest_line"))
+                if latest_line and not (step_current is not None and step_total is not None):
+                    progress_lines.append(f"- **最新进度日志**：{latest_line}")
+            next_stage = _display_assessment_stage(protocol.get("nextStage"))
+            if next_stage and status_raw not in {"finished", "completed"}:
+                progress_lines.append(f"- **下一项**：{next_stage}")
+            if progress_lines:
+                lines.append("\n**运行进度：**")
+                lines.extend(progress_lines)
+
+            if generic_error_summary and status_raw in {"failed", "interrupted", "unknown", "stopped"}:
+                progress_log = _as_non_empty_text(current_detail.get("progress_log"))
+                if progress_log:
+                    lines.append(f"- **相关日志**：{progress_log}")
+
+            score_lines = _assessment_score_lines(protocol.get("scores"))
+            if score_lines:
+                lines.append("\n**已有评分：**")
+                lines.extend(score_lines)
+            macro_average_lines = _assessment_score_lines(protocol.get("macroAverage"))
+            if macro_average_lines:
+                lines.append("\n**等权宏平均：**")
+                lines.extend(macro_average_lines)
+            score_delta_lines = _assessment_score_lines(protocol.get("scoreDeltas"))
+            if score_delta_lines:
+                lines.append("\n**分数差值：**")
+                lines.extend(score_delta_lines)
+
+            if status_raw in {"finished", "completed"}:
+                report_path = _as_non_empty_text(protocol.get("reportPath"))
+                report_text = str(protocol.get("reportText") or "").strip()
+                if report_text:
+                    lines.append("\n**最终报告：**")
+                    lines.append("```text")
+                    lines.extend(report_text.splitlines())
+                    lines.append("```")
+                    if report_path:
+                        lines.append(f"- **报告路径**：{report_path}")
+                elif report_path:
+                    lines.append(f"\n**最终报告：** {report_path}")
+            elif status_raw in {"preparing", "starting", "pending"}:
+                lines.append("\n评估任务正在初始化，阶段日志和进度可能尚未生成。")
+
+            return "\n".join(lines).strip() or str(fallback or "").strip()
 
         running_detail = _first_mapping(protocol.get("currentStageDetails"))
         progress_summary = running_detail.get("progress_summary") if isinstance(running_detail.get("progress_summary"), dict) else {}
         is_assessment_finished = is_assessment and status_raw in {"finished", "completed"}
-        assessment_score_lines = _assessment_score_lines(protocol.get("scores")) if is_assessment and not is_assessment_finished else []
+        assessment_score_lines = (
+            _assessment_score_lines(protocol.get("scores"))
+            if is_assessment and (is_generic_assessment or not is_assessment_finished)
+            else []
+        )
+        assessment_stage_lines = (
+            _assessment_stage_lines(protocol.get("stages"))
+            if is_generic_assessment
+            else []
+        )
+        assessment_model_lines = (
+            _assessment_model_lines(protocol.get("models"))
+            if is_generic_assessment
+            else []
+        )
+        assessment_artifact_lines = (
+            _assessment_artifact_lines(protocol.get("artifacts"))
+            if is_generic_assessment
+            else []
+        )
         assessment_running_detail_lines = (
             _assessment_running_detail_lines(protocol.get("currentStageDetails"))
             if is_assessment
@@ -6357,24 +7079,71 @@ class OrchestratorSystem:
         )
 
         detail_lines = []
-        if is_assessment and assessment_type_raw:
-            detail_lines.append(f"- **评估类型**：{assessment_type_raw}")
+        if is_assessment and assessment_scope:
+            detail_lines.append(f"- **评测范围**：{assessment_scope}")
+        if is_assessment and assessment_type:
+            detail_lines.append(f"- **评估类型**：{assessment_type}")
         elif train_type:
             detail_lines.append(f"- **训练类型**：{train_type}")
         if is_assessment:
+            eval_datasets = protocol.get("evalDatasets")
+            if isinstance(eval_datasets, list) and eval_datasets:
+                detail_lines.append(f"- **评测数据集**：{'、'.join(str(item) for item in eval_datasets)}")
+            run_id = _as_non_empty_text(protocol.get("runId"))
+            if run_id:
+                detail_lines.append(f"- **Run ID**：{run_id}")
+            if protocol.get("pidAlive") is not None:
+                detail_lines.append(f"- **评测进程**：{'PID 存活' if protocol.get('pidAlive') else 'PID 已结束'}")
             current_stage = _as_non_empty_text(protocol.get("currentStage") or protocol.get("currentLogicalStage") or running_detail.get("name"))
             if current_stage:
-                detail_lines.append(f"- **当前阶段**：{current_stage}")
+                current_stage_text = {
+                    "evaluating": "评测执行中",
+                    "preparing": "准备中",
+                    "finished": "已完成",
+                }.get(current_stage.lower(), current_stage)
+                detail_lines.append(f"- **当前阶段**：{current_stage_text}")
+            current_stages = protocol.get("currentStages")
+            if isinstance(current_stages, list) and current_stages:
+                current_stage_names = []
+                for value in current_stages:
+                    stage_value = _as_non_empty_text(value)
+                    if ":" in stage_value:
+                        role, dataset = stage_value.split(":", 1)
+                        stage_value = f"{_assessment_role_text(role)} / {dataset}"
+                    if stage_value:
+                        current_stage_names.append(stage_value)
+                if current_stage_names:
+                    detail_lines.append(f"- **当前评测项**：{'、'.join(current_stage_names)}")
             completed_stages = protocol.get("completedStages")
             total_stages = protocol.get("totalStages")
             next_stage = _as_non_empty_text(protocol.get("nextStage"))
             stage_progress_parts = []
             if completed_stages is not None and total_stages is not None:
                 stage_progress_parts.append(f"已完成 {completed_stages}/{total_stages}")
+            overall_percent = _format_percent(protocol.get("overallProgressPercent"))
+            if overall_percent:
+                stage_progress_parts.append(f"整体 {overall_percent}")
             if next_stage:
-                stage_progress_parts.append(f"下一阶段 {next_stage}")
+                if ":" in next_stage:
+                    next_role, next_dataset = next_stage.split(":", 1)
+                    next_stage = f"{_assessment_role_text(next_role)} / {next_dataset}"
+                stage_progress_parts.append(f"下一项 {next_stage}")
             if stage_progress_parts:
                 detail_lines.append(f"- **阶段进度**：{'，'.join(stage_progress_parts)}")
+            counts = protocol.get("stageStatusCounts")
+            if isinstance(counts, dict):
+                count_parts = []
+                for key, label in (
+                    ("finished", "已完成"),
+                    ("running", "运行中"),
+                    ("pending", "等待中"),
+                    ("failed", "失败"),
+                ):
+                    value = counts.get(key)
+                    if value is not None:
+                        count_parts.append(f"{label} {value}")
+                if count_parts:
+                    detail_lines.append(f"- **阶段分布**：{'，'.join(count_parts)}")
 
         latest_loss = protocol.get("latestLoss")
         if latest_loss is not None:
@@ -6394,9 +7163,31 @@ class OrchestratorSystem:
         sub_stage_text = protocol.get("subStageText")
         if sub_stage_text is not None and str(sub_stage_text).strip():
             detail_lines.append(f"- **阶段**：{sub_stage_text}")
-        export_dir = protocol.get("exportDir")
-        if export_dir is not None and str(export_dir).strip():
-            detail_lines.append(f"- **导出目录**：{export_dir}")
+        is_finished_training = (
+            not is_assessment
+            and status_raw in {"finished", "completed"}
+            and protocol.get("succeeded") is not False
+        )
+        if is_finished_training:
+            output_dir = _as_non_empty_text(protocol.get("outputDir"))
+            export_dir = _as_non_empty_text(protocol.get("exportDir"))
+            if output_dir:
+                detail_lines.append(
+                    f"- **训练输出目录（Adapter/Checkpoint）**：{output_dir}"
+                )
+            else:
+                detail_lines.append(
+                    "- **训练输出目录（Adapter/Checkpoint）**：未解析到对应产物目录"
+                )
+            if train_type_raw.lower() != "grpo":
+                if export_dir:
+                    detail_lines.append(
+                        f"- **合并模型目录（可部署）**：{export_dir}"
+                    )
+                else:
+                    detail_lines.append(
+                        "- **合并模型目录（可部署）**：未解析到对应产物目录"
+                    )
         merge_status = protocol.get("mergeStatus")
         if merge_status is not None and str(merge_status).strip():
             detail_lines.append(f"- **Merge 状态**：{merge_status}")
@@ -6412,13 +7203,50 @@ class OrchestratorSystem:
             lines.append("\n**详细信息：**")
             lines.extend(detail_lines)
 
+        if assessment_model_lines:
+            lines.append("\n**模型信息：**")
+            lines.extend(assessment_model_lines)
+
+        if assessment_stage_lines:
+            lines.append("\n**执行明细：**")
+            lines.extend(assessment_stage_lines)
+
         if assessment_score_lines:
             lines.append("\n**已有评分：**")
             lines.extend(assessment_score_lines)
+        elif is_generic_assessment:
+            no_score_reason = (
+                "当前还没有模型-数据集组合完成评测"
+                if status_raw in {"pending", "preparing", "starting", "running"}
+                else "未读取到可展示的结构化评分"
+            )
+            lines.append(f"\n**已有评分：**\n- 暂无（{no_score_reason}）")
+
+        macro_average_lines = (
+            _assessment_score_lines(protocol.get("macroAverage"))
+            if is_generic_assessment
+            else []
+        )
+        if macro_average_lines:
+            lines.append("\n**等权宏平均：**")
+            lines.extend(macro_average_lines)
+
+        score_delta_lines = (
+            _assessment_score_lines(protocol.get("scoreDeltas"))
+            if is_generic_assessment
+            else []
+        )
+        if score_delta_lines:
+            lines.append("\n**分数差值：**")
+            lines.extend(score_delta_lines)
 
         if assessment_report_lines:
             lines.append("\n**最终报告：**")
             lines.extend(assessment_report_lines)
+
+        if assessment_artifact_lines:
+            lines.append("\n**结果文件：**")
+            lines.extend(assessment_artifact_lines)
 
         if assessment_running_detail_lines:
             lines.append("\n**运行中阶段详情：**")
@@ -6438,8 +7266,8 @@ class OrchestratorSystem:
                 if step_name and step_current is not None and step_total is not None:
                     percent_suffix = f"（局部进度 {local_percent}）" if local_percent else ""
                     lines.append(f"\n当前阶段正在执行 {step_name}：{step_current}/{step_total}{percent_suffix}。")
-                elif assessment_score_lines or assessment_running_detail_lines:
-                    lines.append("\n评估任务仍在运行，最终报告尚未生成；以上为当前已产出的阶段结果和运行日志摘要。")
+                elif assessment_score_lines or assessment_running_detail_lines or assessment_stage_lines:
+                    lines.append("\n评估任务仍在运行，最终报告尚未生成；以上列出了当前进度、逐项状态与已产出结果。")
                 else:
                     lines.append("\n评估任务正在运行中，但阶段结果/指标数据暂未全部就绪，请稍后刷新状态。")
             else:
@@ -6549,7 +7377,7 @@ class OrchestratorSystem:
         if agent_name != "inference":
             return False
         text = (task_description or self.current_user_message or "").lower()
-        keywords = ["推理", "服务", "节点", "gpu", "benchmark", "基准", "功能测试", "配置", "端口", "日志", "启动", "停止", "重启"]
+        keywords = ["推理", "服务", "节点", "gpu", "benchmark", "基准", "配置", "端口", "日志", "启动", "停止", "重启"]
         return any(keyword in text for keyword in keywords) and not isinstance(self._last_inference_tool_payload, dict)
 
     def _missing_tool_call_response(self, agent_name: str, task_description: str, agent: Any) -> ToolResponse:
@@ -6657,7 +7485,9 @@ class OrchestratorSystem:
                     display_text or context_response_text,
                     container=self._training_container_for_request(task_description) if agent_name == "trainer" else None,
                 )
-                request_kind = "param"
+                request_kind = request_kind_from_protocol_kind(
+                    str(response_protocol.get("kind") or ""),
+                )
                 required_params = response_protocol.get("requiredParams") or []
                 self.pending_parameters[agent_name] = self._pending_state(
                     agent_name,
@@ -6667,7 +7497,7 @@ class OrchestratorSystem:
                     display_text,
                     response_protocol,
                     required_params=required_params,
-                    needs_choice=False,
+                    needs_choice=request_kind in {"scope", "choice"},
                 )
                 self.last_response_protocol = response_protocol
                 return ToolResponse(content=[TextBlock(type="text", text=display_text)],
@@ -6747,7 +7577,8 @@ class OrchestratorSystem:
             )
         
         # 检查响应类型
-        if any(tag in response_text for tag in ["[参数请求]", "[类型请求]", "[等待用户选择]"]):
+        detected_request_kind = request_kind_from_text(response_text)
+        if detected_request_kind:
             if self._is_terminal_waiting_response(agent_name, response_text):
                 display_text = re.sub(r"\[[^\]]+\]\s*", "", context_response_text).strip()
                 protocol = self._message_protocol(agent_name, display_text, "task_completed")
@@ -6769,11 +7600,7 @@ class OrchestratorSystem:
                 )
 
             friendly_text = self._friendly_request_text(agent_name, response_text)
-            request_kind = "param"
-            if "[类型请求]" in response_text:
-                request_kind = "type"
-            elif "[等待用户选择]" in response_text:
-                request_kind = "choice"
+            request_kind = detected_request_kind
             required_params = []
             missing_params = []
             if request_kind == "param":
@@ -6826,7 +7653,7 @@ class OrchestratorSystem:
                 friendly_text,
                 protocol,
                 required_params=required_params,
-                needs_choice="[等待用户选择]" in response_text,
+                needs_choice="[等待用户选择]" in response_text or "[范围请求]" in response_text,
             )
             self.last_response_protocol = protocol
             return ToolResponse(content=[TextBlock(type="text", text=friendly_text)],
@@ -7133,14 +7960,90 @@ class OrchestratorSystem:
     def _extract_workflow_benchmark_name(self, text: str) -> str:
         normalized = (text or "").replace("：", ":").strip()
         patterns = [
-            r"(?:评测集|评测数据集|基准评测|benchmark)\s*(?:使用|用|为|是|=|:)\s*([A-Za-z0-9_.-]+)",
-            r"(?:使用|用)\s*([A-Za-z0-9_.-]+)\s*(?:评测集|评测数据集|基准评测|benchmark)",
+            r"(?:(?<!通用)评测集|(?<!通用)评测数据集|基准评测|benchmark)\s*(?:使用|用|为|是|=|:)\s*([A-Za-z0-9_.-]+)",
+            r"(?:使用|用)\s*([A-Za-z0-9_.-]+)\s*(?:(?<!通用)评测集|(?<!通用)评测数据集|基准评测|benchmark)",
         ]
         for pattern in patterns:
             match = re.search(pattern, normalized, re.IGNORECASE)
             if match:
                 return match.group(1).strip().strip("`'\"“”‘’")
         return "2024"
+
+    def _workflow_evaluation_context(self, message: str) -> Dict[str, Any]:
+        """Parse one-click evaluation settings without changing standalone defaults."""
+        text = (message or "").replace("：", ":")
+        scope_requested = bool(re.search(r"(?:evaluation_scope|评测范围|评估范围)\s*(?:是|为|=|:)", text, re.IGNORECASE))
+        scope_match = re.search(
+            r"(?:evaluation_scope|评测范围|评估范围)\s*(?:是|为|=|:)?\s*([^\s,，;；]+)",
+            text,
+            re.IGNORECASE,
+        )
+        if scope_match:
+            evaluation_scope = _normalize_evaluation_scope(
+                scope_match.group(1).strip().strip("`'\"“”‘’。")
+            )
+        elif scope_requested:
+            raise ValueError("evaluation_scope 不能为空；可选值为 general 或 medical")
+        elif "医疗评测" in text or "医疗评估" in text:
+            evaluation_scope = "medical"
+        else:
+            evaluation_scope = "general"
+
+        datasets_requested = bool(re.search(r"(?:eval_datasets|通用评测集|通用评估集)\s*(?:是|为|=|:)", text, re.IGNORECASE))
+        datasets_match = re.search(
+            r"(?:eval_datasets|通用评测集|通用评估集)\s*(?:是|为|=|:)?\s*([^\r\n]+)",
+            text,
+            re.IGNORECASE,
+        )
+        raw_datasets: Optional[str] = None
+        if datasets_match:
+            raw_datasets = datasets_match.group(1).strip()
+            raw_datasets = re.split(
+                r"(?:[,，、;；]|\s+)\s*(?="
+                r"(?:(?:benchmark|train_type|training_type|dataset_dir|data_dir|data_type|"
+                r"evaluation_scope|model_path|base_model_path)\s*[=:]"
+                r"|(?:训练类型|数据类型|评测范围|评估范围)\s*(?:是|为|=|:)"
+                r"|(?:模型在|模型路径|模型位置|基础模型路径|数据集路径|数据路径|"
+                r"数据集目录|数据目录|数据集位置|数据位置)\s*(?:是|为|=|:)?\s*/"
+                r"|评测集使用|评测数据集使用|基准评测))",
+                raw_datasets,
+                maxsplit=1,
+                flags=re.IGNORECASE,
+            )[0].strip().strip("`'\"“”‘’。")
+        elif datasets_requested:
+            raise ValueError("eval_datasets 不能为空；通用评测至少需要选择一个内置评测集")
+
+        profile_datasets: Optional[List[str]] = None
+        if raw_datasets is None:
+            if "中英综合" in text:
+                profile_datasets = ["ceval", "cmmlu", "mmlu"]
+            elif "内置医疗选择题" in text:
+                profile_datasets = ["cmbsingle", "medqa", "medmcqa"]
+            elif any(keyword in text for keyword in ("全六项", "全部六项", "六项全跑")):
+                profile_datasets = list(GENERIC_EVAL_DATASETS)
+
+        has_dataset_override = raw_datasets is not None or profile_datasets is not None
+        if evaluation_scope == "medical":
+            if has_dataset_override:
+                raise ValueError("医疗评测不接受 eval_datasets；请移除该参数，或将 evaluation_scope 改为 general")
+            return {
+                "workflow_schema_version": 2,
+                "evaluation_scope": "medical",
+                "eval_datasets": [],
+                "evaluation_script": "single_model_evaluation_vpn",
+            }
+
+        eval_datasets = _normalize_generic_eval_datasets(
+            raw_datasets.replace("，", ",").replace("、", ",")
+            if raw_datasets is not None
+            else (profile_datasets or ["ceval", "cmmlu"])
+        )
+        return {
+            "workflow_schema_version": 2,
+            "evaluation_scope": "general",
+            "eval_datasets": eval_datasets,
+            "evaluation_script": "generic_single_model_eval",
+        }
 
     def _has_training_type(self, text: str) -> bool:
         if self._infer_multinode_train_family(text):
@@ -7469,8 +8372,6 @@ class OrchestratorSystem:
             "推理基准",
             "推理基准测试",
             "基准测试",
-            "功能测试",
-            "service_test",
             "benchmark",
             "medbench",
             "inference",
@@ -7514,6 +8415,7 @@ class OrchestratorSystem:
         evaluation_keywords = [
             "单模型评估", "单模型评测", "双模型评估", "双模型评测",
             "ckpt评估", "ckpt评测", "checkpoint评估", "checkpoint评测",
+            "通用评测", "通用评估", "医疗评测", "医疗评估",
         ]
         if any(keyword in text for keyword in evaluation_keywords):
             return "evaluator"
@@ -7691,6 +8593,10 @@ class OrchestratorSystem:
             "模型二路径": "model_sec",
             "checkpoint路径": "CKPT_PATH",
             "ckpt路径": "CKPT_PATH",
+            "评测范围": "evaluation_scope",
+            "评估范围": "evaluation_scope",
+            "评测集": "eval_datasets",
+            "评估集": "eval_datasets",
             "定时时间": "schedule_time",
             "训练时间": "schedule_time",
             "数据路径": "input_folder",
@@ -7708,6 +8614,8 @@ class OrchestratorSystem:
             "data.val_files": "val_files",
             "dataset_dir": "dataset_dir",
             "dataset_name": "dataset_name",
+            "evaluation_scope": "evaluation_scope",
+            "eval_datasets": "eval_datasets",
             "input_folder": "input_folder",
             "schedule_time": "schedule_time",
             "data_type": "data_type",
@@ -7759,7 +8667,7 @@ class OrchestratorSystem:
 
         machine_param_re = re.compile(
             r"`?("
-            r"model_fir|model_sec|CKPT_PATH|ckpt_path|checkpoint|model_path|dataset_dir|dataset_name|"
+            r"model_fir|model_sec|CKPT_PATH|ckpt_path|checkpoint|model_path|dataset_dir|dataset_name|evaluation_scope|eval_datasets|"
             r"train_files|data\.train_files|val_files|data\.val_files|"
             r"input_folder|schedule_time|data_type|strategy|container_name|container|pid"
             r")`?",
@@ -7775,11 +8683,11 @@ class OrchestratorSystem:
         candidates: List[str] = []
         param_name_re = re.compile(
             r"`?("
-            r"model_fir|model_sec|CKPT_PATH|ckpt_path|checkpoint|model_path|dataset_dir|dataset_name|"
+            r"model_fir|model_sec|CKPT_PATH|ckpt_path|checkpoint|model_path|dataset_dir|dataset_name|evaluation_scope|eval_datasets|"
             r"train_files|data\.train_files|val_files|data\.val_files|"
             r"input_folder|schedule_time|data_type|strategy|container_name|container|pid|"
             r"模型路径|模型位置|数据集路径|数据集目录|数据目录|数据集名称|第一个模型路径|模型一路径|"
-            r"第二个模型路径|模型二路径|checkpoint路径|ckpt路径|定时时间|训练时间|数据路径|文件夹路径|"
+            r"第二个模型路径|模型二路径|checkpoint路径|ckpt路径|评测范围|评估范围|评测集|评估集|定时时间|训练时间|数据路径|文件夹路径|"
             r"训练数据|训练集|训练文件|训练数据文件|验证数据|验证集|验证文件|验证数据文件"
             r")`?",
             re.IGNORECASE,
@@ -7815,6 +8723,12 @@ class OrchestratorSystem:
             if any(keyword in content for keyword in ["增强训练"]) or "dpo_train_launcher" in lower:
                 return ["model_path", "dataset_dir", "dataset_name"]
         if agent_name == "evaluator":
+            if "generic_ckpt_eval" in lower:
+                return ["CKPT_PATH", "eval_datasets"]
+            if "generic_single_model_eval" in lower:
+                return ["model_fir", "eval_datasets"]
+            if "generic_compare_models_eval" in lower:
+                return ["model_fir", "model_sec", "eval_datasets"]
             if "ckpt_eval" in lower or "ckpt评估" in content:
                 return ["CKPT_PATH"]
             if "single_model_evaluation_vpn" in lower or "单模型" in content:
@@ -7958,6 +8872,33 @@ class OrchestratorSystem:
         )
         if dataset_name_match:
             extracted["dataset_name"] = dataset_name_match.group(1).strip()
+
+        scope_match = re.search(
+            r"(?:evaluation_scope|评测范围|评估范围)\s*(?:是|为|=|:)?\s*(medical|general|医疗评测|医疗评估|通用评测|通用评估)",
+            text,
+            re.IGNORECASE,
+        )
+        if scope_match:
+            scope = scope_match.group(1).lower()
+            extracted["evaluation_scope"] = "general" if scope.startswith("general") or "通用" in scope else "medical"
+        elif "通用评测" in text or "通用评估" in text:
+            extracted["evaluation_scope"] = "general"
+        elif "医疗评测" in text or "医疗评估" in text:
+            extracted["evaluation_scope"] = "medical"
+
+        datasets_match = re.search(
+            r"(?:eval_datasets|评测集|评估集)\s*(?:是|为|=|:)?\s*([A-Za-z0-9_\-\s,，、]+)",
+            text,
+            re.IGNORECASE,
+        )
+        if datasets_match:
+            allowed = {"ceval", "cmbsingle", "cmmlu", "medmcqa", "medqa", "mmlu"}
+            selected = []
+            for item in re.split(r"[\s,，、]+", datasets_match.group(1).strip().lower()):
+                if item in allowed and item not in selected:
+                    selected.append(item)
+            if selected:
+                extracted["eval_datasets"] = ",".join(selected)
 
         return extracted
 
@@ -8588,15 +9529,21 @@ class OrchestratorSystem:
         command = str(command or self.current_user_message or "").strip()
         resource_context: Optional[Dict[str, Any]] = None
         try:
-
-            resource_context = _inference_request_resource_context(command)
             owner_user_id, owner_aliases = _inference_owner_payload(self.user_id)
+            inference_thread_id = f"user:{self.user_id}:inference"
+            resource_context = _inference_request_resource_context(
+                command,
+                owner_user_id=owner_user_id,
+                owner_aliases=owner_aliases,
+                user_role=_current_user_role(),
+                thread_id=inference_thread_id,
+            )
             request_payload: Dict[str, Any] = {
                 "command": command,
                 "user_id": owner_user_id,
                 "user_aliases": owner_aliases,
                 "user_role": _current_user_role(),
-                "thread_id": f"user:{self.user_id}:inference",
+                "thread_id": inference_thread_id,
                 "container": self.evaluation_container,
             }
             if resource_context:
@@ -8604,6 +9551,7 @@ class OrchestratorSystem:
             response = requests.post(
                 config.agents.inference.inference_agent_url,
                 json=request_payload,
+                headers=_inference_ops_headers(),
                 timeout=360,
             )
             response.raise_for_status()
@@ -8627,7 +9575,14 @@ class OrchestratorSystem:
             resource_payload["protocol"] = protocol
             if isinstance(resource_context, dict) and resource_context.get("reservation_id"):
                 if _inference_response_holds_resource_reservation(command, resource_payload, result, resource_context):
-                    _start_inference_resource_heartbeat(resource_context)
+                    _start_inference_resource_heartbeat(
+                        resource_context,
+                        response_payload=resource_payload,
+                        owner_user_id=owner_user_id,
+                        owner_aliases=owner_aliases,
+                        user_role=_current_user_role(),
+                        thread_id=inference_thread_id,
+                    )
                 else:
                     _release_inference_resource_context(resource_context)
             if _inference_protocol_is_service_stop(protocol):
@@ -8664,15 +9619,14 @@ class OrchestratorSystem:
         )
     
     async def _call_inference(self, task_description: str, **kwargs) -> ToolResponse:
-        """调用推理 Agent 处理推理服务、节点运维、功能测试和推理基准评测请求。
+        """调用推理 Agent 处理 vLLM 服务、节点运维和推理基准评测请求。
 
 适用场景：
-- 查看、修改推理配置，例如模型路径、模型名称、端口、GPU、TP、max tokens 等。
+- 查看、修改推理配置，例如模型路径、模型名称、vLLM 端口、GPU、TP 等。
 - 查看、启动、停止、重启推理服务，并查询启动状态、服务状态和服务日志。
 - 查看 GPU 状态、推荐 GPU 分配、根据当前资源推荐在哪个节点启动推理服务。
-- 多节点操作：查看节点列表，查看/修改指定节点配置，查看指定节点服务状态、日志、GPU、测试和 benchmark。
+- 多节点操作：查看节点列表，查看/修改指定节点配置，查看指定节点服务状态、日志、GPU 和 benchmark。
 - 启用/禁用 worker 节点；controller 节点不能禁用。
-- 查看可用的推理功能测试脚本，运行推理功能测试脚本（basicmedicalrecord.sh 等），并查询测试状态、运行列表和测试结果。
 - 查看可用的推理 benchmark，运行/停止推理 benchmark，并查询任务列表、进度、状态和结果报告。
 - 支持医疗选择题（2021.json、2024.json、step1.json、step2.json、step3.json 等）、MedBench、通用 benchmark 等推理评测相关请求。
 """
@@ -8967,20 +9921,20 @@ class OrchestratorSystem:
 
     def _all_stop_patterns_for_type(self, task_type: str) -> List[str]:
         if task_type == "train":
-            return ["batch_train_lora", "batch_train_full", "batch_train_pretrain_lora", "batch_train_pretrain_full", "dpo_train_launcher", "grpo_train"]
+            return ["batch_train_lora", "batch_train_full", "batch_train_pretrain_lora", "batch_train_pretrain_full", "dpo_train_launcher", "train_multinode_sft_pipeline", "train_multinode_sft_full_pipeline", "train_multinode_dpo_pipeline", "grpo_train"]
         if task_type == "data":
             return ["data_preprocessing", "score_based_filtering"]
         if task_type in {"assessment", "evaluate"}:
-            return ["compare_between_models_vpn", "single_model_evaluation_vpn", "ckpt_eval"]
+            return ["compare_between_models_vpn", "single_model_evaluation_vpn", "ckpt_eval", "generic_single_model_eval", "generic_compare_models_eval", "generic_ckpt_eval"]
         return []
 
     def _task_type_for_script_name(self, script_name: Optional[str]) -> Optional[str]:
         name = os.path.basename(str(script_name or "").strip())
-        if name in {"batch_train_lora", "batch_train_full", "batch_train_pretrain_lora", "batch_train_pretrain_full", "dpo_train_launcher", "grpo_train"}:
+        if name in {"batch_train_lora", "batch_train_full", "batch_train_pretrain_lora", "batch_train_pretrain_full", "dpo_train_launcher", "train_multinode_sft_pipeline", "train_multinode_sft_full_pipeline", "train_multinode_dpo_pipeline", "grpo_train"}:
             return "train"
         if name in {"data_preprocessing", "score_based_filtering"}:
             return "data"
-        if name in {"compare_between_models_vpn", "single_model_evaluation_vpn", "ckpt_eval"}:
+        if name in {"compare_between_models_vpn", "single_model_evaluation_vpn", "ckpt_eval", "generic_single_model_eval", "generic_compare_models_eval", "generic_ckpt_eval"}:
             return "assessment"
         return None
 
@@ -9462,6 +10416,7 @@ class OrchestratorSystem:
     def _default_train_stop_patterns(self) -> List[str]:
         return [
             "train_multinode_sft_pipeline",
+            "train_multinode_sft_full_pipeline",
             "train_multinode_dpo_pipeline",
             "batch_train_pretrain_lora",
             "batch_train_pretrain_full",
@@ -9479,6 +10434,8 @@ class OrchestratorSystem:
         text = (message or "").lower()
         if any(keyword in text for keyword in ["train_multinode_dpo_pipeline", "多机增强训练", "多机dpo"]):
             return ["train_multinode_dpo_pipeline"]
+        if any(keyword in text for keyword in ["train_multinode_sft_full_pipeline", "多机全参", "双机全参", "multinode_full_sft"]):
+            return ["train_multinode_sft_full_pipeline"]
         if any(keyword in text for keyword in ["train_multinode_sft_pipeline", "多机lora批量训练", "多机sft"]):
             return ["train_multinode_sft_pipeline"]
         if any(keyword in text for keyword in ["增强训练", "dpo", "dpo_train_launcher"]):
@@ -9511,6 +10468,8 @@ class OrchestratorSystem:
         ).lower()
         if "train_multinode_dpo_pipeline" in text or "多机增强训练" in text or "多机dpo" in text:
             return ["train_multinode_dpo_pipeline"]
+        if "train_multinode_sft_full_pipeline" in text or "多机全参" in text or "双机全参" in text or "multinode_full_sft" in text:
+            return ["train_multinode_sft_full_pipeline"]
         if "train_multinode_sft_pipeline" in text or "多机lora批量训练" in text or "多机sft" in text:
             return ["train_multinode_sft_pipeline"]
         if "dpo_train_launcher" in text or "增强训练" in text or "dpo" in text:
@@ -9569,6 +10528,12 @@ class OrchestratorSystem:
 
     def _resolve_evaluate_stop_patterns(self, message: str) -> List[str]:
         text = (message or "").lower()
+        if any(keyword in text for keyword in ["generic_compare_models_eval", "通用双模型"]):
+            return self._with_evaluate_child_patterns(["generic_compare_models_eval"], message)
+        if any(keyword in text for keyword in ["generic_single_model_eval", "通用单模型"]):
+            return self._with_evaluate_child_patterns(["generic_single_model_eval"], message)
+        if any(keyword in text for keyword in ["generic_ckpt_eval", "通用ckpt", "通用checkpoint"]):
+            return self._with_evaluate_child_patterns(["generic_ckpt_eval"], message)
         if any(keyword in text for keyword in ["双模型评估", "双模型", "compare_between_models_vpn"]):
             return self._with_evaluate_child_patterns(["compare_between_models_vpn"], message)
         if any(keyword in text for keyword in ["单模型评估", "单模型", "single_model_evaluation_vpn"]):
@@ -9582,7 +10547,63 @@ class OrchestratorSystem:
             "compare_between_models_vpn",
             "single_model_evaluation_vpn",
             "ckpt_eval",
+            "generic_single_model_eval",
+            "generic_compare_models_eval",
+            "generic_ckpt_eval",
         ], message)
+
+    def _requested_generic_evaluate_script(self, message: str) -> Optional[str]:
+        text = (message or "").lower()
+        if "generic_compare_models_eval" in text or "通用双模型" in text:
+            return "generic_compare_models_eval"
+        if "generic_single_model_eval" in text or "通用单模型" in text:
+            return "generic_single_model_eval"
+        if "generic_ckpt_eval" in text or "通用ckpt" in text or "通用checkpoint" in text:
+            return "generic_ckpt_eval"
+        if "通用评测" in text or "通用评估" in text:
+            return "*"
+        return None
+
+    def _generic_evaluate_pid_record(
+        self,
+        message: str,
+        pid: Optional[str] = None,
+        container: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve generic evaluation stop targets only from the PID registry."""
+        generic_scripts = {
+            "generic_single_model_eval",
+            "generic_compare_models_eval",
+            "generic_ckpt_eval",
+        }
+        requested_script = self._requested_generic_evaluate_script(message)
+        direct = self._lookup_runtime_job_record(pid)
+        if direct and os.path.basename(str(direct.get("script_name") or "")) in generic_scripts:
+            if not container or str(direct.get("container") or "") == str(container):
+                return direct
+        if pid:
+            return None
+
+        recent_text = "\n".join(
+            str((self.last_completed_task or {}).get(key) or "")
+            for key in ("task", "params", "response")
+        )
+        if requested_script is None:
+            requested_script = self._requested_generic_evaluate_script(recent_text)
+        if requested_script is None:
+            return None
+
+        for record in reversed(self._load_runtime_registry_records()):
+            script_name = os.path.basename(str(record.get("script_name") or ""))
+            if script_name not in generic_scripts:
+                continue
+            if requested_script != "*" and script_name != requested_script:
+                continue
+            if container and str(record.get("container") or "") != str(container):
+                continue
+            if str(record.get("pid") or "").isdigit() and record.get("container"):
+                return record
+        return None
 
     def _extract_docker_paths_from_text(self, text: str) -> List[str]:
         paths = []
@@ -9636,6 +10657,25 @@ class OrchestratorSystem:
             return result
 
         has_model_identifiers = bool(path_patterns or model_name_patterns)
+
+        generic_scripts = [
+            name for name in ("generic_single_model_eval", "generic_compare_models_eval", "generic_ckpt_eval")
+            if name in text
+        ]
+        if generic_scripts or "通用评测" in text:
+            worker_patterns = unique([
+                *generic_scripts,
+                "llamafactory-cli eval",
+                "/home/workspace/eval/llamafactory",
+                "/home/workspace/log/llamafactory_eval",
+                *path_patterns,
+                *model_name_patterns,
+            ])
+            return [{
+                "container": container or self.training_container,
+                "patterns": worker_patterns,
+                "label": "LLaMA-Factory通用评测worker",
+            }]
 
         has_single_model_signal = (
             "single_model_evaluation_vpn" in text
@@ -9742,6 +10782,12 @@ class OrchestratorSystem:
             str(record.get(key) or "")
             for key in ("task", "params", "response")
         ).lower()
+        if "generic_compare_models_eval" in text or "通用双模型" in text:
+            return self._with_evaluate_child_patterns(["generic_compare_models_eval"])
+        if "generic_single_model_eval" in text or "通用单模型" in text:
+            return self._with_evaluate_child_patterns(["generic_single_model_eval"])
+        if "generic_ckpt_eval" in text or "通用ckpt" in text or "通用checkpoint" in text:
+            return self._with_evaluate_child_patterns(["generic_ckpt_eval"])
         if "compare_between_models_vpn" in text or "双模型评估" in text or "双模型" in text:
             return self._with_evaluate_child_patterns(["compare_between_models_vpn"])
         if "single_model_evaluation_vpn" in text or "单模型评估" in text or "单模型" in text:
@@ -10469,6 +11515,36 @@ exit 0
                 self.pending_parameters.clear()
                 return f"已发送结束训练指令。\n容器: {container}\nPID: {pid}\n{result}"
 
+            if task_type in {"assessment", "evaluate"}:
+                requested_generic = self._requested_generic_evaluate_script(message)
+                generic_record = self._generic_evaluate_pid_record(message, pid, container)
+                if generic_record:
+                    generic_pid = str(generic_record.get("pid") or "")
+                    generic_container = str(generic_record.get("container") or container or "")
+                    if not generic_pid.isdigit() or not generic_container:
+                        return "通用评测注册记录缺少有效 PID 或容器，无法安全终止任务。"
+                    timeout_task_type = "assessment"
+                    timeout_container = generic_container
+                    timeout_pid = generic_pid
+                    result = self._run_docker_stop(
+                        generic_container,
+                        self._build_stop_by_pid_command(generic_pid),
+                        timeout=45,
+                    )
+                    self._release_stopped_gpu_reservations(
+                        {"assessment", "evaluate"},
+                        generic_container,
+                        pid=generic_pid,
+                    )
+                    self.current_task_state = {"status": "idle"}
+                    self.pending_parameters.clear()
+                    return (
+                        "已按注册 PID/进程组发送结束 LLaMA-Factory 通用评测指令。\n"
+                        f"容器: {generic_container}\nPID: {generic_pid}\n{result}"
+                    )
+                if requested_generic is not None:
+                    return "没有找到该通用评测的注册 PID；为避免误停其他 eval 任务，未执行目录或关键字匹配终止。"
+
             script_patterns = {
                 "assessment": self._resolve_evaluate_stop_patterns(message),
                 "evaluate": self._resolve_evaluate_stop_patterns(message),
@@ -10558,6 +11634,12 @@ exit 0
             "workflow_status"
         )
         context = workflow.get("context") or {}
+        evaluate_stage = (workflow.get("stages") or {}).get("evaluate") or {}
+        evaluate_metrics = (
+            evaluate_stage.get("metrics")
+            if isinstance(evaluate_stage.get("metrics"), dict)
+            else {}
+        )
         train_type = self._normalize_train_type(context.get("train_type"))
         launch_mode = context.get("launch_mode")
         return self._with_protocol(
@@ -10580,6 +11662,12 @@ exit 0
             previousModelName=context.get("old_model_name"),
             benchmark=context.get("benchmark"),
             evaluationDatasetName=context.get("evaluation_dataset_name"),
+            evaluationScope=context.get("evaluation_scope"),
+            evalDatasets=context.get("eval_datasets"),
+            runId=context.get("run_id") or evaluate_stage.get("run_id") or evaluate_metrics.get("run_id"),
+            reportPath=context.get("report_path") or evaluate_stage.get("report_path") or evaluate_metrics.get("report_path"),
+            scores=context.get("scores") or evaluate_stage.get("scores") or evaluate_metrics.get("scores"),
+            scoreDeltas=context.get("score_deltas") or evaluate_stage.get("score_deltas") or evaluate_metrics.get("score_deltas"),
             benchmarkResultEntry=_benchmark_result_entry(workflow),
             error=workflow.get("error"),
         )
@@ -10597,7 +11685,12 @@ exit 0
             "sub_stage", "sub_stage_text", "train_progress_percent",
             "train_current_step", "train_total_steps", "eval_progress_percent",
             "eval_current_step", "eval_total_steps", "export_dir", "merge_status",
+            "finalizing_after_last_step",
             "iteration_finished", "output_log_success", "error_detail",
+            "descriptor_id", "descriptorId", "lifecycle_status", "lifecycleStatus",
+            "primary_metric", "fallback_metrics", "log_root", "log_files",
+            "run_id", "evaluation_scope", "eval_type", "eval_datasets", "models",
+            "scores", "macro_average", "score_deltas", "manifest_path",
             "step_name", "source", "destination", "temp_dir",
             "train_container", "inference_container", "message",
             "report_path", "report_text", "artifacts", "current_stage", "next_stage", "completed_stages",
@@ -10607,6 +11700,7 @@ exit 0
         }
         result_keys = {
             "status", "benchmark_status", "processed", "total", "progress", "progress_percent",
+            "eta_status", "estimated_remaining_seconds", "eta_calculated_at",
             "correct", "accuracy", "invalid", "invalid_rate", "avg_f1",
             "record_only", "executed", "passed", "failed", "timeout", "executor_error", "pass@1",
             "result_entry", "resultEntry", "benchmark_job_id",
@@ -10651,7 +11745,7 @@ exit 0
         benchmark_name = _benchmark_name(workflow)
         labels = {
             "train": self._train_type_text(train_type) or "模型训练",
-            "evaluate": "单模型评估",
+            "evaluate": "LLaMA-Factory 通用评测" if _workflow_evaluation_scope(workflow) == "general" else "医疗单模型评估",
             "publish": "版本化发布",
             "deploy": "推理服务部署",
             "benchmark": f"{benchmark_name}基准评测",
@@ -10679,7 +11773,22 @@ exit 0
             lines.insert(2, f"逻辑标识：`{workflow.get('workflow_key')}`")
         for name in ("train", "evaluate", "publish", "deploy", "benchmark"):
             stage = (workflow.get("stages") or {}).get(name, {})
-            lines.append(f"- {labels[name]}：{statuses.get(stage.get('status'), stage.get('status'))}")
+            stage_status = statuses.get(stage.get("status"), stage.get("status"))
+            stage_metrics = stage.get("metrics") if isinstance(stage.get("metrics"), dict) else {}
+            if (
+                name == "train"
+                and stage.get("status") == "running"
+                and (
+                    stage_metrics.get("merge_status") == "running"
+                    or stage_metrics.get("finalizing_after_last_step") is True
+                    or (
+                        not stage_metrics.get("merge_status")
+                        and stage_metrics.get("sub_stage") == "merge"
+                    )
+                )
+            ):
+                stage_status = "合并/导出中"
+            lines.append(f"- {labels[name]}：{stage_status}")
         details = self._workflow_current_stage_details(workflow)
         if details:
             lines.append("\n当前阶段详情：")
@@ -10982,7 +12091,7 @@ exit 0
         benchmark_name = _benchmark_name(workflow)
         labels = {
             "train": self._train_type_text(train_type) or "模型训练",
-            "evaluate": "单模型评估",
+            "evaluate": "LLaMA-Factory 通用评测" if _workflow_evaluation_scope(workflow) == "general" else "医疗单模型评估",
             "publish": "版本化发布",
             "deploy": "推理服务部署",
             "benchmark": f"{benchmark_name}基准评测",
@@ -11037,6 +12146,14 @@ exit 0
                 if result.get("average") is not None:
                     items.append(f"{stage_name} 平均分 {result.get('average')}")
                     continue
+                nested_averages = [
+                    f"{dataset_name} {dataset_result.get('average')}"
+                    for dataset_name, dataset_result in result.items()
+                    if isinstance(dataset_result, dict) and dataset_result.get("average") is not None
+                ]
+                if nested_averages:
+                    items.append(f"{stage_name}：{'，'.join(nested_averages)}")
+                    continue
                 compact_parts = []
                 for key in ("accuracy", "mean_fuzziness"):
                     if result.get(key) is not None:
@@ -11058,7 +12175,6 @@ exit 0
             name = str(detail.get("name") or "当前子阶段").strip()
             summary = detail.get("progress_summary") if isinstance(detail.get("progress_summary"), dict) else {}
             log_meta = detail.get("progress_log_meta") if isinstance(detail.get("progress_log_meta"), dict) else {}
-            parts: List[str] = []
             step_name = summary.get("step_name")
             step_current = summary.get("step_current")
             step_total = summary.get("step_total")
@@ -11069,27 +12185,19 @@ exit 0
             if step_current is not None and step_total is not None:
                 step_parts.append(f"{step_current}/{step_total}")
             if local_progress is not None:
-                step_parts.append(f"局部进度 {local_progress}%")
+                step_parts.append(f"{local_progress:g}%" if isinstance(local_progress, (int, float)) else f"{local_progress}%")
             if step_parts:
-                parts.append("，".join(step_parts))
-            latest_line = self._workflow_short_display_text(summary.get("latest_line"), limit=120)
-            if latest_line:
-                parts.append(f"最新日志行：{latest_line}")
+                lines.append(f"{name} 局部进度：`{' · '.join(step_parts)}`")
+            else:
+                latest_line = self._workflow_short_display_text(summary.get("latest_line"), limit=120)
+                if latest_line:
+                    lines.append(f"{name} 最新日志：`{latest_line}`")
             updated_at = log_meta.get("updated_at")
             if updated_at:
-                parts.append(f"日志更新时间：{updated_at}")
+                lines.append(f"日志更新时间：`{updated_at}`")
             progress_log = detail.get("progress_log")
             if progress_log:
-                parts.append(f"日志路径：{progress_log}")
-            if parts:
-                lines.append(f"运行中子阶段 {name}：`{'；'.join(str(part) for part in parts)}`")
-            tail_lines = [
-                self._workflow_short_display_text(item, limit=120)
-                for item in (summary.get("tail_lines") or [])[-2:]
-            ]
-            tail_lines = [item for item in tail_lines if item]
-            if tail_lines:
-                lines.append(f"{name} 日志尾部：`{' / '.join(tail_lines)}`")
+                lines.append(f"日志路径：`{progress_log}`")
         return lines
     def _workflow_publish_target_text(self, stage: Dict[str, Any], metrics: Dict[str, Any], context: Dict[str, Any]) -> Any:
         return (
@@ -11134,7 +12242,10 @@ exit 0
     def _workflow_short_display_text(self, value: Any, limit: int = 120) -> Optional[str]:
         if value in (None, "", [], {}):
             return None
-        text = str(value).strip()
+        text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(value))
+        text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", " ", text).strip()
+        if not text:
+            return None
         if len(text) <= limit:
             return text
         return text[:limit].rstrip() + "..."
@@ -11159,13 +12270,27 @@ exit 0
             finalizing_text = self._workflow_train_finalizing_text(workflow, metrics)
             train_type = self._normalize_train_type(context.get("train_type")) or "lora"
             dpo_sub_stage = str(metrics.get("sub_stage") or "").strip().lower()
+            merge_running = (
+                stage.get("status") == "running"
+                and (
+                    metrics.get("merge_status") == "running"
+                    or metrics.get("finalizing_after_last_step") is True
+                    or (not metrics.get("merge_status") and dpo_sub_stage == "merge")
+                )
+            )
             dpo_stage_text = None
             if train_type == "enhanced" and dpo_sub_stage == "evaluation":
                 dpo_stage_text = "训练已完成，正在执行训练后 Evaluation"
             elif train_type == "enhanced" and dpo_sub_stage == "merge":
                 dpo_stage_text = "Evaluation 已完成，正在合并模型"
             add("训练卡号", (context.get("train_args") or {}).get("LOCALHOST_ID"))
-            if dpo_stage_text:
+            if merge_running:
+                add("训练状态", "训练迭代已结束，正在保存/合并模型")
+                add("Merge 状态", "合并/导出中")
+                add("WandB", self._workflow_wandb_display_text(metrics))
+                add("指标来源", metrics.get("loss_source"))
+                add("指标更新时间", self._workflow_metric_update_text(metrics))
+            elif dpo_stage_text:
                 add("训练状态", dpo_stage_text)
                 add("训练 step", self._workflow_step_display_text({
                     "current_step": metrics.get("train_current_step"),
@@ -11214,8 +12339,16 @@ exit 0
             elif context.get("auto_resume_checkpoint_status") == "not_found":
                 add("续训方式", "未检测到可用 checkpoint，将按普通启动流程继续")
         elif stage_name == "evaluate":
+            add("评测范围", context.get("evaluation_scope") or "medical")
+            eval_datasets = context.get("eval_datasets")
+            add("评测集", "、".join(str(item) for item in eval_datasets) if isinstance(eval_datasets, list) else eval_datasets)
+            add("Run ID", metrics.get("run_id") or stage.get("run_id") or context.get("run_id"))
             evaluate_progress = metrics.get("overall_progress_percent")
-            add("进度", evaluate_progress if evaluate_progress is not None else metrics.get("progress_percent"))
+            if evaluate_progress is None:
+                evaluate_progress = metrics.get("progress_percent")
+            if evaluate_progress is not None:
+                progress_text = f"{evaluate_progress:g}" if isinstance(evaluate_progress, (int, float)) else str(evaluate_progress).strip()
+                add("整体进度", progress_text if progress_text.endswith("%") else f"{progress_text}%")
             if metrics.get("completed_stages") is not None and metrics.get("total_stages") is not None:
                 add("阶段进度", f"{metrics.get('completed_stages')}/{metrics.get('total_stages')}")
             current_stages = metrics.get("current_stages")
@@ -11230,8 +12363,8 @@ exit 0
                 add("日志步骤", self._workflow_evaluate_log_step_text(metrics))
             if stage.get("status") == "finished":
                 add("报告路径", metrics.get("report_path") or stage.get("report_path"))
-            else:
-                add("已有评分", self._workflow_evaluate_scores_text(metrics.get("scores")))
+            add("已有评分", self._workflow_evaluate_scores_text(metrics.get("scores")))
+            add("分数差值", self._workflow_json_display_text(metrics.get("score_deltas")))
         elif stage_name == "publish":
             add("模型名称", stage.get("model_name") or stage.get("model_path") or context.get("published_model_path"))
             publish_progress = metrics.get("progress_percent", stage.get("progress_percent", 0))
@@ -11300,6 +12433,14 @@ exit 0
                 else:
                     progress_value = result.get("progress") or progress_percent
                 add("进度", progress_value)
+                eta_status = result.get("eta_status")
+                if eta_status == "available":
+                    add("预计剩余", format_benchmark_remaining(result.get("estimated_remaining_seconds")))
+                elif eta_status == "calculating":
+                    add("预计剩余", "计算中")
+                elif eta_status == "unavailable":
+                    add("预计剩余", "暂不可用")
+                add("任务关联错误", result.get("error"))
                 def percent_text(value):
                     try:
                         if value is None or str(value).strip() == "":
@@ -11421,6 +12562,7 @@ exit 0
     def _workflow_training_context(self, message: str, dataset_ref: str) -> Dict[str, Any]:
         requested_train_type = self._infer_train_type(message)
         benchmark_name = self._extract_workflow_benchmark_name(message)
+        evaluation_context = self._workflow_evaluation_context(message)
         launch_mode = "multinode" if self._is_multinode_training_request(message) else "single"
         container = self._extract_container_override(message)
         request_container = container or (
@@ -11430,19 +12572,30 @@ exit 0
         )
         batch_path = f"/home/workspace/dataset_batch_train/{dataset_ref}"
         daily_path = f"/home/workspace/dataset_daily_train/{dataset_ref}"
+        pretrain_path = f"/home/workspace/dataset_pretrain/{dataset_ref}"
 
         # A bare dataset identifier does not carry its training family. Locate it
-        # first so one-click workflows route SFT to LoRA and DPO to enhanced
-        # training instead of unconditionally defaulting to LoRA.
+        # first so one-click workflows route SFT to LoRA, DPO to enhanced
+        # training, and PT/text to LoRA PT instead of guessing from precedence.
         if requested_train_type is None:
             batch_exists = self._docker_path_exists(request_container, batch_path)
             daily_exists = self._docker_path_exists(request_container, daily_path)
             pretrain_exists = self._docker_path_exists(request_container, pretrain_path)
-            if batch_exists is True and daily_exists is True and pretrain_exists is not True:
+            existing_families = [
+                ("SFT", batch_path, "lora训练或全参训练") if batch_exists is True else None,
+                ("DPO", daily_path, "增强训练") if daily_exists is True else None,
+                ("PT/text", pretrain_path, "LoRA预训练或全参预训练") if pretrain_exists is True else None,
+            ]
+            existing_families = [family for family in existing_families if family is not None]
+            if len(existing_families) > 1:
+                family_details = "；".join(
+                    f"{family}: {path}（适用于{training}）"
+                    for family, path, training in existing_families
+                )
                 raise ValueError(
-                    "同一数据标识同时存在于 SFT 和 DPO 目录，无法安全判断训练类型："
-                    f"{batch_path}；{daily_path}。"
-                    "请明确指定 lora训练 或 增强训练。"
+                    "同一数据标识同时存在于多个训练数据目录，无法安全判断训练类型："
+                    f"{family_details}。"
+                    "请明确指定 lora训练、增强训练或 LoRA预训练。"
                 )
             if batch_exists is True:
                 train_type = "lora"
@@ -11466,14 +12619,22 @@ exit 0
                 "pretrain_full": "batch_train_pretrain_full",
             }.get(train_type, "batch_train_lora")
             dataset_path = pretrain_path if train_type in {"pretrain_lora", "pretrain_full"} else batch_path
+            train_args = self._workflow_batch_train_args(message)
+            preflight_env = {
+                "DATASET_DIR": dataset_path,
+                "DATASET_DATE": dataset_ref,
+                **train_args,
+            }
             validation_issue = validate_training_inputs_preflight(
                 train_script,
                 request_container,
-                {"DATASET_DIR": dataset_path, "DATASET_DATE": dataset_ref},
+                preflight_env,
+                require_template=False,
             )
             if validation_issue:
                 raise ValueError(str(validation_issue["message"]))
             context = {
+                **evaluation_context,
                 "train_type": train_type,
                 "benchmark": benchmark_name,
                 "evaluation_dataset_name": benchmark_name,
@@ -11483,7 +12644,7 @@ exit 0
                 "multinode_training_container": self.multinode_training_container,
                 "resource_group_id": _current_resource_group_id().strip(),
                 "training_pool_id": _current_training_pool_id().strip(),
-                "train_args": self._workflow_batch_train_args(message),
+                "train_args": train_args,
             }
             if launch_mode == "multinode":
                 context["launch_mode"] = "multinode"
@@ -11505,6 +12666,7 @@ exit 0
         if not model_path:
             raise ValueError("无法自动确定增强训练基础模型。请在口令中补充 model_path=<模型路径>。")
         context =  {
+            **evaluation_context,
             "train_type": "enhanced",
             "benchmark": benchmark_name,
             "evaluation_dataset_name": benchmark_name,
@@ -11532,6 +12694,7 @@ exit 0
                 "dataset_dir": dataset_dir,
                 "dataset_name": dataset_name,
             },
+            require_template=False,
         )
         if validation_issue:
             raise ValueError(str(validation_issue["message"]))
@@ -11715,13 +12878,24 @@ exit 0
         resource_context = _workflow_context_inference_resource_context(context)
 
         status_result = await self._workflow_inference_event("查看推理服务状态", workflow, stage_name)
-        if _workflow_inference_service_matches_resource(
+        target = _workflow_target_service_instance(
+            status_result, str(context.get("published_model_path") or "")
+        )
+        if target is not None and str(target.get("status") or "").lower() == "running" and _workflow_inference_service_matches_resource(
             status_result,
             resource_context,
             resource_group_id=resource_group_id,
             training_pool_id=training_pool_id,
+            target_model_path=str(context.get("published_model_path") or ""),
         ):
             return status_result
+
+        if str((target or {}).get("status") or "").lower() == "starting":
+            return {"waiting_service": True, "success": True}
+        if str((target or {}).get("status") or "").lower() == "failed":
+            raise RuntimeError(
+                "推理服务启动失败：" + str(target.get("error") or f"instance_id={target.get('instance_id', '')}")
+            )
 
         restarted = await self._workflow_inference_event("重启推理服务", workflow, stage_name)
         if not restarted.get("success"):
@@ -11738,6 +12912,7 @@ exit 0
                 resource_context,
                 resource_group_id=resource_group_id,
                 training_pool_id=training_pool_id,
+                target_model_path=str(context.get("published_model_path") or ""),
             ):
                 return check
         raise RuntimeError("推理服务启动超时，请检查容器日志和资源配置")
@@ -11799,13 +12974,24 @@ exit 0
             return bool(updated and updated.get("status") == "running")
         if event_type == "start_evaluate":
             model_fir = workflow["context"]["trained_model_path"]
+            evaluation_scope = _workflow_evaluation_scope(workflow)
+            evaluation_script = _workflow_evaluation_script(workflow)
+            eval_datasets = _workflow_eval_datasets(workflow)
+            run_id = _workflow_evaluation_run_id(workflow) if evaluation_scope == "general" else None
             manager.activate_worker_for(workflow["workflow_id"])
             if not mark_external_starting():
                 return
-            task = (
-                "执行单模型评估。不要询问评估类型，立即调用单模型评估工具。"
-                f"必须使用 model_fir={model_fir}。"
-            )
+            if evaluation_scope == "general":
+                task = (
+                    "执行通用单模型评测，立即调用 generic_single_model_eval。"
+                    f"必须使用 model_fir={model_fir}，evaluation_scope=general，"
+                    f"eval_datasets={','.join(eval_datasets)}，run_id={run_id}。"
+                )
+            else:
+                task = (
+                    "执行医疗单模型评测，立即调用 single_model_evaluation_vpn。"
+                    f"必须使用 model_fir={model_fir}，evaluation_scope=medical。"
+                )
             previous_child_context = self._workflow_child_context
             self._workflow_child_context = {
                 "workflow_id": workflow["workflow_id"],
@@ -11822,7 +13008,10 @@ exit 0
                 str((workflow.get("context") or {}).get("training_pool_id") or "").strip()
             )
             try:
-                result = self._workflow_trainer_result(await self._call_evaluator(task))
+                result = self._workflow_trainer_result(await self._call_evaluator(
+                    task,
+                    __skip_launch_confirmation=True,
+                ))
             finally:
                 REQUEST_TRAINING_POOL_ID.reset(training_pool_token)
                 REQUEST_RESOURCE_GROUP_ID.reset(resource_group_token)
@@ -11830,13 +13019,31 @@ exit 0
                 REQUEST_TRAINING_CONTAINER.reset(training_container_token)
                 self._workflow_child_context = previous_child_context
             require_running()
+            if result.get("failed"):
+                raise RuntimeError(result.get("display") or "evaluator 启动评测失败")
             if not result.get("pid") or not result.get("container"):
                 raise RuntimeError(result.get("display") or "evaluator 未返回评估 PID 或容器名称")
+            protocol = result.get("protocol") if isinstance(result.get("protocol"), dict) else {}
+            if evaluation_scope == "general":
+                actual_script = str(protocol.get("scriptName") or protocol.get("script") or "").strip()
+                actual_run_id = str(protocol.get("runId") or "").strip()
+                if actual_script != evaluation_script or actual_run_id != run_id:
+                    raise RuntimeError("evaluator 未按当前工作流的通用评测脚本或 run_id 启动任务")
+            report_path = f"/home/workspace/eval/llamafactory/{run_id}/summary.txt" if run_id else None
             workflow = manager.record_running_stage(
                 workflow["workflow_id"],
                 pid=result["pid"],
                 container=result["container"],
                 message=result["display"],
+                script_name=evaluation_script,
+                evaluation_scope=evaluation_scope,
+                eval_datasets=eval_datasets,
+                run_id=run_id,
+                report_path=report_path,
+                context_updates={
+                    "run_id": run_id,
+                    "report_path": report_path,
+                },
             )
             manager.activate_worker_for(workflow["workflow_id"])
             await push_workflow_update(workflow, started=True)
@@ -11871,7 +13078,14 @@ exit 0
             if config_matches_target:
                 checked = await self._workflow_inference_event("查看推理服务状态", workflow, "deploy")
                 require_running()
-                all_running = checked.get("all_running") is True
+                target = _workflow_target_service_instance(checked, published_path)
+                all_running = _workflow_inference_service_matches_resource(
+                    checked,
+                    _workflow_context_inference_resource_context(workflow.get("context") or {}),
+                    resource_group_id=str((workflow.get("context") or {}).get("resource_group_id") or "").strip(),
+                    training_pool_id=str((workflow.get("context") or {}).get("training_pool_id") or "").strip(),
+                    target_model_path=published_path,
+                ) and target is not None and str(target.get("status") or "").lower() == "running"
                 if all_running:
                     manager.record_finished_stage(
                         workflow["workflow_id"],
@@ -11885,6 +13099,25 @@ exit 0
                         **_workflow_stage_log_fields(workflow, "deploy"),
                     )
                     workflow = manager.advance(workflow["workflow_id"])
+                    await push_workflow_update(workflow)
+                    return
+                if target is not None and str(target.get("status") or "").lower() == "starting":
+                    workflow = manager.record_running_stage(
+                        workflow["workflow_id"],
+                        model_name=model_name,
+                        model_path=published_path,
+                        config_update_skipped=True,
+                        deployment_step="waiting_service",
+                        deploy_progress="4/4",
+                        service_checked=True,
+                        all_running=False,
+                        service_wait_started_at=time.time(),
+                        service_wait_instance_id=str(target.get("instance_id") or ""),
+                        next_service_check_at=time.time() + config.workflow.poll_interval,
+                        service_log_command="查看推理服务日志",
+                        message="目标模型仍在加载，等待服务就绪",
+                    )
+                    manager.activate_worker_for(workflow["workflow_id"])
                     await push_workflow_update(workflow)
                     return
                 workflow = manager.record_running_stage(
@@ -11919,6 +13152,8 @@ exit 0
                     all_running=False,
                     deployment_step="waiting_service",
                     deploy_progress="4/4",
+                    service_wait_started_at=time.time(),
+                    service_wait_instance_id="",
                     next_service_check_at=time.time() + config.workflow.poll_interval,
                     service_log_command="查看推理服务日志",
                     message="推理服务重启命令已提交，等待服务全部运行",
@@ -11981,6 +13216,8 @@ exit 0
                     all_running=False,
                     deployment_step="waiting_service",
                     deploy_progress="4/4",
+                    service_wait_started_at=time.time(),
+                    service_wait_instance_id="",
                     next_service_check_at=time.time() + config.workflow.poll_interval,
                     service_log_command="查看推理服务日志",
                     message="推理服务重启命令已提交，等待服务全部运行",
@@ -12008,7 +13245,12 @@ exit 0
                 workflow.get("workflow_id"),
                 start_command,
             )
-            await self._workflow_ensure_benchmark_inference_ready_event(workflow, "benchmark")
+            ready = await self._workflow_ensure_benchmark_inference_ready_event(workflow, "benchmark")
+            if ready.get("waiting_service"):
+                workflow = manager.defer_benchmark_for_service(workflow["workflow_id"])
+                manager.activate_worker_for(workflow["workflow_id"])
+                await push_workflow_update(workflow)
+                return
             require_running()
             result = await self._workflow_inference_event(start_command, workflow, "benchmark")
             logger.debug(
@@ -12026,6 +13268,8 @@ exit 0
                 "status": result.get("status") or "running",
                 "message": result.get("text"),
                 "commands": result.get("commands"),
+                "protocol": result.get("protocol"),
+                "resource_context": result.get("resource_context"),
                 "result_entry": _benchmark_result_entry(workflow),
             })
             if benchmark_result.get("status_command") and not benchmark_result.get("log_command"):

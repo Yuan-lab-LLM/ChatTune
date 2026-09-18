@@ -3,6 +3,7 @@ import { KeyRoundIcon, LogOutIcon } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import AuthBrand from '@/components/AuthBrand';
 import { useAuth } from '@/context/AuthContext';
 import { translateAuthError } from '@/utils/authErrors';
 
@@ -40,17 +41,12 @@ const ForcePasswordChangePage = () => {
         <main className="auth-page">
             <div className="auth-page-backdrop" aria-hidden="true" />
             <section className="auth-panel">
-                <div className="auth-brand">
-                    <div className="auth-brand-mark">M</div>
-                    <div className="auth-brand-copy">
-                        <h1>{t('auth.forcePasswordChangeTitle')}</h1>
-                        <p>
-                            {t('auth.forcePasswordChangeDescription', {
-                                username: user?.username ?? '',
-                            })}
-                        </p>
-                    </div>
-                </div>
+                <AuthBrand
+                    title={t('auth.forcePasswordChangeTitle')}
+                    description={t('auth.forcePasswordChangeDescription', {
+                        username: user?.username ?? '',
+                    })}
+                />
 
                 <form className="auth-form" onSubmit={handleSubmit}>
                     <label>
@@ -102,7 +98,7 @@ const ForcePasswordChangePage = () => {
                         </div>
                     </label>
 
-                    {error && <div className="auth-error">{error}</div>}
+                    {error && <div className="auth-error" role="alert">{error}</div>}
 
                     <Button type="submit" className="auth-submit" disabled={submitting}>
                         <KeyRoundIcon className="size-4" />
@@ -110,7 +106,7 @@ const ForcePasswordChangePage = () => {
                             ? t('auth.changingPassword')
                             : t('auth.forcePasswordChangeSubmit')}
                     </Button>
-                    <Button type="button" variant="ghost" onClick={() => void logout()}>
+                    <Button type="button" variant="ghost" className="auth-secondary" onClick={() => void logout()}>
                         <LogOutIcon className="size-4" />
                         {t('auth.logout')}
                     </Button>

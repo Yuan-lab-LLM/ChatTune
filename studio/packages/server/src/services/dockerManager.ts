@@ -18,7 +18,7 @@ const DATASET_DATA_EXTENSIONS: Record<DatasetType, string[]> = {
     raw: ['.json'],
     sft: ['.json'],
     dpo: ['.json'],
-    pt: ['.json', '.jsonl', '.txt'],
+    pt: ['.json'],
 };
 
 const datasetFileMatchesType = (filename: string, datasetType: DatasetType): boolean => {
@@ -89,6 +89,21 @@ interface ModelDirectorySummary {
     checkpoints?: string[];
 }
 
+type ModelArtifactType = 'base' | 'adapter' | 'merged' | 'checkpoint' | 'inference' | 'reward' | 'custom';
+
+const modelArtifactTypes = (
+    legacyType: string,
+    modelPath: string,
+    summary: ModelDirectorySummary,
+): ModelArtifactType[] => {
+    if (legacyType === 'base_train') return ['base'];
+    if (legacyType === 'inference') return ['inference'];
+    const isDpoExport = modelPath === DPO_MODEL_PATHS.export;
+    const isMergedDirectory = /(?:^|[_-])merged$/i.test(summary.name);
+    if (isDpoExport || isMergedDirectory) return ['merged'];
+    return summary.checkpoints?.length ? ['adapter', 'checkpoint'] : ['adapter'];
+};
+
 interface MedicalTestSummary {
     filename: string;
     size?: string;
@@ -103,6 +118,8 @@ export interface ModelInfo {
     path: string;
     merged?: boolean;
     checkpoints?: string[];
+    artifactType?: ModelArtifactType;
+    artifactTypes?: ModelArtifactType[];
     size?: string;
     createdAt?: string;
 }
@@ -1175,15 +1192,20 @@ export class DockerManager {
             type: string,
             modelPath: string,
             summary: ModelDirectorySummary,
-        ): ModelInfo => ({
-            name: summary.name,
-            type,
-            path: modelPath,
-            merged: summary.merged,
-            checkpoints: summary.checkpoints,
-            size: summary.size,
-            createdAt: summary.modifiedTime,
-        });
+        ): ModelInfo => {
+            const artifactTypes = modelArtifactTypes(type, modelPath, summary);
+            return {
+                name: summary.name,
+                type,
+                path: modelPath,
+                merged: summary.merged,
+                checkpoints: summary.checkpoints,
+                artifactType: artifactTypes[0],
+                artifactTypes,
+                size: summary.size,
+                createdAt: summary.modifiedTime,
+            };
+        };
 
         const [
             baseSummaries,
@@ -1239,6 +1261,8 @@ export class DockerManager {
             name: summary.name,
             type: 'grpo_base',
             path: GRPO_MODEL_PATH,
+            artifactType: 'checkpoint' as const,
+            artifactTypes: ['checkpoint', 'reward'] as ModelArtifactType[],
             size: summary.size,
             createdAt: summary.modifiedTime,
         }));
@@ -1623,7 +1647,7 @@ export class DockerManager {
     /**
      * 检查数据集格式
      * - 检查是否有子目录（要求扁平结构）
-     * - SFT/DPO 检查是否只包含 .json 文件，PT 允许 .json/.jsonl/.txt
+     * - Raw/SFT/DPO/PT 检查是否只包含 .json 文件
      * - SFT/DPO/PT 检查是否包含 dataset_info.json（仅警告）
      * @returns { valid: boolean, message?: string, warning?: string }
      */
@@ -1688,8 +1712,7 @@ export class DockerManager {
             // 只显示前 10 个不符合要求的文件
             const displayFiles = invalidFiles.slice(0, 10);
             const moreCount = invalidFiles.length > 10 ? ` 等共${invalidFiles.length}个文件` : '';
-            const allowedText = datasetType === 'pt' ? '.json/.jsonl/.txt' : '.json';
-            errors.push(`检测到不支持的文件：${displayFiles.join(', ')}${moreCount}\n该类型数据集只能包含 ${allowedText} 格式的数据文件`);
+            errors.push(`检测到不支持的文件：${displayFiles.join(', ')}${moreCount}\n该类型数据集只能包含 .json 格式的数据文件`);
         }
         
         // raw 原始数据不要求 dataset_info.json；SFT/DPO 缺失时仅提示警告。

@@ -19,10 +19,11 @@ INIT_CENTER_URL=""
 INIT_AGENT_URL=""
 INIT_IPHOST=""
 INIT_FORCE=false
+ADMIN_USERNAME=""
 
 usage() {
   cat <<'EOF'
-Usage: bash runtime.sh [options] {init|start|stop|restart|status|logs|check|doctor}
+Usage: bash runtime.sh [options] {init|start|stop|restart|status|logs|check|doctor|reset-admin-password}
 
 Options:
   --env-file PATH   Load a specific runtime env file.
@@ -34,6 +35,7 @@ Options:
   --agent-url URL   Node init local Agent API URL. Defaults to http://<node-host>:8099.
   --iphost HOST     Single init host used for non-model local URLs. Defaults to 127.0.0.1.
   --force           Init: overwrite an existing env file.
+  --username NAME   Reset: existing administrator username to reset.
   --foreground      Run the selected service in the foreground when possible.
   --no-studio       Center start: do not start Studio.
   --no-bridge       Center start: do not start Bridge.
@@ -46,6 +48,7 @@ Examples:
   bash runtime.sh check
   bash runtime.sh --env-file runtime.node.env start
   bash runtime.sh logs agent
+  bash runtime.sh reset-admin-password --username admin
 EOF
 }
 
@@ -87,6 +90,14 @@ while [[ $# -gt 0 ]]; do
       INIT_FORCE=true
       shift
       ;;
+    --username)
+      if [[ $# -lt 2 || "$2" == --* ]]; then
+        echo "Missing value for --username."
+        exit 1
+      fi
+      ADMIN_USERNAME="$2"
+      shift 2
+      ;;
     --foreground)
       FOREGROUND=true
       shift
@@ -103,7 +114,7 @@ while [[ $# -gt 0 ]]; do
       usage
       exit 0
       ;;
-    init|start|stop|restart|status|logs|check|doctor)
+    init|start|stop|restart|status|logs|check|doctor|reset-admin-password)
       ACTION="$1"
       shift
       if [[ "$ACTION" == "logs" && $# -gt 0 && "$1" != --* ]]; then
@@ -171,6 +182,9 @@ START_LOCAL_AGENT="${START_LOCAL_AGENT:-false}"
 RUNTIME_STOP_TIMEOUT_SECONDS="${RUNTIME_STOP_TIMEOUT_SECONDS:-5}"
 MEDFLOW_STUDIO_RUNTIME_TOKEN="${MEDFLOW_STUDIO_RUNTIME_TOKEN:-}"
 export MEDFLOW_STUDIO_RUNTIME_TOKEN
+INFERENCE_OPS_AUTH_MODE="${INFERENCE_OPS_AUTH_MODE:-trusted_network}"
+INFERENCE_OPS_AUTH_MODE="${INFERENCE_OPS_AUTH_MODE,,}"
+export INFERENCE_OPS_AUTH_MODE
 
 if [[ "$ACTION" != "init" ]]; then
   mkdir -p "$LOG_DIR" "$DATA_DIR"
@@ -311,6 +325,7 @@ MODEL_NAME=replace-model-name
 MODEL_API_KEY=empty
 MODEL_BASE_URL=http://127.0.0.1:7000/v1
 INFERENCE_AGENT_URL=http://127.0.0.1:8899/inference_agent
+INFERENCE_OPS_AUTH_MODE=trusted_network
 
 # Network entry points. Keep 127.0.0.1 only for same-host local debugging.
 STUDIO_PUBLIC_URL=http://$single_host:5173
@@ -405,6 +420,7 @@ MODEL_NAME=replace-model-name
 MODEL_API_KEY=empty
 MODEL_BASE_URL=http://<llm-host>:<llm-port>/v1
 INFERENCE_AGENT_URL=http://<inference-agent-host>:8899/inference_agent
+INFERENCE_OPS_AUTH_MODE=trusted_network
 
 # Generated shared credentials. Copy these to every node env where required.
 MEDFLOW_STUDIO_RUNTIME_TOKEN=$studio_token
@@ -480,6 +496,7 @@ MODEL_NAME=replace-model-name
 MODEL_API_KEY=empty
 MODEL_BASE_URL=http://<llm-host>:<llm-port>/v1
 INFERENCE_AGENT_URL=http://<inference-agent-host>:8899/inference_agent
+INFERENCE_OPS_AUTH_MODE=trusted_network
 EOF
     write_common_runtime_defaults
   } >"$ENV_FILE"
@@ -795,12 +812,30 @@ validate_common() {
     exit 1
   fi
   require_value MEDFLOW_AGENT_API_TOKEN
+  case "$INFERENCE_OPS_AUTH_MODE" in
+    trusted_network)
+      if [[ -n "${INFERENCE_OPS_API_TOKEN:-}" ]]; then
+        echo "Warning: INFERENCE_OPS_API_TOKEN is ignored because INFERENCE_OPS_AUTH_MODE=trusted_network."
+      fi
+      ;;
+    token)
+      require_value INFERENCE_OPS_API_TOKEN
+      ;;
+    *)
+      echo "INFERENCE_OPS_AUTH_MODE must be trusted_network or token."
+      exit 1
+      ;;
+  esac
   if [[ -n "${MEDFLOW_RESOURCE_API_TOKEN:-}" && "$MEDFLOW_AGENT_API_TOKEN" == "$MEDFLOW_RESOURCE_API_TOKEN" ]]; then
     echo "MEDFLOW_AGENT_API_TOKEN must differ from MEDFLOW_RESOURCE_API_TOKEN."
     exit 1
   fi
   if [[ "$MEDFLOW_AGENT_API_TOKEN" == "$MEDFLOW_STUDIO_RUNTIME_TOKEN" ]]; then
     echo "MEDFLOW_AGENT_API_TOKEN must differ from MEDFLOW_STUDIO_RUNTIME_TOKEN."
+    exit 1
+  fi
+  if [[ "$INFERENCE_OPS_AUTH_MODE" == "token" && ( "${INFERENCE_OPS_API_TOKEN:-}" == "$MEDFLOW_AGENT_API_TOKEN" || "${INFERENCE_OPS_API_TOKEN:-}" == "$MEDFLOW_STUDIO_RUNTIME_TOKEN" || ( -n "${MEDFLOW_RESOURCE_API_TOKEN:-}" && "${INFERENCE_OPS_API_TOKEN:-}" == "$MEDFLOW_RESOURCE_API_TOKEN" ) ) ]]; then
+    echo "INFERENCE_OPS_API_TOKEN must be distinct from Agent, Studio runtime, and resource API tokens."
     exit 1
   fi
   validate_runtime_env_consistency
@@ -922,6 +957,37 @@ case "$ACTION" in
   restart)
     bash "$ROOT_DIR/runtime.sh" --env-file "$ENV_FILE" --role "$RUNTIME_ROLE" stop
     bash "$ROOT_DIR/runtime.sh" --env-file "$ENV_FILE" --role "$RUNTIME_ROLE" start
+    ;;
+  reset-admin-password)
+    if [[ "$RUNTIME_ROLE" != "center" ]]; then
+      echo "Administrator password reset must run on the center server."
+      exit 1
+    fi
+    if [[ -z "$ADMIN_USERNAME" ]]; then
+      echo "Missing --username for reset-admin-password."
+      exit 1
+    fi
+    if [[ -z "${MEDFLOW_ADMIN_PASSWORD:-}" ]]; then
+      echo "Set MEDFLOW_ADMIN_PASSWORD in $ENV_FILE before resetting the administrator password."
+      exit 1
+    fi
+    if is_running studio; then
+      echo "Stop Studio before resetting the administrator password: bash runtime.sh stop"
+      exit 1
+    fi
+    if ! check_port_free Studio "$STUDIO_HOST" "$STUDIO_PORT"; then
+      echo "Studio may still be running. Stop it before resetting the administrator password."
+      exit 1
+    fi
+    if [[ -n "${MEDFLOW_DATABASE_PATH:-}" && "$MEDFLOW_DATABASE_PATH" != /* ]]; then
+      MEDFLOW_DATABASE_PATH="$ROOT_DIR/studio/packages/server/$MEDFLOW_DATABASE_PATH"
+    fi
+    prepare_studio_database
+    if [[ ! -f "$MEDFLOW_DATABASE_PATH" ]]; then
+      echo "Studio database not found: $MEDFLOW_DATABASE_PATH"
+      exit 1
+    fi
+    (cd "$ROOT_DIR/studio" && "$NPM_BIN" run reset-admin-password --workspace=packages/server -- --username "$ADMIN_USERNAME")
     ;;
   status)
     show_status

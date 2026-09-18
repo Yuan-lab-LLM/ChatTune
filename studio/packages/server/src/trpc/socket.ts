@@ -748,7 +748,7 @@ export class SocketManager {
                   data.runData = {
                     ...data.runData,
                     project: "",
-                    name: "MedFlow 智能服务",
+                    name: "ChatTune 智能服务",
                     timestamp: "",
                     run_dir: "",
                     pid: 0,
@@ -1997,7 +1997,7 @@ export class SocketManager {
     void this.emitToRunMembers(runId, SocketEvents.server.pushRunData, runData, {
       ...runData,
       project: "",
-      name: "MedFlow 智能服务",
+      name: "ChatTune 智能服务",
       timestamp: "",
       run_dir: "",
       pid: 0,

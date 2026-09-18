@@ -6,7 +6,7 @@
     "start-backend": "请启动后端程序后刷新"
   },
   "auth": {
-    "loginHint": "请使用管理员创建的账号登录",
+    "loginDescription": "登录后继续使用 ChatTune Studio。",
     "username": "用户名",
     "password": "密码",
     "login": "登录",
@@ -170,12 +170,217 @@
     "privateResource": "私有资源",
     "noPrivateResources": "暂无私有资源。",
     "reviewingPublication": "审批中...",
+    "publicationPendingTitle": "待审批",
+    "publicationHistoryTitle": "审批历史",
+    "publicationRequester": "申请人",
+    "publicationPublishedDirectly": "管理员直接发布",
+    "noPendingPublicationRequests": "暂无待审批发布申请。",
+    "noPublicationReviewHistory": "暂无发布审批历史。",
+    "publicationColumnTime": "时间",
+    "publicationColumnRequester": "申请人/操作人",
+    "publicationColumnResource": "资源",
+    "publicationColumnNode": "节点",
+    "publicationColumnContainer": "容器",
+    "publicationColumnResult": "结果",
+    "publicationColumnReviewer": "审批人",
+    "publicationColumnNote": "备注",
+    "publicationStatus": {
+      "pending": "待审批",
+      "approved": "已批准",
+      "rejected": "已拒绝"
+    },
     "noRegisteredResources": "暂无已登记资源。",
     "recentResourceAudit": "最近资源审计",
     "auditLogTitle": "审计日志",
     "auditLogDescription": "查看管理员操作、资源发布、资源写入和权限相关事件。",
     "systemActor": "系统",
     "noAuditRecords": "暂无审计记录。",
+    "auditActor": "操作者",
+    "auditTarget": "对象",
+    "auditResourceId": "资源 ID",
+    "auditResourceCount": "{{count}} 个资源",
+    "auditNoDetails": "暂无更多明细。",
+    "auditSensitiveValue": "已隐藏",
+    "auditSearch": "搜索",
+    "auditSearchPlaceholder": "事件、用户、资源或明细",
+    "auditEventType": "事件类型",
+    "auditAllEventTypes": "全部事件",
+    "auditAllResults": "全部结果",
+    "auditAllModules": "全部模块",
+    "auditAllLevels": "全部级别",
+    "auditAllOperationTypes": "全部操作类型",
+    "auditHorizontalScroll": "审计日志表格横向滚动",
+    "auditActorId": "操作者 ID",
+    "auditActorIdPlaceholder": "用户 ID",
+    "auditResourceIdPlaceholder": "资源 ID",
+    "auditStartAt": "开始时间",
+    "auditEndAt": "结束时间",
+    "auditDateFormatHint": "格式：YYYY/MM/DD HH:mm",
+    "auditLimit": "条数",
+    "auditExportFormat": "格式",
+    "auditExport": "导出",
+    "auditExporting": "导出中...",
+    "auditExportSuccess": "审计记录已导出",
+    "auditExportFailed": "审计记录导出失败",
+    "auditAdvancedFilters": "高级",
+    "auditClearFilters": "清空",
+    "auditColumnTime": "操作时间",
+    "auditColumnActor": "操作人",
+    "auditColumnGroup": "用户组",
+    "auditColumnObject": "操作对象",
+    "auditColumnContent": "操作内容",
+    "auditColumnResult": "操作结果",
+    "auditColumnModule": "功能模块",
+    "auditColumnLevel": "日志级别",
+    "auditColumnType": "操作类型",
+    "auditColumnDataId": "数据ID",
+    "auditColumnDetails": "明细",
+    "auditToggleDetails": "展开明细",
+    "auditDetailSummary": "变更字段",
+    "auditDetailBefore": "变更前",
+    "auditDetailAfter": "变更后",
+    "auditDetailRaw": "原始明细",
+    "auditEnabled": "启用",
+    "auditDisabled": "禁用",
+    "auditResults": {
+      "success": "成功",
+      "warning": "需关注",
+      "failure": "失败"
+    },
+    "auditLevels": {
+      "low": "低",
+      "medium": "中",
+      "high": "高"
+    },
+    "auditObjects": {
+      "user": "用户",
+      "resource": "资源",
+      "resourceGroup": "用户组",
+      "trainingPool": "GPU 资源池",
+      "trainingQuota": "GPU 配额",
+      "trainingReservation": "GPU 预约",
+      "publicationRequest": "发布申请",
+      "systemObject": "系统对象"
+    },
+    "auditModules": {
+      "auth": "身份与访问管理",
+      "resource": "资源管理",
+      "resourceGroup": "用户组资源管理",
+      "trainingResource": "训练资源管理",
+      "inferenceAdmin": "推理管理",
+      "other": "其他"
+    },
+    "auditContent": {
+      "userCreated": "创建用户 {{target}}，角色为 {{role}}，用户组为 {{group}}",
+      "passwordReset": "重置用户 {{target}} 的密码，并要求下次登录修改密码",
+      "roleUpdated": "更新用户 {{target}} 的角色：{{changes}}",
+      "userStatusChanged": "将用户 {{target}} 状态设置为 {{status}}",
+      "sessionsRevoked": "撤销用户 {{target}} 的登录会话",
+      "userDeleted": "删除用户 {{target}}",
+      "userMoved": "移动用户 {{target}} 的用户组：{{changes}}",
+      "groupNodeSet": "将用户组 {{group}} 绑定到节点 {{node}}",
+      "groupContainerSet": "设置用户组 {{group}} 的容器为 {{container}}。{{changes}}",
+      "poolNodesSet": "设置资源池 {{pool}} 的节点：{{nodes}}",
+      "quotaSet": "设置用户组 {{group}} 在资源池 {{pool}} 的训练配额：{{changes}}",
+      "quotaDeleted": "删除用户组 {{group}} 在资源池 {{pool}} 的训练配额",
+      "resourceWrite": "写入 {{bizType}} 资源 {{itemKey}}，容器 {{container}}，节点 {{node}}",
+      "resourceDelete": "删除 {{bizType}} 资源 {{itemKey}}，容器 {{container}}，节点 {{node}}",
+      "resourcePublished": "发布 {{count}} 为公共资源",
+      "publicationRequested": "申请发布资源 {{target}}",
+      "publicationApproved": "批准资源 {{target}} 的发布申请",
+      "publicationRejected": "拒绝资源 {{target}} 的发布申请，备注：{{note}}"
+    },
+    "auditSources": {
+      "admin": "管理员",
+      "user": "用户",
+      "runtime": "Runtime",
+      "system": "系统"
+    },
+    "auditEvents": {
+      "resource_write": "资源写入",
+      "resource_delete": "资源删除",
+      "resource_published": "资源发布",
+      "publication_requested": "申请资源发布",
+      "publication_approved": "批准资源发布",
+      "publication_rejected": "拒绝资源发布",
+      "admin_user_created": "创建用户",
+      "admin_user_role_updated": "更新用户角色",
+      "admin_user_password_reset": "重置用户密码",
+      "admin_user_disabled_set": "设置用户状态",
+      "admin_user_sessions_revoked": "撤销用户会话",
+      "admin_user_deleted": "删除用户",
+      "admin_user_resource_group_moved": "移动用户组",
+      "admin_resource_group_created": "创建用户组",
+      "admin_resource_group_deleted": "删除用户组",
+      "admin_resource_group_container_set": "设置训练 Docker",
+      "admin_resource_group_evaluate_container_set": "设置评测 Docker",
+      "admin_resource_group_grpo_container_set": "设置 GRPO Docker",
+      "admin_resource_group_multinode_container_set": "设置多机训练 Docker",
+      "admin_resource_group_node_set": "设置用户组节点",
+      "admin_resource_group_containers_validated": "重新校验用户组 Docker",
+      "admin_training_pool_upserted": "保存训练资源池",
+      "admin_training_pool_status_changed": "设置训练资源池状态",
+      "admin_training_pool_nodes_set": "设置训练资源池节点",
+      "admin_training_group_quota_set": "设置训练配额",
+      "admin_training_group_quota_deleted": "删除训练配额",
+      "admin_training_resources_reserved": "管理员预约训练资源",
+      "admin_training_resources_released": "管理员释放训练资源",
+      "admin_training_resources_stop_and_released": "停止并释放训练资源",
+      "training_reservation_created": "创建训练资源预约",
+      "training_reservation_released": "释放训练资源预约",
+      "training_reservation_force_released": "强制释放训练资源预约",
+      "training_reservation_stopped_and_released": "停止并释放训练资源预约",
+      "training_reservation_release_failed": "训练资源释放失败",
+      "training_reservation_renewed": "续期训练资源预约",
+      "training_reservation_expired": "训练资源预约过期"
+    },
+    "auditFields": {
+      "action": "动作",
+      "bizType": "资源类型",
+      "nodeId": "节点",
+      "containerName": "容器",
+      "itemKey": "资源键",
+      "ownerUserId": "所有者",
+      "groupId": "用户组",
+      "visibility": "可见性",
+      "resourceIds": "资源列表",
+      "sourcePath": "来源路径",
+      "requestId": "申请 ID",
+      "requesterUserId": "申请人",
+      "requesterUsername": "申请人",
+      "ownerUsername": "所有者",
+      "groupName": "用户组",
+      "previousGroupId": "原用户组",
+      "previousGroupName": "原用户组",
+      "poolName": "资源池",
+      "nodeName": "节点",
+      "homeNodeName": "归属节点",
+      "nodeNames": "节点列表",
+      "targetUserId": "目标用户",
+      "role": "角色",
+      "disabled": "禁用",
+      "mustChangePassword": "需改密",
+      "sessionsRevoked": "会话已撤销",
+      "poolId": "资源池",
+      "nodeIds": "节点列表",
+      "homeNodeId": "归属节点",
+      "guaranteedGpuCount": "保底 GPU",
+      "maxGpuCount": "最大 GPU",
+      "maxConcurrentJobs": "最大并发",
+      "maxNodesPerJob": "单任务最大节点",
+      "reservationId": "预约 ID",
+      "nodeCount": "节点数",
+      "gpusPerNode": "每节点 GPU",
+      "status": "状态",
+      "force": "强制",
+      "mode": "模式",
+      "container": "容器",
+      "pid": "PID",
+      "alreadyExited": "已退出",
+      "stopped": "已停止",
+      "note": "备注",
+      "change": "变更"
+    },
     "containerRolesMustDiffer": "训练 Docker、评测/推理 Docker、GRPO Docker 与多机训练 Docker 不能相同",
     "containerNameInvalid": "Docker 容器名只能包含字母、数字、点、下划线和连字符",
     "containerAlreadyBound": "该 Docker 容器已绑定其他用户组",
@@ -454,7 +659,8 @@
       "stopped": "已停止",
       "starting": "启动中",
       "failed": "失败",
-      "degraded": "降级"
+      "degraded": "降级",
+      "reserved": "已预留"
     },
     "servicePortDescription": "{{description}} · 端口 {{port}}",
     "forceStop": "强制停止",
@@ -467,17 +673,9 @@
         "name": "VLLM OpenAI API",
         "description": "vLLM OpenAI 兼容 API 服务"
       },
-      "INFERENCE_PORT": {
-        "name": "推理服务",
-        "description": "主推理服务"
-      },
-      "UI_PORT": {
-        "name": "UI 服务",
-        "description": "Web UI 服务"
-      },
-      "DATA_ANNOTATION_PORT": {
-        "name": "数据标注服务",
-        "description": "数据标注工具服务"
+      "MASTER_PORT": {
+        "name": "Master 端口",
+        "description": "vLLM 分布式通信预留端口"
       }
     },
     "noStatusData": "暂无服务状态数据",
@@ -563,14 +761,12 @@
   "categoryAll": "全部",
   "categoryBeginner": "新手",
   "categoryTraining": "训练",
-  "categoryAssessment": "医疗自建评估",
+  "categoryAssessment": "模型评估",
   "categoryEvaluation": "评测",
   "categoryInference": "推理",
   "categoryData": "数据",
   "categoryManagement": "管理",
   "Beginner": "新手入门",
-  "beginner-train": "适合新手快速发起训练",
-  "beginner-train-with-dataset-placeholderDesc": "适合新手使用占位数据集快速发起一次训练请求",
   "lora-train": "LoRA训练",
   "lora-batch-train": "LoRA批量训练",
   "full-param-batch-train": "全参批量训练",
@@ -590,17 +786,13 @@
   "pretrain-full-trainingDesc": "执行全参PT预训练任务",
   "grpo-trainingDesc": "使用指定模型、训练集、验证集和 GPU 编号启动 GRPO 训练",
   "dual-model-assessment": "双模型评估",
-  "dual-model-assessmentDesc": "对比评估两个模型",
+  "dual-model-assessmentDesc": "使用 LLaMA-Factory 内置评测或医疗综合流程对比两个模型",
   "single-model-assessment": "单模型评估",
-  "single-model-assessmentDesc": "评估单个模型性能",
+  "single-model-assessmentDesc": "使用 LLaMA-Factory 内置评测或医疗综合流程评估单个模型",
   "checkpoint-assessment": "Checkpoint评估",
-  "checkpoint-assessmentDesc": "评估模型检查点",
+  "checkpoint-assessmentDesc": "使用 LLaMA-Factory 内置评测或医疗综合流程评估模型检查点",
   "start-inference-service": "启动推理服务",
   "start-inference-serviceDesc": "启动模型推理服务",
-  "view-inference-test-scripts": "查看推理测试脚次",
-  "view-inference-test-scriptsDesc": "查看当前可用的推理功能测试脚次",
-  "run-inference-test-scripts": "运行推理测试脚次",
-  "run-inference-test-scriptsDesc": "执行推理功能测试脚次",
   "view-inference-benchmark-tests": "查看推理基准测试",
   "view-inference-benchmark-testsDesc": "查看当前可用的推理基准测试",
   "run-inference-benchmark-tests": "运行推理基准测试",
@@ -1112,7 +1304,7 @@
     "no-results": "未找到模板",
     "category": {
       "training": "训练",
-      "assessment": "医疗自建评估",
+      "assessment": "模型评估",
       "evaluation": "评测",
       "inference": "推理",
       "data": "数据"
@@ -1148,14 +1340,6 @@
     "start-inference-service": {
       "title": "启动推理服务",
       "description": "启动模型推理服务"
-    },
-    "view-inference-test-scripts": {
-      "title": "查看推理测试脚次",
-      "description": "查看当前可用的推理功能测试脚次"
-    },
-    "run-inference-test-scripts": {
-      "title": "运行推理测试脚次",
-      "description": "执行推理功能测试脚次"
     },
     "view-inference-benchmark-tests": {
       "title": "查看推理基准测试",
@@ -1228,7 +1412,7 @@
   "oneClickWorkflow": {
     "button": "一键工作流",
     "title": "一键工作流",
-    "subtitle": "选择数据集和评测集，生成命令后手动发送执行。",
+    "subtitle": "选择训练数据集和部署后基准评测集，生成命令后手动发送执行。",
     "refreshCurrentRunNodeResources": "刷新当前 Run 节点资源",
     "inputHint": "一键工作流命令已填入，点击右下角发送即可开始",
     "preview": "命令预览",
@@ -1252,7 +1436,8 @@
       "notQueried": "请先查询数据集"
     },
     "evaluation": {
-      "label": "评测集",
+      "label": "部署后基准评测集",
+      "description": "此处评测集用于部署后的推理 Benchmark；训练后的模型评估默认使用 general 和 ceval,cmmlu，可在生成的命令中修改。",
       "placeholder": "可选；不选则由 Agent 默认使用 2024.json",
       "selected": "已选择",
       "defaultHint": "未指定，默认使用 2024.json",
@@ -1417,11 +1602,20 @@
       "stageMessage": "阶段说明",
       "datasetRef": "数据标识",
       "evaluationDataset": "评测集",
+      "workflowBenchmarkDataset": "部署后基准评测集",
+      "workflowModelEvaluationScope": "模型评估范围",
+      "workflowModelEvaluationDatasets": "模型评估数据集",
       "modelPath": "模型路径",
       "progress": "进度",
       "labelSeparator": "：",
       "trainingType": "训练类型",
       "evaluationType": "评估类型",
+      "evaluationScope": "评估范围",
+      "evaluationDatasets": "评估数据集",
+      "runId": "运行 ID",
+      "reportPath": "报告路径",
+      "scores": "评测分数",
+      "scoreDeltas": "分数差值",
       "benchmarkTaskId": "任务ID",
       "benchmarkModel": "模型",
       "benchmarkDataset": "数据集",
@@ -1468,6 +1662,15 @@
       "viewBenchmarkProgress": "查看评测进度",
       "viewBenchmarkStatus": "查看状态",
       "stopBenchmark": "结束评测",
+      "benchmarkEta": "预计剩余",
+      "benchmarkEtaCalculating": "计算中",
+      "benchmarkEtaUnavailable": "暂不可用",
+      "benchmarkEtaLessThanMinute": "不足1分钟",
+      "benchmarkEtaMinutes": "约{{count}}分钟",
+      "benchmarkEtaHours": "约{{count}}小时",
+      "benchmarkEtaHoursMinutes": "约{{hours}}小时{{minutes}}分钟",
+      "benchmarkEtaDays": "约{{count}}天",
+      "benchmarkEtaDaysHours": "约{{days}}天{{hours}}小时",
       "configFile": "配置文件",
       "startService": "启动服务",
       "stopService": "关闭服务",
@@ -1481,11 +1684,25 @@
         "preparing": "准备中",
         "starting": "启动中",
         "running": "运行中",
+        "exporting": "导出中",
         "interrupted": "已中断",
         "stopped": "已停止",
         "finished": "已完成",
         "failed": "失败",
         "error": "错误"
+      },
+      "evaluationStatuses": {
+        "started": "已启动",
+        "pending": "等待中",
+        "preparing": "准备中",
+        "starting": "启动中",
+        "running": "运行中",
+        "finished": "已完成",
+        "completed": "已完成",
+        "failed": "失败",
+        "interrupted": "已中断",
+        "stopped": "已停止",
+        "unknown": "未知"
       },
       "workflowStatuses": {
         "pending": "等待中",
@@ -1493,6 +1710,7 @@
         "starting_external": "启动中",
         "starting": "启动中",
         "running": "运行中",
+        "exporting": "合并/导出中",
         "timeout": "超时",
         "finished": "已完成",
         "failed": "失败",
@@ -1500,23 +1718,31 @@
       },
       "workflowStages": {
         "train": "训练",
-        "evaluate": "评估",
+        "evaluate": "模型评估",
         "publish": "发布",
         "deploy": "部署",
-        "benchmark": "基准评测"
+        "benchmark": "部署后基准评测"
       },
       "typeValues": {
         "loraBatchTraining": "LoRA批量训练",
         "multinodeLoraBatchTraining": "双机 LoRA SFT",
         "fullParamBatchTraining": "全参批量训练",
+        "multinodeFullParamBatchTraining": "双机全参 SFT",
         "pretrainLoraTraining": "LoRA PT",
         "pretrainFullTraining": "全参 PT",
         "enhancedTraining": "增强训练",
         "multinodeEnhancedTraining": "双机增强训练",
         "grpoTraining": "GRPO训练",
+        "scheduledTraining": "定时训练",
         "singleModelEvaluation": "单模型评估",
         "dualModelEvaluation": "双模型评估",
-        "checkpointEvaluation": "Checkpoint评估"
+        "checkpointEvaluation": "Checkpoint评估",
+        "generalSingleModelEvaluation": "通用单模型评估",
+        "generalDualModelEvaluation": "通用双模型评估",
+        "generalCheckpointEvaluation": "通用 Checkpoint 评估",
+        "medicalSingleModelEvaluation": "医疗单模型评估",
+        "medicalDualModelEvaluation": "医疗双模型评估",
+        "medicalCheckpointEvaluation": "医疗 Checkpoint 评估"
       }
     },
     "guide": {
@@ -1764,8 +1990,9 @@
     "container-name": "Docker 容器名称",
     "container-required": "请输入容器名称",
     "container-default-hint": "默认使用 training_container，可直接确认或修改。系统将记住您最近使用的容器名称。",
-    "merged": "Training Complete",
-    "not-merged": "Training Incomplete",
+    "merged-artifact": "合并模型",
+    "merged-output-exists": "已生成合并模型",
+    "merged-output-missing": "未生成合并模型",
     "delete": {
       "button": "删除",
       "confirm-title": "确认删除该模型？",
@@ -1785,9 +2012,10 @@
         "item7": "Inference：推理部署模型"
       },
       "section2": {
-        "title": "训练状态说明",
-        "item1": "Training Complete：模型训练流程已完成，可继续用于后续使用",
-        "item2": "Training Incomplete：模型训练流程尚未完成，仍需继续处理"
+        "title": "合并产物说明",
+        "item1": "已生成合并模型：原始训练目录已有对应的合并产物",
+        "item2": "未生成合并模型：未检测到对应的合并产物",
+        "item3": "合并模型：当前目录就是合并产物"
       }
     }
   },
@@ -1819,8 +2047,10 @@
     "filter": {
       "category-label": "评测分类",
       "all": "全部",
-      "medical": "Medical",
-      "general": "General"
+      "medical": "医疗",
+      "general": "通用",
+      "custom": "自定义",
+      "unknown": "未分类"
     },
     "guide": {
       "button": "评测管理使用说明",
@@ -1829,12 +2059,12 @@
         "title": "查询评测",
         "item1": "输入 Docker 容器名称查询可用评测",
         "item2": "评测类型：",
-        "item3": "医疗评测",
-        "item4": "通用评测"
+        "item3": "通用评测",
+        "item4": "医疗评测"
       },
       "section2": {
         "title": "上传评测",
-        "item1": "支持上传标准医疗评测数据集",
+        "item1": "支持上传 .json、.jsonl 评测文件",
         "item2": "支持格式：.json、.jsonl"
       }
     },
@@ -1898,7 +2128,7 @@
       "container": "Docker 容器",
       "file": "评测文件",
       "test-type": "评测类型",
-      "test-type-placeholder": "请输入评测类型，如：中国执业医师资格考试",
+      "test-type-placeholder": "请输入评测分类，如 general、medical 或 custom",
       "test-type-required": "请输入评测类型",
       "drag": "点击或拖拽文件到此区域上传",
       "hint": "文件大小不超过 20MB",
@@ -1942,7 +2172,7 @@
     "steps": {
       "step1": {
         "title": "数据准备",
-        "description": "了解数据集并选择示例数据"
+        "description": "选择任意可用的原始数据"
       },
       "step2": {
         "title": "数据预处理",
@@ -1959,10 +2189,10 @@
     },
     "commands": {
       "preprocess": "执行数据预处理",
-      "training": "运行lora批量训练",
+      "training": "运行lora批量训练，TEM=qwen3",
       "description": {
         "preprocess": "执行数据预处理，数据类型为{{type}}，数据格式为{{format}}，数据在{{dataset}}",
-        "training": "运行lora批量训练"
+        "training": "运行lora批量训练，TEM=qwen3"
       }
     },
     "validation": {
@@ -2028,7 +2258,7 @@
       "preprocess": {
         "task": "“执行数据预处理”：告诉系统先把原始数据转换成训练可用的数据。",
         "dataset": "“数据在 ...”：指定这一步要处理哪个数据集路径。",
-        "format": "“数据类型/数据格式”：告诉系统输出 SFT 训练数据，并按 diagnosis 任务格式处理。"
+        "format": "“data_type=sft”：输出 SFT 数据；医疗 Raw 示例还需指定 strategy。示例路径请替换为实际数据目录。"
       },
       "training": {
         "task": "“运行”：告诉系统开始执行一个训练任务。",
@@ -2052,48 +2282,51 @@
       "description": "包括：数据预处理、模型训练、监控训练进度"
     },
     "step1": {
-      "title": "第一步：选择示例数据集",
+      "title": "第一步：选择原始数据集",
       "querying": "正在查询数据集...",
       "queryingDesc": "正在从容器中获取数据集列表，请稍候...",
-      "cacheFound": "发现缓存数据！请直接选择 medical-example 数据集。",
-      "queryComplete": "查询完成！请选择 medical-example 数据集进行演示。",
+      "cacheFound": "发现已缓存的 raw 数据，可直接选择。",
+      "queryComplete": "查询完成！请选择与当前任务匹配的 Raw 数据集。医疗数据可用于医疗场景。",
       "guide": {
         "title": "操作引导",
-        "desc": "请先在左侧数据管理面板查询数据集，再回到这里选择示例数据继续。",
+        "desc": "请先在左侧数据管理面板查询数据集，再回到这里选择任意 raw 数据继续。",
         "step1": "点击左侧'查询可用数据集'按钮",
         "step1Desc": "位于数据管理面板中",
         "step2": "输入容器名称",
         "step2Desc": "默认使用：training_container",
         "step3": "查看数据集列表",
-        "step3Desc": "找到 medical-example 数据集"
+        "step3Desc": "选择一个 raw 数据集"
       },
       "selectRequired": "请完成查询后继续",
       "selectRequiredDesc": "点击左侧'查询可用数据集'按钮，查询完成后返回此向导",
       "useCache": "使用缓存数据（请选择）",
-      "foundExample": "找到示例数据集（请选择）",
+      "foundExample": "找到可用的 raw 数据集（请选择）",
       "cacheDesc": "系统检测到您之前已查询过数据集，正在使用缓存数据。如需最新数据，请重新查询。",
-      "exampleData": "示例数据",
+      "exampleData": "原始数据",
       "recommended": "推荐",
-      "exampleDesc": "包含病历记录的示例数据集，用于演示训练流程",
+      "exampleDesc": "用于演示通用 LLM SFT 流程的 raw 数据集",
+      "genericDesc": "可预处理为通用 SFT 格式的原始数据",
+      "medicalExample": "医疗示例",
       "type": "类型",
       "recordCount": "记录数",
       "selected": "已选择",
       "select": "选择",
-      "notFound": "未找到示例数据集",
-      "notFoundDesc": "查询完成，但未找到名为 'medical-example' 的数据集。",
+      "notFound": "未找到 raw 数据集",
+      "notFoundDesc": "查询完成，但当前只有已预处理数据或暂无数据。请先上传一个 raw 数据集。",
       "reasons": {
         "title": "可能的原因：",
         "reason1": "示例数据集尚未上传到容器中",
-        "reason2": "数据集名称不匹配（应为 medical-example）",
+        "reason2": "现有数据已经是 SFT、DPO 或 PT 类型",
         "contactAdmin": "请联系管理员添加示例数据集。"
       },
       "otherDatasets": "其他数据集",
+      "nonRawDatasets": "已预处理数据不需要执行本向导的预处理步骤",
       "unavailable": "不可用",
       "moreDatasets": "还有 {{count}} 个数据集...",
-      "mustSelectExample": "必须选择示例数据集",
-      "mustSelectExampleDesc": "请点击上方的 medical-example 卡片选择数据集，这是演示流程的必要步骤。",
+      "mustSelectExample": "请选择 raw 数据集",
+      "mustSelectExampleDesc": "请点击上方任意 raw 数据集卡片继续。",
       "selectionStatus": "已选择: {{name}}",
-      "selectionStatusDesc": "示例数据集已选择。点击'下一步'开始数据预处理。"
+      "selectionStatusDesc": "raw 数据集已选择。点击'下一步'开始生成通用 SFT 数据。"
     },
     "step2": {
       "title": "第二步：数据预处理",

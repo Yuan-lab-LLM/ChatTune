@@ -338,6 +338,57 @@ function DataPreparationStep({ isZh, defaultContainerName }: { isZh: boolean; de
                     {isZh ? '数据格式示例' : 'Data Format Examples'}
                 </Title>
 
+                {/* SFT 格式 */}
+                <Card 
+                    size="small" 
+                    className="overflow-hidden rounded-2xl border border-emerald-200/70 bg-emerald-50/40 shadow-none"
+                    title={
+                        <div className="flex items-center gap-2">
+                            <Tag className="rounded-full border-emerald-200 bg-emerald-50 text-emerald-700">SFT</Tag>
+                            <Text type="secondary" className="text-xs">
+                                {isZh ? '指令微调数据格式' : 'Supervised Fine-Tuning Format'}
+                            </Text>
+                        </div>
+                    }
+                >
+                    <div className="overflow-x-auto rounded-2xl border border-slate-800 bg-slate-950 p-4">
+                        <pre className="text-xs text-green-400 font-mono leading-relaxed">
+{`[
+  {
+    "instruction": "请将客服回复改写得更简洁",
+    "input": "客户询问订单何时发货；原回复：您的订单正在处理中，请耐心等待。",
+    "output": "订单正在处理中，发货后会通知您。"
+  }
+]`}
+                        </pre>
+                    </div>
+                </Card>
+
+                {/* DPO 格式 */}
+                <Card 
+                    size="small" 
+                    className="overflow-hidden rounded-2xl border border-amber-200/70 bg-amber-50/40 shadow-none"
+                    title={
+                        <div className="flex items-center gap-2">
+                            <Tag className="rounded-full border-amber-200 bg-amber-50 text-amber-700">DPO</Tag>
+                            <Text type="secondary" className="text-xs">
+                                {isZh ? '偏好对齐数据格式' : 'Direct Preference Optimization Format'}
+                            </Text>
+                        </div>
+                    }
+                >
+                    <div className="overflow-x-auto rounded-2xl border border-slate-800 bg-slate-950 p-4">
+                        <pre className="text-xs text-green-400 font-mono leading-relaxed">
+{`{
+  "instruction": "为客户回答退货流程",
+  "input": "用户：如何申请退货？",
+  "chosen": "请在订单详情中选择申请退货，并按页面提示提交。",
+  "rejected": "自己去看帮助中心。"
+}`}
+                        </pre>
+                    </div>
+                </Card>
+
                 {/* Raw 格式 */}
                 <Card 
                     size="small" 
@@ -346,7 +397,7 @@ function DataPreparationStep({ isZh, defaultContainerName }: { isZh: boolean; de
                         <div className="flex items-center gap-2">
                             <Tag className="rounded-full border-blue-200 bg-blue-50 text-blue-700">Raw</Tag>
                             <Text type="secondary" className="text-xs">
-                                {isZh ? '原始病历数据格式' : 'Raw Medical Record Format'}
+                                {isZh ? '医疗 Raw 示例（可选）' : 'Optional Medical Raw Example'}
                             </Text>
                         </div>
                     }
@@ -370,56 +421,6 @@ function DataPreparationStep({ isZh, defaultContainerName }: { isZh: boolean; de
                     </div>
                 </Card>
 
-                {/* SFT 格式 */}
-                <Card 
-                    size="small" 
-                    className="overflow-hidden rounded-2xl border border-emerald-200/70 bg-emerald-50/40 shadow-none"
-                    title={
-                        <div className="flex items-center gap-2">
-                            <Tag className="rounded-full border-emerald-200 bg-emerald-50 text-emerald-700">SFT</Tag>
-                            <Text type="secondary" className="text-xs">
-                                {isZh ? '指令微调数据格式' : 'Supervised Fine-Tuning Format'}
-                            </Text>
-                        </div>
-                    }
-                >
-                    <div className="overflow-x-auto rounded-2xl border border-slate-800 bg-slate-950 p-4">
-                        <pre className="text-xs text-green-400 font-mono leading-relaxed">
-{`[
-  {
-    "instruction": "根据患者当前的情况，给出临床诊断",
-    "input": "主诉: 头痛1天,现病史: 患者一天前开始剧烈头痛,持续1小时,既往史: 否认高血压,否认心脏病,个人史: 否认吸烟,否认饮酒,过敏史: 无,体格检查: 体温38.5,辅助检查: 无,检验检查结果: 白细胞计数xxx",
-    "output": "诊断: 感冒,发烧"    
-  }
-]`}
-                        </pre>
-                    </div>
-                </Card>
-
-                {/* DPO 格式 */}
-                <Card 
-                    size="small" 
-                    className="overflow-hidden rounded-2xl border border-amber-200/70 bg-amber-50/40 shadow-none"
-                    title={
-                        <div className="flex items-center gap-2">
-                            <Tag className="rounded-full border-amber-200 bg-amber-50 text-amber-700">DPO</Tag>
-                            <Text type="secondary" className="text-xs">
-                                {isZh ? '偏好对齐数据格式' : 'Direct Preference Optimization Format'}
-                            </Text>
-                        </div>
-                    }
-                >
-                    <div className="overflow-x-auto rounded-2xl border border-slate-800 bg-slate-950 p-4">
-                        <pre className="text-xs text-green-400 font-mono leading-relaxed">
-{`{
-  "instruction": "根据病历诊断",
-  "input": "主诉:解黑便11小时,现病史:昨晚20时开始无明显诱因出现解黑便2次,过敏史: 否认药物和食物过敏史,既往史:胃窦部溃疡伴出血,个人史:否认吸烟、酗酒,物理检查: 体温: 36.5℃, 脉搏: 86次/分",
-  "chosen": "急性上消化道出血，高血压",
-  "rejected": "贫血。"
-}`}
-                        </pre>
-                    </div>
-                </Card>
             </div>
 
             <Divider />
@@ -903,15 +904,15 @@ function DataPreprocessingStep({ isZh }: { isZh: boolean }) {
                         <div className="flex-1">
                             <div className="flex items-center gap-2 mb-1">
                                 <Tag className="m-0 rounded-full border-sky-200 bg-sky-50 text-sky-700">{isZh ? '格式转换' : 'Format Conversion'}</Tag>
-                                <Tag className="m-0 rounded-full border-border/30 bg-white/80 text-slate-600">{isZh ? 'Raw → SFT/DPO' : 'Raw → SFT/DPO'}</Tag>
+                                <Tag className="m-0 rounded-full border-border/30 bg-white/80 text-slate-600">{isZh ? '数据 → SFT/DPO' : 'Data → SFT/DPO'}</Tag>
                             </div>
                             <Title level={4} className="!mb-1 !mt-0">
                                 {isZh ? '数据预处理' : 'Data Preprocessing'}
                             </Title>
                             <Paragraph className="text-muted-foreground text-sm !mb-0">
                                 {isZh 
-                                    ? '把原始病历数据整理成 SFT 或 DPO 训练集。'
-                                    : 'Turn raw medical records into SFT or DPO training data.'}
+                                    ? '将已支持的数据格式整理成 SFT 或 DPO 训练集。'
+                                    : 'Prepare supported data formats for SFT or DPO training.'}
                             </Paragraph>
                         </div>
                     </div>
@@ -959,12 +960,12 @@ function DataPreprocessingStep({ isZh }: { isZh: boolean }) {
                         </div>
                         <div className="rounded-xl border border-slate-700 bg-slate-900/80 p-3">
                             <code className="block min-h-[44px] text-sm leading-6 text-green-300 font-mono">
-                                执行数据预处理操作，数据类型为sft，数据格式为diagnosis
+                                执行数据预处理，data_type=sft，input_folder=&lt;数据集路径&gt;
                             </code>
                         </div>
                         <div className="mt-3 text-xs text-slate-400 space-y-1">
-                            <p>• {isZh ? '系统会优先识别最新的 Raw 数据目录' : 'The system prefers the latest Raw data folder'}</p>
-                            <p>• {isZh ? '补充数据类型和目标能力即可开始转换' : 'Add the target type and capability, then start the conversion'}</p>
+                            <p>• {isZh ? '系统会检查指定数据目录的格式' : 'The system checks the format of the selected data folder'}</p>
+                            <p>• {isZh ? '按数据格式补充必要参数；医疗 Raw 示例需额外指定 strategy' : 'Provide the required parameters; medical Raw data also needs a strategy'}</p>
                             <p>• {isZh ? '处理完成后会生成可直接训练的数据集' : 'A training-ready dataset is generated automatically'}</p>
                         </div>
                     </div>

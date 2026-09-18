@@ -458,6 +458,26 @@ export class AuthDao {
         await AuthSessionTable.delete({ userId });
     }
 
+    static async resetAdminPasswordByUsername(username: string, newPassword: string) {
+        const normalizedUsername = username.trim();
+        if (!normalizedUsername) {
+            throw new Error('Administrator username is required.');
+        }
+        if (newPassword.length < 6) {
+            throw new Error('MEDFLOW_ADMIN_PASSWORD must be at least 6 characters.');
+        }
+
+        const user = await AuthUserTable.findOne({
+            where: { username: normalizedUsername },
+        });
+        if (!user || user.role !== UserRole.ADMIN) {
+            throw new Error(`Administrator account not found: ${normalizedUsername}`);
+        }
+
+        await this.resetUserPassword(user.id, newPassword);
+        await this.clearLoginFailures(normalizedUsername);
+    }
+
     static async revokeUserSessions(userId: string, actorUserId: string) {
         if (userId === actorUserId) {
             throw new Error('auth.error.useLogoutForSelf');

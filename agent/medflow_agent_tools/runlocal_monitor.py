@@ -31,7 +31,6 @@ from ._train_monitor_helpers import (
     parse_output_log_history,
     parse_wandb_run_timestamp,
     select_wandb_run,
-    select_wandb_run_by_start_time,
     validate_pid_binding,
     should_return_status_record,
     is_integer_step_value,
@@ -40,6 +39,7 @@ from ._train_monitor_helpers import (
     public_train_type,
     public_train_type_text,
 )
+from ._training_descriptors import find_training_descriptor
 
 def _load_agent_config():
     try:
@@ -75,7 +75,8 @@ DEFAULT_MODEL_API_KEY = (
 DEFAULT_SAVES_ROOT = "/home/workspace/models/dpo_train/internal/saves"
 DEFAULT_BATCH_TRAIN_ROOT = "/home/workspace/models/batch_train"
 DEFAULT_PRETRAIN_ROOT = "/home/workspace/models/pretrain"
-DEFAULT_WANDB_ROOT = "/home/workspace/llamafactory/wandb"
+DEFAULT_WANDB_ROOT = "/home/workspace/log/wandb/wandb"
+DEFAULT_LEGACY_WANDB_ROOT = "/home/workspace/llamafactory/wandb"
 DEFAULT_LOG_WANDB_ROOT = "/home/workspace/log/wandb/wandb"
 DEFAULT_VERL_WANDB_ROOT = "/home/workspace/verl/wandb"
 DEFAULT_INSINFER_WANDB_ROOT = "/usr/local/insinfersystem/wandb"
@@ -88,6 +89,8 @@ DEFAULT_MIN_HISTORY_FOR_LLM = 2
 STARTING_TEXT = "训练正在启动中，请稍后查看实际训练loss和step/epoch"
 DEFAULT_LOG_ROOT = "/home/workspace/log"
 TRAINING_METRICS_WANDB_CACHE_TTL_SECONDS = 60
+WANDB_RUN_START_TOLERANCE_SECONDS = 120
+CURRENT_JOB_LOG_MTIME_TOLERANCE_SECONDS = 5
 
 _RUNTIME_DIR = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "..", "runtime"),
@@ -102,7 +105,20 @@ _LLM_LOOP_THREAD: Optional[threading.Thread] = None
 _LLM_LOOP_LOCK = threading.Lock()
 _LLM_LOOP_READY = threading.Event()
 _LAST_OK_BY_CONTAINER: Dict[str, Dict[str, Any]] = {}
-_WANDB_RUN_CACHE: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+_WANDB_RUN_CACHE: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+
+
+def _last_ok_for_job(
+    container: Optional[str], pid: Optional[str], started_at: Optional[datetime]
+) -> Optional[Dict[str, Any]]:
+    if not container or not pid or started_at is None:
+        return None
+    cached = _LAST_OK_BY_CONTAINER.get(container)
+    if not cached:
+        return None
+    if cached.get("pid") != pid or cached.get("started_at") != started_at.isoformat():
+        return None
+    return cached
 
 
 def _wandb_display_text(metrics: Dict[str, Any]) -> Optional[str]:
@@ -243,12 +259,23 @@ def _monitor_protocol_hint(payload: Dict[str, Any]) -> Dict[str, Any]:
             else metrics.get("is_multinode")
         ),
         "scriptName": metrics.get("scriptName") or metrics.get("script_name"),
+        "descriptorId": metrics.get("descriptorId") or metrics.get("descriptor_id"),
+        "lifecycleStatus": metrics.get("lifecycleStatus") or metrics.get("lifecycle_status"),
+        "primaryMetric": metrics.get("primary_metric"),
+        "fallbackMetrics": metrics.get("fallback_metrics") or [],
+        "logRoot": metrics.get("log_root"),
+        "logFiles": metrics.get("log_files") or [],
         "latestLoss": latest_loss,
         "latestStep": latest_step,
         "latestEpoch": latest_epoch,
         "progressPercent": progress_percent,
         "subStage": metrics.get("sub_stage"),
         "subStageText": metrics.get("sub_stage_text"),
+        "outputDir": (
+            metrics.get("artifact_output_dir")
+            if "artifact_output_dir" in metrics
+            else metrics.get("output_dir")
+        ),
         "exportDir": metrics.get("export_dir"),
         "mergeStatus": metrics.get("merge_status"),
         "progress": {
@@ -340,15 +367,58 @@ def _docker_exec_python(
 
 
 def _should_use_pid_file_url(
-    training_process_exists: bool,
     pid_started_at: Optional[datetime],
     file_mtime: Optional[float],
 ) -> bool:
-    if not training_process_exists:
-        return True
     if pid_started_at is None or file_mtime is None:
         return False
     return file_mtime >= pid_started_at.timestamp()
+
+
+def _wandb_run_is_current(run: Optional[Dict[str, Any]], started_at: Optional[datetime]) -> bool:
+    if not run or not run.get("path") or started_at is None:
+        return False
+    run_name = str(run.get("name") or os.path.basename(str(run["path"]).rstrip("/")))
+    run_time = parse_wandb_run_timestamp(run_name)
+    return bool(
+        run_time
+        and run_time >= started_at - timedelta(seconds=WANDB_RUN_START_TOLERANCE_SECONDS)
+        and run_time <= datetime.now() + timedelta(seconds=WANDB_RUN_START_TOLERANCE_SECONDS)
+    )
+
+
+def _wandb_url_matches_run(url: Optional[str], run: Optional[Dict[str, Any]], started_at: Optional[datetime]) -> bool:
+    if not url or not _wandb_run_is_current(run, started_at):
+        return False
+    return _extract_run_id_from_wandb_url(url) == _extract_wandb_run_id(
+        run.get("name"), run.get("path")
+    )
+
+
+def _select_current_wandb_run(
+    container: str,
+    runs: List[Dict[str, Any]],
+    pid: Optional[str],
+    started_at: Optional[datetime],
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    current = {str(run["path"]): run for run in runs if _wandb_run_is_current(run, started_at)}
+    if not current:
+        return None, "no_current_wandb_run"
+    if pid:
+        pid_matches = []
+        for run in current.values():
+            meta_path = os.path.join(str(run["path"]), "files", "wandb-metadata.json")
+            meta = _read_wandb_json_file(container, meta_path) or {}
+            meta_pid = meta.get("pid") or meta.get("process_id")
+            if meta_pid is not None and str(meta_pid) == str(pid):
+                pid_matches.append(run)
+        if len(pid_matches) == 1:
+            return pid_matches[0], "metadata_pid_match"
+        if len(pid_matches) > 1:
+            return None, "ambiguous_metadata_pid_matches"
+    if len(current) == 1:
+        return next(iter(current.values())), "unique_current_wandb_run"
+    return None, "ambiguous_current_wandb_runs"
 
 
 def _wandb_url_file(pid: Optional[str]) -> Optional[str]:
@@ -370,6 +440,16 @@ def _read_wandb_url_file(pid: Optional[str]) -> Optional[str]:
     if content and "wandb.ai" in content:
         return content.splitlines()[0].strip()
     return None
+
+
+def _remove_wandb_url_file_if_matches(pid: Optional[str], expected_url: Optional[str]) -> None:
+    path = _wandb_url_file(pid)
+    if not path or not expected_url or _read_wandb_url_file(pid) != expected_url:
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def _list_pid_url_run_ids(current_pid: Optional[str]) -> List[str]:
@@ -434,10 +514,13 @@ def _extract_wandb_url_from_log_text(text: str) -> Optional[str]:
     return None
 
 
-def _read_wandb_url_from_log_file(container: str, path: str) -> Optional[str]:
+def _read_wandb_url_from_log_file(
+    container: str, path: str, expected_run_id: Optional[str] = None
+) -> Optional[str]:
     script = r"""
 import re, sys
 path = sys.argv[1]
+expected_run_id = sys.argv[2] if len(sys.argv) > 2 else ""
 project_url = None
 local_run_id = None
 try:
@@ -447,27 +530,219 @@ try:
                 continue
             run_match = re.search(r"https?://wandb\.ai/[^\s\"')>,;]+/runs/[A-Za-z0-9]+", line, re.I)
             if run_match:
-                print(run_match.group(0).rstrip(").,;\"'"))
-                raise SystemExit(0)
+                run_url = run_match.group(0).rstrip(").,;\"'")
+                if not expected_run_id or run_url.rsplit("/", 1)[-1] == expected_run_id:
+                    print(run_url)
+                    raise SystemExit(0)
             if project_url is None:
                 project_match = re.search(r"View project at\s+(https?://wandb\.ai/[^\s\"')>,;]+)", line, re.I)
                 if project_match:
                     project_url = project_match.group(1).rstrip(").,;\"'")
             if local_run_id is None:
                 local_run_match = re.search(r"(?:offline-)?run-\d{8}_\d{6}-([A-Za-z0-9]+)", line, re.I)
-                if local_run_match:
+                if local_run_match and (not expected_run_id or local_run_match.group(1) == expected_run_id):
                     local_run_id = local_run_match.group(1)
     if project_url and local_run_id:
         print(project_url.rstrip("/") + "/runs/" + local_run_id)
 except Exception:
     pass
 """
-    g_code, g_out, _ = _docker_exec_python(container, script, [path], timeout=10)
+    g_code, g_out, _ = _docker_exec_python(container, script, [path, expected_run_id or ""], timeout=10)
     if g_code == 0 and g_out:
         candidate = _extract_wandb_url_from_log_text(g_out.splitlines()[0].strip()) or g_out.splitlines()[0].strip()
         if candidate and "wandb.ai" in candidate:
             return candidate
     return None
+
+
+def _wandb_url_probe_reason(diagnostic: Dict[str, Any]) -> str:
+    files = diagnostic.get("files")
+    file_records = files if isinstance(files, list) else []
+    existing_files = [item for item in file_records if isinstance(item, dict) and item.get("exists")]
+    if not existing_files:
+        return "candidate_files_missing"
+    if any(item.get("readable") is False for item in existing_files):
+        return "candidate_file_read_failed"
+    if any(int(item.get("foreign_run_url_count") or 0) > 0 for item in existing_files):
+        return "foreign_run_url_only"
+    return "no_url_markers"
+
+
+def _probe_wandb_url_from_selected_run_logs(
+    container: str,
+    run_dir: Optional[str],
+    expected_run_id: Optional[str],
+) -> Tuple[Optional[str], Optional[str], Dict[str, Any]]:
+    """Read a selected run's URL and return safe diagnostics for failed discovery."""
+    if (
+        not container
+        or not run_dir
+        or not expected_run_id
+        or _extract_wandb_run_id(None, run_dir) != expected_run_id
+    ):
+        return None, None, {"reason": "invalid_selected_run_identity"}
+    script = r"""
+import json, os, re, sys
+run_dir = os.path.realpath(sys.argv[1])
+expected_run_id = sys.argv[2]
+candidates = [
+    ("logs/debug.log", os.path.join(run_dir, "logs", "debug.log")),
+    ("logs/debug-internal.log", os.path.join(run_dir, "logs", "debug-internal.log")),
+    ("logs/debug-core.log", os.path.join(run_dir, "logs", "debug-core.log")),
+    ("files/output.log", os.path.join(run_dir, "files", "output.log")),
+]
+diagnostic = {
+    "run_id": expected_run_id,
+    "files": [],
+    "binary": {},
+    "metadata": {},
+    "config": {},
+}
+matching_urls = []
+project_urls = []
+for relative_path, path in candidates:
+    item = {
+        "path": relative_path,
+        "exists": os.path.isfile(path),
+        "size": None,
+        "readable": None,
+        "has_wandb_text": False,
+        "matching_run_url_count": 0,
+        "foreign_run_url_count": 0,
+        "has_project_url": False,
+    }
+    diagnostic["files"].append(item)
+    if not item["exists"]:
+        continue
+    try:
+        item["size"] = os.path.getsize(path)
+    except Exception:
+        pass
+    real_path = os.path.realpath(path)
+    try:
+        if os.path.commonpath([run_dir, real_path]) != run_dir:
+            item["readable"] = False
+            item["read_error"] = "outside_selected_run"
+            continue
+    except Exception as exc:
+        item["readable"] = False
+        item["read_error"] = type(exc).__name__
+        continue
+    try:
+        with open(real_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if "wandb" not in line.lower():
+                    continue
+                item["has_wandb_text"] = True
+                for run_match in re.finditer(
+                    r"https?://wandb\.ai/[^\s\"')>,;]+/runs/([A-Za-z0-9]+)", line, re.I
+                ):
+                    run_url = run_match.group(0).rstrip(").,;\"'")
+                    if run_match.group(1) == expected_run_id:
+                        item["matching_run_url_count"] += 1
+                        matching_urls.append((real_path, run_url))
+                    else:
+                        item["foreign_run_url_count"] += 1
+                project_match = re.search(
+                    r"View project at\s+(https?://wandb\.ai/[^\s\"')>,;]+)", line, re.I
+                )
+                if project_match:
+                    item["has_project_url"] = True
+                    project_urls.append(
+                        (real_path, project_match.group(1).rstrip(").,;\"'"))
+                    )
+        item["readable"] = True
+    except Exception as exc:
+        item["readable"] = False
+        item["read_error"] = type(exc).__name__
+        continue
+
+def file_stat(relative_path, path):
+    result = {"path": relative_path, "exists": os.path.isfile(path), "size": None}
+    if result["exists"]:
+        try:
+            result["size"] = os.path.getsize(path)
+        except Exception:
+            pass
+    return result
+
+binary_name = "run-" + expected_run_id + ".wandb"
+diagnostic["binary"] = file_stat(binary_name, os.path.join(run_dir, binary_name))
+metadata_path = os.path.join(run_dir, "files", "wandb-metadata.json")
+diagnostic["metadata"] = file_stat("files/wandb-metadata.json", metadata_path)
+diagnostic["metadata"]["readable"] = None
+diagnostic["metadata"]["fields"] = {}
+if diagnostic["metadata"]["exists"]:
+    try:
+        with open(metadata_path, "r", encoding="utf-8", errors="ignore") as f:
+            metadata = json.load(f)
+        diagnostic["metadata"]["readable"] = True
+        if isinstance(metadata, dict):
+            for key in ("entity", "project", "run_id", "pid"):
+                value = metadata.get(key)
+                diagnostic["metadata"]["fields"][key] = {
+                    "present": key in metadata and value is not None and str(value).strip() != "",
+                    "value": str(value)[:200] if value is not None else None,
+                }
+    except Exception as exc:
+        diagnostic["metadata"]["readable"] = False
+        diagnostic["metadata"]["read_error"] = type(exc).__name__
+config_path = os.path.join(run_dir, "files", "config.yaml")
+diagnostic["config"] = file_stat("files/config.yaml", config_path)
+
+url = None
+source_path = None
+if matching_urls:
+    source_path, url = matching_urls[0]
+    diagnostic["result"] = "matching_run_url"
+elif project_urls:
+    path, project_url = project_urls[0]
+    source_path = path
+    url = project_url.rstrip("/") + "/runs/" + expected_run_id
+    diagnostic["result"] = "project_url"
+else:
+    diagnostic["result"] = "not_found"
+print(json.dumps({"url": url, "source_path": source_path, "diagnostic": diagnostic}))
+"""
+    code, out, _ = _docker_exec_python(
+        container,
+        script,
+        [run_dir, expected_run_id],
+        timeout=10,
+    )
+    if code != 0 or not out:
+        return None, None, {
+            "reason": "probe_execution_failed",
+            "exit_code": code,
+            "output_present": bool(out),
+        }
+    try:
+        result = json.loads(out.splitlines()[0].strip())
+    except Exception:
+        return None, None, {"reason": "probe_output_invalid"}
+    if not isinstance(result, dict):
+        return None, None, {"reason": "probe_output_invalid"}
+    diagnostic = result.get("diagnostic") if isinstance(result.get("diagnostic"), dict) else {}
+    candidate = str(result.get("url") or "").strip() or None
+    source_path = str(result.get("source_path") or "").strip() or None
+    diagnostic["reason"] = _wandb_url_probe_reason(diagnostic)
+    if _extract_run_id_from_wandb_url(candidate) != expected_run_id:
+        return None, None, diagnostic
+    return candidate, source_path, diagnostic
+
+
+def _read_wandb_url_from_selected_run_logs(
+    container: str,
+    run_dir: Optional[str],
+    expected_run_id: Optional[str],
+) -> Tuple[Optional[str], Optional[str]]:
+    candidate, source_path, _ = _probe_wandb_url_from_selected_run_logs(
+        container,
+        run_dir,
+        expected_run_id,
+    )
+    return candidate, source_path
+
 
 def _find_log_file_by_pid(container: str, pid: str) -> Optional[str]:
     if not container or not pid:
@@ -613,11 +888,12 @@ def _training_metrics_wandb_cache_key(
     container: Optional[str],
     pid: Optional[str],
     train_type: Optional[str],
-) -> Optional[Tuple[str, str, str]]:
-    if not container or not pid:
+    started_at: Optional[datetime],
+) -> Optional[Tuple[str, str, str, str]]:
+    if not container or not pid or started_at is None:
         return None
     normalized_train_type = normalize_train_type(train_type) or "unknown"
-    return (str(container), str(pid), normalized_train_type)
+    return (str(container), str(pid), normalized_train_type, started_at.isoformat())
 
 
 def _wandb_output_log_exists(container: str, run_dir: Optional[str]) -> bool:
@@ -632,9 +908,10 @@ def _get_cached_wandb_run(
     container: str,
     pid: Optional[str],
     train_type: Optional[str],
+    started_at: Optional[datetime],
     current_run_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    key = _training_metrics_wandb_cache_key(container, pid, train_type)
+    key = _training_metrics_wandb_cache_key(container, pid, train_type, started_at)
     if not key:
         return None
     entry = _WANDB_RUN_CACHE.get(key)
@@ -655,7 +932,7 @@ def _get_cached_wandb_run(
         _WANDB_RUN_CACHE.pop(key, None)
         return None
     run = _run_record_from_dir(run_dir)
-    if not run:
+    if not _wandb_run_is_current(run, started_at):
         _WANDB_RUN_CACHE.pop(key, None)
         return None
     run["_wandb_root"] = str(entry.get("wandb_root") or "").strip()
@@ -672,9 +949,10 @@ def _remember_wandb_run(
     wandb_root: Optional[str],
     wandb_root_source: Optional[str],
     wandb_url_run_id: Optional[str],
+    started_at: Optional[datetime],
 ) -> None:
-    key = _training_metrics_wandb_cache_key(container, pid, train_type)
-    if not key or not wandb_run_dir:
+    key = _training_metrics_wandb_cache_key(container, pid, train_type, started_at)
+    if not key or not wandb_run_dir or not _wandb_run_is_current(_run_record_from_dir(wandb_run_dir), started_at):
         return
     run_dir = str(wandb_run_dir).rstrip("/")
     _WANDB_RUN_CACHE[key] = {
@@ -729,6 +1007,13 @@ def _infer_wandb_root_from_cmd(cmd: str) -> Optional[str]:
     except Exception:
         parts = cmd.split()
     for part in parts:
+        descriptor = find_training_descriptor(str(part).strip("'\"()"))
+        descriptor_wandb_dir = str(
+            ((descriptor or {}).get("monitoring") or {}).get("wandbDir") or ""
+        ).strip()
+        if descriptor_wandb_dir:
+            return descriptor_wandb_dir
+    for part in parts:
         token = str(part).strip("'\"()")
         if token.startswith("/usr/local/insinfersystem/") and not token.endswith(".py"):
             base_dir = os.path.dirname(token)
@@ -765,6 +1050,13 @@ def _infer_wandb_root_from_pid_record(pid_record: Optional[Dict[str, Any]]) -> O
     script_path = str(pid_record.get("script_path") or "")
     working_dir = str(pid_record.get("docker_working_dir") or "")
     command = str(pid_record.get("command") or "")
+    for identity in (script_name, script_path, command.split()[0] if command else ""):
+        descriptor = find_training_descriptor(identity)
+        descriptor_wandb_dir = str(
+            ((descriptor or {}).get("monitoring") or {}).get("wandbDir") or ""
+        ).strip()
+        if descriptor_wandb_dir:
+            return descriptor_wandb_dir
     if (
         "/usr/local/insinfersystem" in working_dir
         or "/usr/local/insinfersystem" in script_path
@@ -777,7 +1069,7 @@ def _infer_wandb_root_from_pid_record(pid_record: Optional[Dict[str, Any]]) -> O
     if "/home/workspace/verl" in working_dir or "/home/workspace/verl" in command:
         return DEFAULT_VERL_WANDB_ROOT
     if "/home/workspace/llamafactory" in working_dir:
-        return DEFAULT_WANDB_ROOT
+        return DEFAULT_LEGACY_WANDB_ROOT
     return None
 
 
@@ -938,7 +1230,14 @@ def _trainer_stdout_log_path(
             return None
         return f"{DEFAULT_PRETRAIN_LOG_ROOT.rstrip('/')}/{name}-train-log.log"
     if train_type_public in {"lora_sft", "full_sft"}:
-        if not (name.startswith("model_lora_") or name.startswith("model_full_")):
+        if not name.startswith(
+            (
+                "model_lora_",
+                "model_full_",
+                "model_medical_lora_",
+                "model_medical_full_",
+            )
+        ):
             return None
         return f"{DEFAULT_BATCH_TRAIN_LOG_ROOT.rstrip('/')}/{name}-train-log.log"
     return None
@@ -962,6 +1261,74 @@ def _find_trainer_stdout_log_by_output_dir(
     return None
 
 
+def _descendant_training_output_dirs(ps_output: str, root_pid: Optional[str]) -> List[str]:
+    """Return unique training output dirs owned by descendants of ``root_pid``."""
+    root_pid = str(root_pid or "").strip()
+    if not root_pid.isdigit():
+        return []
+
+    children: Dict[str, List[Tuple[str, str]]] = {}
+    for raw_line in str(ps_output or "").splitlines():
+        parts = raw_line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        child_pid, parent_pid, cmd = parts
+        if not child_pid.isdigit() or not parent_pid.isdigit():
+            continue
+        children.setdefault(parent_pid, []).append((child_pid, cmd))
+
+    output_dirs: List[str] = []
+    seen_dirs: set[str] = set()
+    seen_pids = {root_pid}
+    pending = [root_pid]
+    while pending:
+        parent_pid = pending.pop()
+        for child_pid, cmd in children.get(parent_pid, []):
+            if child_pid in seen_pids:
+                continue
+            seen_pids.add(child_pid)
+            pending.append(child_pid)
+            if not _is_training_cmd(cmd):
+                continue
+            output_dir = _extract_param(cmd, "--output_dir") or _extract_param(
+                cmd, "--output-dir"
+            )
+            output_dir = str(output_dir or "").strip().strip("'\"")
+            if output_dir and output_dir not in seen_dirs:
+                seen_dirs.add(output_dir)
+                output_dirs.append(output_dir)
+    return output_dirs
+
+
+def _is_batch_sft_launcher_context(
+    pid_record: Optional[Dict[str, Any]], proc_cmdline: str
+) -> bool:
+    values = [proc_cmdline]
+    if isinstance(pid_record, dict):
+        values.extend(
+            str(pid_record.get(key) or "")
+            for key in ("script_name", "script_path", "command")
+        )
+    identity = " ".join(values).lower()
+    return any(name in identity for name in ("batch_train_lora", "batch_train_full"))
+
+
+def _resolve_descendant_output_dir(
+    container: str, pid: Optional[str]
+) -> Tuple[Optional[str], Optional[str]]:
+    if not container or not pid or not str(pid).isdigit():
+        return None, None
+    code, out, _ = _docker_exec(container, ["ps", "-eo", "pid=,ppid=,args="])
+    if code != 0:
+        return None, "proc_descendant_scan_failed"
+    output_dirs = _descendant_training_output_dirs(out, str(pid))
+    if len(output_dirs) == 1:
+        return output_dirs[0], "proc_descendant"
+    if len(output_dirs) > 1:
+        return None, "proc_descendant_ambiguous"
+    return None, "proc_descendant_no_output_dir"
+
+
 def _resolve_output_dir_from_pid_context(
     container: str,
     pid: Optional[str],
@@ -982,11 +1349,30 @@ def _resolve_output_dir_from_pid_context(
                 value = str(script_args.get(key) or "").strip()
                 if value:
                     return value, f"pid_registry:script_args:{key}"
+        launch_log_file = str(pid_record.get("launch_log_file") or "").strip()
+        if launch_log_file:
+            output_dir = _parse_output_dir_from_log(container, launch_log_file)
+            if output_dir:
+                return output_dir, "pid_registry:launch_log"
 
     cmdline = _read_proc_cmdline(container, pid)
     output_dir = _extract_param(cmdline, "--output_dir") or _extract_param(cmdline, "--output-dir")
     if output_dir:
         return output_dir, "proc_cmdline"
+    if _is_batch_sft_launcher_context(pid_record, cmdline):
+        descendant_output_dir, descendant_source = _resolve_descendant_output_dir(
+            container, pid
+        )
+        logger.info(
+            "[train-monitor] batch_descendant_output_dir "
+            "container=%s pid=%s source=%s output_dir=%s",
+            container,
+            pid,
+            descendant_source,
+            descendant_output_dir,
+        )
+        if descendant_output_dir:
+            return descendant_output_dir, descendant_source
     return None, None
 
 
@@ -1288,20 +1674,88 @@ path = sys.argv[1]
 if not os.path.exists(path):
     print("")
     raise SystemExit(0)
+patterns = (
+    re.compile(r"--output[_-]dir(?:=|\s+)['\"]?([^\s'\";,]+)", re.I),
+    re.compile(r"output[_-]dir\s*(?:is\s*:?|=|:)\s*['\"]?([^\s'\";,]+)", re.I),
+    re.compile(r"saved model(?:\s+(?:to|at))?\s*:?\s*['\"]?([^\s'\";,]*/global_step_\d+)", re.I),
+)
+matched = None
 with open(path, "r", encoding="utf-8", errors="ignore") as f:
-    lines = f.readlines()[-200:]
-pattern = re.compile(r"output_dir\s*(?:is|=|:)\s*([/\w\-\.]+)")
-for line in reversed(lines):
-    m = pattern.search(line)
-    if m:
-        print(m.group(1))
-        raise SystemExit(0)
-print("")
+    for line in f:
+        for pattern in patterns:
+            m = pattern.search(line)
+            if m:
+                matched = m.group(1).rstrip("/")
+print(matched or "")
 """
     code, out, _ = _docker_exec_python(container, script, [log_file])
     if code == 0 and out:
         return out.strip()
     return None
+
+
+def _parse_output_dir_from_wandb_run(
+    container: str,
+    run_dir: Optional[str],
+) -> Optional[str]:
+    value = str(run_dir or "").strip().rstrip("/")
+    if not container or not value:
+        return None
+    script = r"""
+import json, os, re, sys
+run_dir = sys.argv[1]
+patterns = (
+    re.compile(r"--output[_-]dir(?:=|\s+)['\"]?([^\s'\";,]+)", re.I),
+    re.compile(r"output[_-]dir\s*(?:is\s*:?|=|:)\s*['\"]?([^\s'\";,]+)", re.I),
+)
+candidates = []
+metadata_path = os.path.join(run_dir, "files", "wandb-metadata.json")
+if os.path.isfile(metadata_path):
+    try:
+        with open(metadata_path, "r", encoding="utf-8", errors="ignore") as f:
+            metadata = json.load(f)
+        args = metadata.get("args") if isinstance(metadata, dict) else None
+        if isinstance(args, list):
+            for index, token in enumerate(args):
+                token_text = str(token)
+                if token_text.startswith(("--output_dir=", "--output-dir=")):
+                    print(token_text.split("=", 1)[1].rstrip("/"))
+                    raise SystemExit(0)
+                if token_text in {"--output_dir", "--output-dir"} and index + 1 < len(args):
+                    print(str(args[index + 1]).rstrip("/"))
+                    raise SystemExit(0)
+        candidates.append(json.dumps(metadata, ensure_ascii=False))
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+config_path = os.path.join(run_dir, "files", "config.yaml")
+if os.path.isfile(config_path):
+    try:
+        with open(config_path, "r", encoding="utf-8", errors="ignore") as f:
+            config_text = f.read()
+        block = re.search(
+            r"(?mi)^output[_-]dir[ \t]*:[ \t]*(?:\r?\n[ \t]+value[ \t]*:[ \t]*)?['\"]?([^\s'\";,]+)",
+            config_text,
+        )
+        if block:
+            print(block.group(1).rstrip("/"))
+            raise SystemExit(0)
+        candidates.append(config_text)
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+for candidate in candidates:
+    for pattern in patterns:
+        match = pattern.search(candidate)
+        if match:
+            print(match.group(1).rstrip("/"))
+            raise SystemExit(0)
+print("")
+"""
+    code, out, _ = _docker_exec_python(container, script, [value], timeout=10)
+    return out.strip() if code == 0 and out.strip() else None
 
 
 def _scan_latest_dir(
@@ -1433,6 +1887,36 @@ def _read_launch_log_tail(
     code, out, _ = _docker_exec(
         container,
         ["sh", "-c", f"test -f {shlex.quote(path)} && tail -n {safe_count} {shlex.quote(path)}"],
+    )
+    return out.strip() if code == 0 else ""
+
+
+def _read_launch_log_state_markers(
+    container: str,
+    pid_record: Optional[Dict[str, Any]],
+) -> str:
+    """Read stage markers from the whole launch log, not just its last lines."""
+    if not container or not isinstance(pid_record, dict):
+        return ""
+    path = str(pid_record.get("launch_log_file") or "").strip()
+    if not path:
+        return ""
+    markers = (
+        "training started[.]|start training|[*][*][*][*][*] running training [*][*][*][*][*]|"
+        "merging lora weights|merge started[.]|export started[.]|"
+        "merge weights operation completed successfully|merge command executed successfully|"
+        "export command executed successfully|merge weights operation failed|"
+        "merge command failed|export failed|export command failed|"
+        "train launcher successfully|dpo multi-node train launcher completed successfully|"
+        "training finished[.] duration"
+    )
+    code, out, _ = _docker_exec(
+        container,
+        [
+            "sh", "-c",
+            f"test -f {shlex.quote(path)} && "
+            f"grep -Eio {shlex.quote(markers)} {shlex.quote(path)} | sort -u",
+        ],
     )
     return out.strip() if code == 0 else ""
 
@@ -1591,10 +2075,23 @@ def _record_train_status(
     last_update_time: Optional[str],
     completion_reason: Optional[str] = None,
     completion_source: Optional[str] = None,
+    output_dir: Optional[str] = None,
+    export_dir: Optional[str] = None,
+    merge_status: Optional[str] = None,
+    train_type: Optional[str] = None,
+    launch_mode: Optional[str] = None,
+    script_name: Optional[str] = None,
 ) -> None:
     if not container or not pid:
         return
     os.makedirs(_RUNTIME_DIR, exist_ok=True)
+    previous = _get_status_record_by_pid(container, str(pid)) or {}
+    output_dir = output_dir or previous.get("output_dir")
+    export_dir = export_dir or previous.get("export_dir")
+    merge_status = merge_status or previous.get("merge_status")
+    train_type = train_type or previous.get("train_type")
+    launch_mode = launch_mode or previous.get("launch_mode")
+    script_name = script_name or previous.get("script_name")
     record = {
         "container": container,
         "pid": str(pid),
@@ -1610,6 +2107,12 @@ def _record_train_status(
         "output_log_success": output_log_success,
         "completion_reason": completion_reason,
         "completion_source": completion_source,
+        "output_dir": output_dir,
+        "export_dir": export_dir,
+        "merge_status": merge_status,
+        "train_type": train_type,
+        "launch_mode": launch_mode,
+        "script_name": script_name,
         "last_update_time": last_update_time,
         "updated_at": datetime.now().isoformat(),
     }
@@ -1620,6 +2123,7 @@ def _record_train_status(
 def _build_payload_from_status_record(
     container: str,
     record: Dict[str, Any],
+    started_at: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     status = record.get("status") or "unknown"
     latest_loss = record.get("latest_loss")
@@ -1653,6 +2157,9 @@ def _build_payload_from_status_record(
     record_train_type = normalize_train_type(record.get("train_type") or record.get("trainType"))
     record_launch_mode = record.get("launch_mode") or record.get("launchMode")
     record_script = record.get("script_name") or record.get("scriptName")
+    recorded_run = _run_record_from_dir(record.get("wandb_run_dir"))
+    if not _wandb_run_is_current(recorded_run, started_at):
+        recorded_run = None
     payload = {
         "status": status,
         "metrics": {
@@ -1669,12 +2176,18 @@ def _build_payload_from_status_record(
             "script_name": record_script,
             "scriptName": record_script,
             "training_process_exists": False,
+            "output_dir": record.get("output_dir"),
+            "artifact_output_dir": record.get("output_dir"),
+            "output_dir_exists": True if record.get("output_dir") else None,
+            "export_dir": record.get("export_dir"),
+            "export_dir_exists": True if record.get("export_dir") else None,
+            "merge_status": record.get("merge_status"),
             "latest_loss": latest_loss,
             "latest_epoch": latest_epoch,
             "latest_step": latest_step,
             "last_update_time": last_update_time,
-            "wandb_run_name": record.get("wandb_run_name"),
-            "wandb_run_dir": record.get("wandb_run_dir"),
+            "wandb_run_name": recorded_run.get("name") if recorded_run else None,
+            "wandb_run_dir": recorded_run.get("path") if recorded_run else None,
             "wandb_mode": wandb_mode,
             "finished": status == "finished",
             "succeeded": succeeded,
@@ -1784,6 +2297,7 @@ def _wandb_root_candidates(
         for fallback_root in (
             DEFAULT_LOG_WANDB_ROOT,
             DEFAULT_WANDB_ROOT,
+            DEFAULT_LEGACY_WANDB_ROOT,
             DEFAULT_INSINFER_WANDB_ROOT,
         ):
             add(fallback_root, f"fallback:{fallback_root}")
@@ -1990,13 +2504,152 @@ def _dpo_sub_stage_text(sub_stage: Optional[str]) -> Optional[str]:
 def _extract_export_dir_from_text(text: str) -> Optional[str]:
     for pattern in (
         r"export_dir\s+is\s*:\s*(\S+)",
-        r"--export_dir\s+(\S+)",
+        r"--export[_-]dir(?:=|\s+)(\S+)",
         r"Configuration saved in\s+(\S+)/config\.json",
     ):
         match = re.search(pattern, text or "", re.IGNORECASE)
         if match:
-            return match.group(1).rstrip("/")
+            return match.group(1).strip("'\"()[]{}<>,;").rstrip("/")
     return None
+
+
+def _extract_output_dir_from_text(text: str) -> Optional[str]:
+    for pattern in (
+        r"--output[_-]dir(?:=|\s+)['\"]?([^\s'\";,]+)",
+        r"output[_-]dir\s*(?:is\s*:?|=|:)\s*['\"]?([^\s'\";,]+)",
+        r"saved model(?:\s+(?:to|at))?\s*:?\s*['\"]?([^\s'\";,]*/global_step_\d+)",
+    ):
+        match = re.search(pattern, text or "", re.IGNORECASE)
+        if match:
+            return match.group(1).strip("'\"()[]{}<>,;").rstrip("/")
+    return None
+
+
+def _container_directory_exists(container: str, path: Optional[str]) -> bool:
+    value = str(path or "").strip()
+    if not container or not value or not value.startswith("/"):
+        return False
+    return _docker_exec(container, ["test", "-d", value], timeout=5)[0] == 0
+
+
+def _read_container_file_tail(
+    container: str,
+    path: Optional[str],
+    line_count: int = 300,
+) -> str:
+    value = str(path or "").strip()
+    if not container or not value:
+        return ""
+    safe_count = max(1, min(int(line_count), 500))
+    code, out, _ = _docker_exec(
+        container,
+        ["sh", "-c", f"test -f {shlex.quote(value)} && tail -n {safe_count} {shlex.quote(value)}"],
+        timeout=10,
+    )
+    return out.strip() if code == 0 else ""
+
+
+def _artifact_log_paths_for_output_dir(
+    output_dir: Optional[str],
+    training_descriptor: Optional[Dict[str, Any]],
+) -> List[str]:
+    output_name = str(output_dir or "").rstrip("/").rsplit("/", 1)[-1]
+    descriptor_paths = (training_descriptor or {}).get("paths") or {}
+    monitoring = (training_descriptor or {}).get("monitoring") or {}
+    log_root = str(descriptor_paths.get("logRoot") or "").rstrip("/")
+    if not output_name or not log_root:
+        return []
+    paths: List[str] = []
+    for pattern in monitoring.get("logFiles") or []:
+        pattern_text = str(pattern or "").strip()
+        if not pattern_text or not any(token in pattern_text.lower() for token in ("merge", "export")):
+            continue
+        filename = pattern_text.replace("*", output_name)
+        if "/" in filename or "\\" in filename:
+            continue
+        candidate = f"{log_root}/{filename}"
+        if candidate not in paths:
+            paths.append(candidate)
+    return paths
+
+
+def _resolve_export_dir_from_job_logs(
+    container: str,
+    output_dir: Optional[str],
+    launch_log_tail: str,
+    training_descriptor: Optional[Dict[str, Any]],
+) -> Tuple[Optional[str], Optional[str]]:
+    candidates: List[Tuple[str, str]] = []
+    launch_export_dir = _extract_export_dir_from_text(launch_log_tail)
+    if launch_export_dir:
+        candidates.append((launch_export_dir, "launch_log"))
+    for log_path in _artifact_log_paths_for_output_dir(output_dir, training_descriptor):
+        export_dir = _extract_export_dir_from_text(
+            _read_container_file_tail(container, log_path)
+        )
+        if export_dir:
+            candidates.append((export_dir, f"artifact_log:{log_path}"))
+    seen: set[str] = set()
+    for candidate, source in candidates:
+        normalized = str(candidate or "").strip().rstrip("/")
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        if _container_directory_exists(container, normalized):
+            return normalized, source
+    output_value = str(output_dir or "").strip().rstrip("/")
+    policy = (training_descriptor or {}).get("artifactPolicy") or {}
+    if output_value and "merged" in (policy.get("produces") or []):
+        verified_siblings = [f"{output_value}_merged"]
+        descriptor_paths = (training_descriptor or {}).get("paths") or {}
+        export_root = str(descriptor_paths.get("exportRoot") or "").strip().rstrip("/")
+        output_name = output_value.rsplit("/", 1)[-1]
+        if export_root and output_name:
+            verified_siblings.extend(
+                [
+                    f"{export_root}/model_dpo_{output_name}",
+                    f"{export_root}/model_medical_{output_name}",
+                ]
+            )
+        for candidate in verified_siblings:
+            if _container_directory_exists(container, candidate):
+                return candidate, "verified_output_sibling"
+    return None, None
+
+
+def _resolve_training_artifact_dirs(
+    container: str,
+    pid: Optional[str],
+    pid_record: Optional[Dict[str, Any]],
+    output_dir: Optional[str] = None,
+    launch_log_tail: str = "",
+    training_descriptor: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Optional[str]]:
+    resolved_output_dir = str(output_dir or "").strip().rstrip("/") or None
+    output_dir_source: Optional[str] = None
+    if not resolved_output_dir:
+        resolved_output_dir, output_dir_source = _resolve_output_dir_from_pid_context(
+            container,
+            pid,
+            pid_record,
+        )
+    if not _container_directory_exists(container, resolved_output_dir):
+        resolved_output_dir = None
+        output_dir_source = None
+    if not launch_log_tail:
+        launch_log_tail = _read_launch_log_tail(container, pid_record, line_count=500)
+    export_dir, export_dir_source = _resolve_export_dir_from_job_logs(
+        container,
+        resolved_output_dir,
+        launch_log_tail,
+        training_descriptor,
+    )
+    return {
+        "output_dir": resolved_output_dir,
+        "output_dir_source": output_dir_source,
+        "export_dir": export_dir,
+        "export_dir_source": export_dir_source,
+    }
 
 
 def _parse_dpo_launch_log_state(log_text: str) -> Dict[str, Any]:
@@ -2016,15 +2669,18 @@ def _parse_dpo_launch_log_state(log_text: str) -> Dict[str, Any]:
     merge_started = (
         "merging lora weights" in lower
         or "merge started." in lower
+        or "export started." in lower
     )
     merge_succeeded = (
         "merge weights operation completed successfully" in lower
         or "merge command executed successfully" in lower
+        or "export command executed successfully" in lower
     )
     merge_failed = (
         "merge weights operation failed" in lower
         or "merge command failed" in lower
         or "export failed" in lower
+        or "export command failed" in lower
     )
     launcher_finished = (
         "train launcher successfully" in lower
@@ -2057,6 +2713,51 @@ def _parse_dpo_launch_log_state(log_text: str) -> Dict[str, Any]:
         "merge_failed": merge_failed,
         "launcher_finished": launcher_finished,
     }
+
+
+def _resolve_training_descriptor(
+    script_name: Optional[str],
+    train_type: Optional[str],
+    launch_mode: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    for identity in (script_name,):
+        descriptor = find_training_descriptor(str(identity or ""))
+        if descriptor:
+            return descriptor
+
+    public_type = public_train_type(train_type, launch_mode, script_name)
+    descriptor_id = {
+        "lora_sft": "batch_train_lora",
+        "full_sft": "batch_train_full",
+        "pretrain_lora": "batch_train_pretrain_lora",
+        "pretrain_full": "batch_train_pretrain_full",
+        "enhanced": "dpo_train_launcher",
+        "multinode_lora_sft": "train_multinode_sft_pipeline",
+        "multinode_full_sft": "train_multinode_sft_full_pipeline",
+        "multinode_enhanced": "train_multinode_dpo_pipeline",
+        "grpo": "grpo_train",
+    }.get(str(public_type or ""))
+    return find_training_descriptor(descriptor_id or "")
+
+
+def _training_lifecycle_status(
+    status: Optional[str],
+    sub_stage: Optional[str] = None,
+    merge_status: Optional[str] = None,
+) -> str:
+    normalized_status = str(status or "unknown").strip().lower()
+    normalized_merge_status = str(merge_status or "").strip().lower()
+    if normalized_status in {"failed", "interrupted", "stopped"} or normalized_merge_status == "failed":
+        return "failed"
+    if normalized_merge_status == "running" or str(sub_stage or "").lower() == "merge":
+        return "exporting"
+    if normalized_status == "finished":
+        return "completed"
+    if normalized_status in {"preparing", "starting"}:
+        return "preparing"
+    if normalized_status == "running":
+        return "training"
+    return "unknown"
 
 
 def _parse_dpo_output_log_stage(lines: List[str]) -> Dict[str, Any]:
@@ -2425,7 +3126,12 @@ def _confirm_realtime_tqdm_progress(
     return confirmed, reason
 
 
-def _read_output_log(container: str, path: str, history_limit: int) -> Dict[str, Any]:
+def _read_output_log(
+    container: str,
+    path: str,
+    history_limit: int,
+    latest_step_hint: Optional[Any] = None,
+) -> Dict[str, Any]:
     cmd = f"tail -n {int(history_limit)} {shlex.quote(path)}"
     code, out, _ = _docker_exec(container, ["sh", "-c", cmd], timeout=15)
     history: List[Dict[str, Any]] = []
@@ -2444,7 +3150,7 @@ def _read_output_log(container: str, path: str, history_limit: int) -> Dict[str,
     if code == 0 and out:
         lines = out.splitlines()
         training_start_signal = _lines_have_training_start_signal(lines)
-        history = parse_output_log_history(lines)
+        history = parse_output_log_history(lines, latest_step_hint=latest_step_hint)
         progress_info = _parse_output_log_progress(lines)
         completion_info = _parse_training_completion_from_output_log(lines)
         error_hint = completion_info.get("active_error_line")
@@ -2630,6 +3336,99 @@ def _log_data_has_any_metrics(data: Any) -> bool:
     )
 
 
+def _log_data_has_job_evidence(data: Any) -> bool:
+    if not isinstance(data, dict) or not data:
+        return False
+    return bool(
+        _log_data_has_any_metrics(data)
+        or data.get("error_hint")
+        or data.get("success_hint")
+        or data.get("success_found")
+        or data.get("finished")
+        or data.get("training_start_signal")
+    )
+
+
+def _filter_log_data_for_job_start(
+    data: Optional[Dict[str, Any]],
+    job_started_at: Optional[datetime],
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    """Drop evidence from a reused output directory that predates this job."""
+    if not isinstance(data, dict) or not data:
+        return {}, None
+    if job_started_at is None or not _log_data_has_job_evidence(data):
+        return data, None
+
+    last_update_time = data.get("last_update_time")
+    if not last_update_time:
+        return data, None
+    try:
+        last_update_at = datetime.fromisoformat(str(last_update_time))
+        last_update_ts = last_update_at.timestamp()
+        job_started_ts = job_started_at.timestamp()
+    except (TypeError, ValueError, OSError):
+        return data, None
+
+    if last_update_ts >= job_started_ts - CURRENT_JOB_LOG_MTIME_TOLERANCE_SECONDS:
+        return data, None
+
+    diagnostic = {
+        "reason": "predates_current_job",
+        "path": data.get("path"),
+        "last_update_time": str(last_update_time),
+        "job_started_at": job_started_at.isoformat(),
+    }
+    return {
+        "path": data.get("path"),
+        "last_update_time": str(last_update_time),
+        "ignored": True,
+        "ignore_reason": "predates_current_job",
+    }, diagnostic
+
+
+def _should_fail_for_stale_metrics(
+    stale: bool,
+    training_process_exists: bool,
+    status: str,
+    error_reason: Optional[str],
+    wandb_run_dir: Optional[str],
+    merge_status: Optional[str],
+    final_step_confirmed: bool = False,
+) -> bool:
+    if (
+        not stale
+        or (training_process_exists and (merge_status == "running" or final_step_confirmed))
+        or status == "finished"
+    ):
+        return False
+    if (
+        training_process_exists
+        and not wandb_run_dir
+        and error_reason in {"wandb_run_not_found", "wandb_no_metrics"}
+    ):
+        return False
+    return True
+
+
+def _final_training_step_confirmed(
+    current_step: Any,
+    total_steps: Any,
+    progress_percent: Any,
+) -> bool:
+    """A completed iteration may spend a long time saving or merging shards."""
+    current = _to_float_or_none(current_step)
+    total = _to_float_or_none(total_steps)
+    progress = _to_float_or_none(str(progress_percent).strip().rstrip("%"))
+    return bool(
+        current is not None
+        and total is not None
+        and total > 0
+        and current >= total
+        and progress is not None
+        and progress >= 100
+    )
+
+
 def _log_data_has_chart_metrics(data: Any) -> bool:
     if not isinstance(data, dict) or not data:
         return False
@@ -2689,77 +3488,15 @@ def _candidate_wandb_runs_for_ended_pid(
     run_start_time: Optional[datetime],
     time_window_minutes: int,
 ) -> List[Dict[str, Any]]:
-    candidates: List[Dict[str, Any]] = []
-    seen: set = set()
-
-    def _add(run: Optional[Dict[str, Any]], reason: str, score: float = 0.0) -> None:
-        if not run or not run.get("path"):
-            return
-        key = str(run.get("path"))
-        if key in seen:
-            return
-        seen.add(key)
-        item = dict(run)
-        item["select_reason"] = reason
-        item["select_score"] = score
-        candidates.append(item)
-
-    roots = []
-    for root in (wandb_root, DEFAULT_INSINFER_WANDB_ROOT, DEFAULT_VERL_WANDB_ROOT, DEFAULT_WANDB_ROOT):
-        if root and root not in roots:
-           roots.append(root) 
-
-    wandb_url = _read_wandb_url_file(pid)
-    run_id = _extract_run_id_from_wandb_url(wandb_url)
-    if run_id:
-        for root in roots:
-            _add(
-                _run_record_from_dir(_find_wandb_run_dir_by_id(container, root, run_id)),
-                "pid_wandb_url",
-                0.0,
-            )
-
-    training_log_path = None
-    if pid_record:
-        training_log_path = _extract_log_file(str(pid_record.get("command") or ""))
-    if training_log_path:
-        log_wandb_url = _read_wandb_url_from_log_file(container, training_log_path)
-        log_run_id = _extract_run_id_from_wandb_url(log_wandb_url)
-        if log_run_id:
-            _write_wandb_url_file(pid, log_wandb_url)
-            for root in roots:
-                _add(
-                    _run_record_from_dir(_find_wandb_run_dir_by_id(container, root, log_run_id)),
-                    "training_log_wandb_url",
-                    1.0,
-                )
-
-    selected_by_time, time_reason = select_wandb_run_by_start_time(
-        wandb_runs,
-        run_start_time,
-        time_window_minutes,
-        allow_early_seconds=120,
-    )
-    _add(selected_by_time, time_reason, 2.0)
-
-    if run_start_time:
-        earliest = run_start_time - timedelta(seconds=120)
-        latest = run_start_time + timedelta(minutes=max(1, int(time_window_minutes)))
-        scored: List[Tuple[float, Dict[str, Any]]] = []
-        for run in wandb_runs:
-            ts = parse_wandb_run_timestamp(run.get("name") or "")
-            if not ts and isinstance(run.get("mtime"), (int, float)) and run.get("mtime"):
-                ts = datetime.fromtimestamp(float(run.get("mtime")))
-            if not ts or ts < earliest or ts > latest:
-                continue
-            diff = abs((ts - run_start_time).total_seconds())
-            scored.append((diff, run))
-        scored.sort(key=lambda item: item[0])
-        for diff, run in scored[:12]:
-            _add(run, "start_time_output_log_scan", 10.0 + diff)
-
-    candidates.sort(key=lambda item: float(item.get("select_score") or 0.0))
-    return candidates
+    # A completed output.log is not evidence of this PID if it belongs to an
+    # older or concurrent run. The caller has no live process to disambiguate.
+    selected, reason = _select_current_wandb_run(container, wandb_runs, pid, run_start_time)
+    if not selected:
+        return []
+    candidate = dict(selected)
+    candidate["select_reason"] = reason
+    candidate["select_score"] = 0.0
+    return [candidate]
 
 
 def _build_finished_payload_from_output_log_candidate(
@@ -2805,6 +3542,32 @@ def _build_finished_payload_from_output_log_candidate(
     last_update_time = output_log_payload.get("last_update_time")
     completion_reason = completion_info.get("completion_reason") or "output_log_completion_marker"
     completion_source = "wandb_output_log"
+    record_train_type = normalize_train_type(
+        (pid_record or {}).get("train_type") or (pid_record or {}).get("trainType")
+        if isinstance(pid_record, dict)
+        else None
+    )
+    record_launch_mode = (
+        (pid_record or {}).get("launch_mode") or (pid_record or {}).get("launchMode")
+        if isinstance(pid_record, dict)
+        else None
+    )
+    record_script = (
+        (pid_record or {}).get("script_name") or (pid_record or {}).get("scriptName")
+        if isinstance(pid_record, dict)
+        else None
+    )
+    training_descriptor = _resolve_training_descriptor(
+        record_script,
+        record_train_type,
+        record_launch_mode,
+    )
+    artifacts = _resolve_training_artifact_dirs(
+        container,
+        pid,
+        pid_record,
+        training_descriptor=training_descriptor,
+    )
 
     _record_train_status(
         container,
@@ -2822,6 +3585,12 @@ def _build_finished_payload_from_output_log_candidate(
         last_update_time,
         completion_reason,
         completion_source,
+        artifacts.get("output_dir"),
+        artifacts.get("export_dir"),
+        "finished" if artifacts.get("export_dir") else None,
+        record_train_type,
+        record_launch_mode,
+        record_script,
     )
 
     analysis_text = (
@@ -2837,6 +3606,19 @@ def _build_finished_payload_from_output_log_candidate(
             "pid": str(pid) if pid else None,
             "pid_alive": False,
             "training_process_exists": False,
+            "train_type": record_train_type or "unknown",
+            "train_type_public": public_train_type(record_train_type, record_launch_mode, record_script),
+            "train_type_text": public_train_type_text(record_train_type, record_launch_mode, record_script),
+            "launch_mode": record_launch_mode,
+            "script_name": record_script,
+            "output_dir": artifacts.get("output_dir"),
+            "artifact_output_dir": artifacts.get("output_dir"),
+            "output_dir_source": artifacts.get("output_dir_source"),
+            "output_dir_exists": True if artifacts.get("output_dir") else None,
+            "export_dir": artifacts.get("export_dir"),
+            "export_dir_source": artifacts.get("export_dir_source"),
+            "export_dir_exists": True if artifacts.get("export_dir") else None,
+            "merge_status": "finished" if artifacts.get("export_dir") else None,
             "latest_loss": latest_loss,
             "latest_epoch": latest_epoch,
             "latest_step": latest_step,
@@ -2925,6 +3707,15 @@ def _build_finished_payload_from_grpo_launch_log(
     launch_log_path = (pid_record or {}).get("launch_log_file") if isinstance(pid_record, dict) else None
     completion_reason = "grpo_launch_log_completion"
     completion_source = "launch_log"
+    training_descriptor = _resolve_training_descriptor("grpo_train", "grpo", None)
+    artifacts = _resolve_training_artifact_dirs(
+        container,
+        pid,
+        pid_record,
+        output_dir=_extract_output_dir_from_text(launch_log_tail),
+        launch_log_tail=launch_log_tail,
+        training_descriptor=training_descriptor,
+    )
     cleanup_lines = [
         line.strip()
         for line in lines
@@ -2947,6 +3738,12 @@ def _build_finished_payload_from_grpo_launch_log(
         None,
         completion_reason,
         completion_source,
+        artifacts.get("output_dir"),
+        None,
+        None,
+        "grpo",
+        None,
+        "grpo_train",
     )
 
     analysis_text = "训练已完成，已解析到最终验证指标、模型保存或 W&B 同步信息。"
@@ -2963,6 +3760,10 @@ def _build_finished_payload_from_grpo_launch_log(
             "train_type": "grpo",
             "train_type_public": "grpo",
             "train_type_text": "GRPO",
+            "output_dir": artifacts.get("output_dir"),
+            "artifact_output_dir": artifacts.get("output_dir"),
+            "output_dir_source": artifacts.get("output_dir_source") or "launch_log",
+            "output_dir_exists": True if artifacts.get("output_dir") else None,
             "latest_loss": latest_loss,
             "latest_epoch": latest_epoch,
             "latest_step": latest_step,
@@ -3072,20 +3873,8 @@ def _build_finished_payload_from_dpo_launch_log(
         match = re.search(r"/home/workspace/models/dpo_train/internal/saves/(\d{14})", launch_log_tail)
         if match:
             output_dir = f"/home/workspace/models/dpo_train/internal/saves/{match.group(1)}"
-
-    export_dir = dpo_launch_state.get("export_dir")
-    if not export_dir and output_dir:
-        save_name = os.path.basename(output_dir.rstrip("/"))
-        if save_name:
-            export_candidates = [
-                f"/home/workspace/models/dpo_train/internal/export/model_dpo_{save_name}",
-                f"/home/workspace/models/dpo_train/internal/export/model_medical_{save_name}",
-            ]
-            export_dir = export_candidates[0]
-            for candidate in export_candidates:
-                if _docker_exec(container, ["test", "-d", candidate], timeout=5)[0] == 0:
-                    export_dir = candidate
-                    break
+    if not _container_directory_exists(container, output_dir):
+        output_dir = None
 
     record_train_type = normalize_train_type(
         (pid_record or {}).get("train_type") or (pid_record or {}).get("trainType")
@@ -3102,12 +3891,59 @@ def _build_finished_payload_from_dpo_launch_log(
         if isinstance(pid_record, dict)
         else None
     )
+    training_descriptor = _resolve_training_descriptor(
+        record_script,
+        record_train_type,
+        record_launch_mode,
+    )
+    export_dir, export_dir_source = _resolve_export_dir_from_job_logs(
+        container,
+        output_dir,
+        launch_log_tail,
+        training_descriptor,
+    )
+    if not export_dir and output_dir:
+        save_name = os.path.basename(output_dir.rstrip("/"))
+        if save_name:
+            export_candidates = [
+                f"/home/workspace/models/dpo_train/internal/export/model_dpo_{save_name}",
+                f"/home/workspace/models/dpo_train/internal/export/model_medical_{save_name}",
+            ]
+            for candidate in export_candidates:
+                if _container_directory_exists(container, candidate):
+                    export_dir = candidate
+                    export_dir_source = "verified_dpo_sibling"
+                    break
     train_type_value = record_train_type or "unknown"
     train_type_text = public_train_type_text(record_train_type, record_launch_mode, record_script)
     display_name = train_type_text or "训练"
     analysis_text = f"{display_name}已完成，已从启动日志确认 merge/export 成功。"
     if export_dir:
         analysis_text += f"\n导出模型：{export_dir}"
+
+    _record_train_status(
+        container,
+        pid,
+        "finished",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        _infer_wandb_mode(pid_record, None, None),
+        None,
+        True,
+        None,
+        "dpo_launcher_merge_success",
+        "launch_log",
+        output_dir,
+        export_dir,
+        dpo_launch_state.get("merge_status") or "finished",
+        record_train_type,
+        record_launch_mode,
+        record_script,
+    )
 
     return {
         "status": "finished",
@@ -3120,7 +3956,11 @@ def _build_finished_payload_from_dpo_launch_log(
             "train_type_public": public_train_type(record_train_type, record_launch_mode, record_script),
             "train_type_text": train_type_text,
             "output_dir": output_dir,
+            "artifact_output_dir": output_dir,
+            "output_dir_exists": True if output_dir else None,
             "export_dir": export_dir,
+            "export_dir_source": export_dir_source,
+            "export_dir_exists": True if export_dir else None,
             "sub_stage": "finished",
             "sub_stage_text": _dpo_sub_stage_text("finished"),
             "merge_status": dpo_launch_state.get("merge_status") or "finished",
@@ -3388,6 +4228,50 @@ def _normalize_history_loss(history: Any) -> Any:
     return new_hist
 
 
+def _valid_curve_history(data: Any, history_limit: int) -> List[Dict[str, Any]]:
+    if not isinstance(data, dict):
+        return []
+    history = _normalize_history_loss(data.get("history") or [])
+    by_step: Dict[int, Dict[str, Any]] = {}
+    for item in history:
+        if not isinstance(item, dict) or not is_integer_step_value(item.get("step")):
+            continue
+        loss = item.get("loss")
+        if not isinstance(loss, (int, float)) or not math.isfinite(float(loss)):
+            continue
+        step = int(float(item.get("step")))
+        normalized = dict(item)
+        normalized["step"] = step
+        normalized["loss"] = float(loss)
+        by_step[step] = normalized
+    result = [by_step[step] for step in sorted(by_step)]
+    if history_limit > 0 and len(result) > history_limit:
+        result = result[-history_limit:]
+    return result
+
+
+def _select_curve_history(
+    trainer_state_data: Any,
+    wandb_data: Any,
+    trainer_log_data: Any,
+    output_log_data: Any,
+    training_log_data: Any,
+    history_limit: int,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    candidates = (
+        ("trainer_state", trainer_state_data),
+        ("wandb", wandb_data),
+        ("trainer_log", trainer_log_data),
+        ("output.log", output_log_data),
+        ("training_log", training_log_data),
+    )
+    for source, data in candidates:
+        history = _valid_curve_history(data, history_limit)
+        if history:
+            return history, source
+    return [], None
+
+
 def _find_last_finite_loss(history: Any, lookback: int = 20) -> Tuple[Optional[float], Optional[Any]]:
     if not isinstance(history, list) or not history:
         return None, None
@@ -3623,6 +4507,105 @@ print(json.dumps({
         return json.loads(out)
     except json.JSONDecodeError:
         return {"error": "trainer_log_invalid_json"}
+
+
+def _read_trainer_state_history(
+    container: str,
+    output_dir: Optional[str],
+    history_limit: int,
+) -> Dict[str, Any]:
+    """Read authoritative Hugging Face Trainer curve points from trainer_state.json."""
+    if not output_dir:
+        return {"error": "trainer_state_output_dir_missing"}
+    script = r"""
+import glob, json, math, os, re, sys, datetime
+
+root = sys.argv[1].rstrip("/")
+limit = int(sys.argv[2])
+paths = []
+root_state = os.path.join(root, "trainer_state.json")
+if os.path.isfile(root_state):
+    paths.append(root_state)
+paths.extend(glob.glob(os.path.join(root, "checkpoint-*", "trainer_state.json")))
+
+def to_number(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except Exception:
+        return None
+    return number if math.isfinite(number) else None
+
+def to_step(value):
+    number = to_number(value)
+    if number is None or number < 0 or abs(number - round(number)) > 1e-9:
+        return None
+    return int(round(number))
+
+best = None
+for path in paths:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+            state = json.load(handle)
+    except Exception:
+        continue
+    raw_history = state.get("log_history")
+    if not isinstance(raw_history, list):
+        continue
+    by_step = {}
+    for record in raw_history:
+        if not isinstance(record, dict) or "loss" not in record:
+            continue
+        step = to_step(record.get("step"))
+        loss = to_number(record.get("loss"))
+        if step is None or loss is None:
+            continue
+        item = {"step": step, "loss": loss}
+        epoch = to_number(record.get("epoch"))
+        learning_rate = to_number(record.get("learning_rate", record.get("lr")))
+        if epoch is not None:
+            item["epoch"] = epoch
+        if learning_rate is not None:
+            item["learning_rate"] = learning_rate
+        by_step[step] = item
+    history = [by_step[key] for key in sorted(by_step)]
+    if not history:
+        continue
+    global_step = to_step(state.get("global_step"))
+    max_step = history[-1]["step"]
+    mtime = os.path.getmtime(path)
+    score = (global_step if global_step is not None else max_step, len(history), mtime)
+    if best is None or score > best[0]:
+        best = (score, path, history, mtime)
+
+if best is None:
+    print(json.dumps({"error": "trainer_state_not_found"}))
+    raise SystemExit(0)
+
+_, path, full_history, mtime = best
+history = full_history[-limit:] if limit > 0 else full_history
+print(json.dumps({
+    "history": history,
+    "latest": history[-1] if history else None,
+    "history_count": len(history),
+    "raw_history_count": len(full_history),
+    "last_update_time": datetime.datetime.fromtimestamp(mtime).isoformat(),
+    "path": path,
+}))
+"""
+    code, out, _ = _docker_exec_python(
+        container,
+        script,
+        [str(output_dir), str(history_limit)],
+    )
+    if code != 0 or not out:
+        return {"error": "trainer_state_read_failed"}
+    try:
+        payload = json.loads(out)
+    except json.JSONDecodeError:
+        return {"error": "trainer_state_invalid_json"}
+    return payload if isinstance(payload, dict) else {"error": "trainer_state_invalid_payload"}
 
 
 def _read_tensorboard_events(container: str, events_path: str, history_limit: int) -> Dict[str, Any]:
@@ -3963,6 +4946,7 @@ def monitor_training(
     allow_llm: bool = True,
 ) -> ToolResponse:
     try:
+        pid_started_at = None
         _ = session_id  # session_id 当前未参与定位（保留参数兼容）
         user_supplied_wandb_root = bool(wandb_root)
         wandb_root = (wandb_root or DEFAULT_WANDB_ROOT).strip()
@@ -4078,13 +5062,13 @@ def monitor_training(
                 return _monitor_response(payload)
 
         pid_started_at = None
-        if pid and pid in start_times:
-            pid_started_at = start_times.get(pid)
-        elif pid_record and pid_record.get("started_at"):
+        if pid_record and pid_record.get("started_at"):
             try:
                 pid_started_at = datetime.fromisoformat(str(pid_record.get("started_at")))
             except Exception:
                 pid_started_at = None
+        if pid_started_at is None and pid and pid in start_times:
+            pid_started_at = start_times.get(pid)
 
         selected_proc = None
         output_dir_source = "no_process"
@@ -4137,12 +5121,22 @@ def monitor_training(
         train_type_value = train_type or "unknown"
         train_type_public = public_train_type(train_type, launch_mode, script_name_for_type)
         train_type_text = public_train_type_text(train_type, launch_mode, script_name_for_type)
+        training_descriptor = _resolve_training_descriptor(
+            script_name_for_type,
+            train_type,
+            launch_mode,
+        )
+        descriptor_paths = (training_descriptor or {}).get("paths") or {}
+        descriptor_monitoring = (training_descriptor or {}).get("monitoring") or {}
         launch_log_tail_for_state = (
             _read_launch_log_tail(container_name, pid_record)
             if isinstance(pid_record, dict)
             else ""
         )
-        dpo_launch_state = _parse_dpo_launch_log_state(launch_log_tail_for_state)
+        launch_log_state_markers = _read_launch_log_state_markers(container_name, pid_record)
+        dpo_launch_state = _parse_dpo_launch_log_state(
+            launch_log_state_markers or launch_log_tail_for_state
+        )
         uses_trainer_log_metrics = train_type_public in {
             "pretrain_lora",
             "pretrain_full",
@@ -4172,14 +5166,17 @@ def monitor_training(
 
         allow_output_dir_scan = pid_source != "input"
         if not output_dir and allow_output_dir_scan:
-            scan_root = (
+            scan_root = str(descriptor_paths.get("outputRoot") or "").strip() or (
                 DEFAULT_PRETRAIN_ROOT
                 if train_type_public in {"pretrain_lora", "pretrain_full"}
                 else DEFAULT_BATCH_TRAIN_ROOT
             )
             output_dir = _scan_latest_dir(container_name, scan_root, cutoff_ts)
             if output_dir:
-                output_dir_source = "scan:pretrain" if scan_root == DEFAULT_PRETRAIN_ROOT else "scan:batch_train"
+                descriptor_id = str((training_descriptor or {}).get("id") or "").strip()
+                output_dir_source = f"scan:descriptor:{descriptor_id}" if descriptor_id else (
+                    "scan:pretrain" if scan_root == DEFAULT_PRETRAIN_ROOT else "scan:batch_train"
+                )
         if not output_dir and allow_output_dir_scan:
             output_dir = _scan_latest_dir(container_name, DEFAULT_SAVES_ROOT, cutoff_ts)
             if output_dir:
@@ -4224,32 +5221,32 @@ def monitor_training(
                 wandb_root = cmd_wandb_root
                 wandb_root_source = "process_cmd"
 
+        if not user_supplied_wandb_root and wandb_root_source == "default":
+            descriptor_wandb_root = str(descriptor_monitoring.get("wandbDir") or "").strip()
+            if descriptor_wandb_root:
+                wandb_root = descriptor_wandb_root
+                wandb_root_source = "training_descriptor"
+
         training_log_path = (
             _find_trainer_stdout_log_by_output_dir(container_name, output_dir, train_type_public)
             if uses_trainer_log_metrics
             else None
         )
-        wandb_url = _read_wandb_url_file(pid) if pid else None
-        wandb_url_source = "pid_file" if wandb_url else None
+        raw_pid_file_wandb_url = _read_wandb_url_file(pid) if pid else None
+        pid_file_wandb_url = raw_pid_file_wandb_url
+        wandb_url = None
+        wandb_url_source = None
         wandb_url_file = _wandb_url_file(pid) if pid else None
         wandb_url_file_exists = bool(wandb_url_file and os.path.exists(wandb_url_file))
-        wandb_url_pid_file_hit = bool(wandb_url)
-        if wandb_url and wandb_url_file and os.path.exists(wandb_url_file):
+        wandb_url_pid_file_hit = bool(pid_file_wandb_url)
+        if pid_file_wandb_url and wandb_url_file_exists:
             try:
                 file_mtime = os.path.getmtime(wandb_url_file)
-                if not _should_use_pid_file_url(training_process_exists, pid_started_at, file_mtime):
-                    wandb_url = None
-                    wandb_url_source = None
+                if not _should_use_pid_file_url(pid_started_at, file_mtime):
+                    pid_file_wandb_url = None
             except Exception:
-                pass
-        if wandb_url:
-            current_run_id = _extract_run_id_from_wandb_url(wandb_url)
-            if current_run_id:
-                existing_run_ids = _list_pid_url_run_ids(pid)
-                if current_run_id in existing_run_ids:
-                    wandb_url = None
-                    wandb_url_source = None
-        wandb_url_run_id = _extract_run_id_from_wandb_url(wandb_url)
+                pid_file_wandb_url = None
+        wandb_url_run_id = None
 
         wandb_runs: List[Dict[str, Any]] = []
         wandb_root_candidates = _wandb_root_candidates(
@@ -4261,52 +5258,62 @@ def monitor_training(
             container_name,
             pid,
             train_type_value,
+            pid_started_at,
             wandb_url_run_id,
         )
-        wandb_select_reason = "cache_hit" if wandb_run else "no_runs"
-        if not wandb_run and wandb_url_run_id:
-            wandb_run, wandb_select_reason = _find_wandb_run_from_url(
+        seen_wandb_run_paths: set[str] = set()
+        for candidate_root, candidate_source in wandb_root_candidates:
+            candidate_runs = _list_wandb_runs(container_name, candidate_root)
+            logger.info(
+                "[train-monitor] wandb_runs_discovered "
+                "container=%s pid=%s wandb_root=%s wandb_root_source=%s "
+                "wandb_runs_count=%s candidate_runs=%s",
                 container_name,
-                wandb_url,
-                wandb_root_candidates,
+                pid,
+                candidate_root,
+                candidate_source,
+                len(candidate_runs),
+                [run.get("name") for run in candidate_runs[:5]],
             )
-        if not wandb_run:
-            seen_wandb_run_paths: set[str] = set()
-            for candidate_root, candidate_source in wandb_root_candidates:
-                candidate_runs = _list_wandb_runs(container_name, candidate_root)
-                logger.info(
-                    "[train-monitor] wandb_runs_discovered "
-                    "container=%s pid=%s wandb_root=%s wandb_root_source=%s "
-                    "wandb_runs_count=%s candidate_runs=%s",
+            for candidate_run in candidate_runs:
+                run_path = str(candidate_run.get("path") or "").strip()
+                if not run_path or run_path in seen_wandb_run_paths:
+                    continue
+                seen_wandb_run_paths.add(run_path)
+                annotated_run = dict(candidate_run)
+                annotated_run["_wandb_root"] = candidate_root
+                annotated_run["_wandb_root_source"] = candidate_source
+                wandb_runs.append(annotated_run)
+        if pid:
+            selected_run, wandb_select_reason = _select_current_wandb_run(
+                container_name, wandb_runs, pid, pid_started_at
+            )
+            if wandb_run and selected_run and wandb_run.get("path") == selected_run.get("path"):
+                wandb_select_reason = "cache_hit"
+            wandb_run = selected_run
+        else:
+            wandb_run, wandb_select_reason = select_wandb_run(
+                wandb_runs, run_start_time, time_window_minutes
+            )
+        selected_wandb_output_dir = _parse_output_dir_from_wandb_run(
+            container_name,
+            wandb_run.get("path") if isinstance(wandb_run, dict) else None,
+        )
+        if _container_directory_exists(container_name, selected_wandb_output_dir):
+            output_dir = selected_wandb_output_dir
+            output_dir_source = "selected_wandb_run"
+            output_dir_exists = True
+            if uses_trainer_log_metrics:
+                training_log_path = _find_trainer_stdout_log_by_output_dir(
                     container_name,
-                    pid,
-                    candidate_root,
-                    candidate_source,
-                    len(candidate_runs),
-                    [run.get("name") for run in candidate_runs[:5]],
+                    output_dir,
+                    train_type_public,
                 )
-                for candidate_run in candidate_runs:
-                    run_path = str(candidate_run.get("path") or "").strip()
-                    if not run_path or run_path in seen_wandb_run_paths:
-                        continue
-                    seen_wandb_run_paths.add(run_path)
-                    annotated_run = dict(candidate_run)
-                    annotated_run["_wandb_root"] = candidate_root
-                    annotated_run["_wandb_root_source"] = candidate_source
-                    wandb_runs.append(annotated_run)
-            if pid:
-                wandb_run, wandb_select_reason = _find_wandb_run_by_pid(
-                    container_name,
-                    wandb_runs,
-                    pid,
-                )
-            if not wandb_run and pid_source == "input" and (pid_record or pid_matches_proc or run_start_time):
-                wandb_run, wandb_select_reason = select_wandb_run_by_start_time(
-                    wandb_runs,
-                    run_start_time,
-                    time_window_minutes,
-                    allow_early_seconds=0 if pid_alive else 60,
-                )
+        if _wandb_url_matches_run(pid_file_wandb_url, wandb_run, pid_started_at):
+            wandb_url = pid_file_wandb_url
+            wandb_url_source = "pid_file"
+        elif raw_pid_file_wandb_url:
+            _remove_wandb_url_file_if_matches(pid, raw_pid_file_wandb_url)
         pid_ok, pid_reason = validate_pid_binding(
             pid_source,
             pid_record,
@@ -4345,6 +5352,8 @@ def monitor_training(
                     _LAST_OK_BY_CONTAINER[container_name] = {
                         "payload": json.loads(json.dumps(completed_payload, ensure_ascii=False)),
                         "cached_at": datetime.now().isoformat(),
+                        "pid": pid,
+                        "started_at": pid_started_at.isoformat() if pid_started_at else None,
                     }
                 return _monitor_response(completed_payload)
 
@@ -4360,6 +5369,8 @@ def monitor_training(
                     _LAST_OK_BY_CONTAINER[container_name] = {
                         "payload": json.loads(json.dumps(completed_payload, ensure_ascii=False)),
                         "cached_at": datetime.now().isoformat(),
+                        "pid": pid,
+                        "started_at": pid_started_at.isoformat() if pid_started_at else None,
                     }
                 return _monitor_response(completed_payload)
 
@@ -4374,6 +5385,8 @@ def monitor_training(
                     _LAST_OK_BY_CONTAINER[container_name] = {
                         "payload": json.loads(json.dumps(completed_payload, ensure_ascii=False)),
                         "cached_at": datetime.now().isoformat(),
+                        "pid": pid,
+                        "started_at": pid_started_at.isoformat() if pid_started_at else None,
                     }
                 return _monitor_response(completed_payload)
 
@@ -4415,7 +5428,9 @@ def monitor_training(
             bool(wandb_run),
             bool(status_record),
         ):
-            payload = _build_payload_from_status_record(container_name, status_record or {})
+            payload = _build_payload_from_status_record(
+                container_name, status_record or {}, pid_started_at
+            )
             return _monitor_response(payload)
         if not wandb_run:
             if pid_source == "input":
@@ -4452,6 +5467,7 @@ def monitor_training(
         wandb_data: Dict[str, Any] = {}
         if wandb_run_dir:
             wandb_data = _read_wandb_run(container_name, wandb_run_dir, history_limit)
+        wandb_latest_step_hint = (wandb_data.get("latest") or {}).get("step")
         output_log_data: Dict[str, Any] = {}
         output_log_full_data: Optional[Dict[str, Any]] = None
         output_log_path = (
@@ -4460,49 +5476,24 @@ def monitor_training(
             else None
         )
         if output_log_path:
-            output_log_data = _read_output_log(container_name, output_log_path, history_limit)
+            output_log_data = _read_output_log(
+                container_name,
+                output_log_path,
+                history_limit,
+                latest_step_hint=wandb_latest_step_hint,
+            )
             count = output_log_data.get("count")
             if isinstance(count, int) and count > history_limit:
-                output_log_full_data = _read_output_log(container_name, output_log_path, count)
+                output_log_full_data = _read_output_log(
+                    container_name,
+                    output_log_path,
+                    count,
+                    latest_step_hint=wandb_latest_step_hint,
+                )
 
-        if not wandb_url and pid and pid_alive:
-            pid_log_path = _find_log_file_by_pid(container_name, pid)
-            if not training_log_path:
-                training_log_path = pid_log_path
-            for candidate_log_path in [training_log_path, pid_log_path]:
-                if not candidate_log_path:
-                    continue
-                wandb_url = _read_wandb_url_from_log_file(container_name, candidate_log_path)
-                if wandb_url:
-                    dup_run_id = _extract_run_id_from_wandb_url(wandb_url)
-                    if dup_run_id and dup_run_id in _list_pid_url_run_ids(pid):
-                        wandb_url = None
-                        wandb_url_source = None
-                    else:
-                        _write_wandb_url_file(pid, wandb_url)
-                        wandb_url_source = "training_log"
-                        training_log_path = candidate_log_path
-                        break
-        wandb_url_run_id = _extract_run_id_from_wandb_url(wandb_url)
-        run_id = wandb_url_run_id or _extract_wandb_run_id(wandb_run_name, wandb_run_dir)
-        if run_id and (training_log_path is None or wandb_url is None):
-            matched_logs = _find_log_files_by_run_id(container_name, DEFAULT_LOG_ROOT, run_id)
-            for matched_log in matched_logs:
-                if not training_log_path:
-                    training_log_path = matched_log
-                if wandb_url:
-                    break
-                candidate_url = _read_wandb_url_from_log_file(container_name, matched_log)
-                if not candidate_url:
-                    continue
-                dup_run_id = _extract_run_id_from_wandb_url(candidate_url)
-                if dup_run_id and dup_run_id in _list_pid_url_run_ids(pid):
-                    continue
-                wandb_url = candidate_url
-                training_log_path = matched_log
-                _write_wandb_url_file(pid, wandb_url)
-                wandb_url_source = "training_log"
-                break
+        pid_log_path = _find_log_file_by_pid(container_name, pid) if pid and pid_alive else None
+        if not training_log_path:
+            training_log_path = pid_log_path
         pid_record_log_path = _extract_log_file(str(pid_record.get("command") or "")) if pid_record else None
         if (not training_log_path) and pid_record_log_path:
             training_log_path = pid_record_log_path
@@ -4516,41 +5507,119 @@ def monitor_training(
             or str(training_log_path).startswith("/usr/local/insinfersystem/")
         ):
             training_log_path = trainer_stdout_log_path
-        if (not wandb_url) and pid_record_log_path and pid_record_log_path != training_log_path and wandb_mode != "offline":
-            log_wandb_url = _read_wandb_url_from_log_file(container_name, pid_record_log_path)
-            if log_wandb_url:
-                dup_run_id = _extract_run_id_from_wandb_url(log_wandb_url)
-                if not (dup_run_id and dup_run_id in _list_pid_url_run_ids(pid)):
-                    wandb_url = log_wandb_url
-                    training_log_path = pid_record_log_path
-                    _write_wandb_url_file(pid, wandb_url)
-                    wandb_url_source = "training_log"
-        if not wandb_url and training_log_path and wandb_mode != "offline":
-            log_wandb_url = _read_wandb_url_from_log_file(container_name, training_log_path)
-            if log_wandb_url:
-                dup_run_id = _extract_run_id_from_wandb_url(log_wandb_url)
-                if dup_run_id and dup_run_id in _list_pid_url_run_ids(pid):
-                    wandb_url = None
-                    wandb_url_source = None
-                else:
-                    wandb_url = log_wandb_url
-                    _write_wandb_url_file(pid, wandb_url)
-                    wandb_url_source = "training_log"
+        selected_run_id = _extract_wandb_run_id(wandb_run_name, wandb_run_dir)
+        selected_run_url_log_path = None
+        selected_run_url_diagnostic: Dict[str, Any] = {}
+        if not wandb_url and selected_run_id and wandb_mode != "offline":
+            (
+                selected_run_url,
+                selected_run_url_log_path,
+                selected_run_url_diagnostic,
+            ) = _probe_wandb_url_from_selected_run_logs(
+                container_name,
+                wandb_run_dir,
+                selected_run_id,
+            )
+            selected_run_url_matches = _wandb_url_matches_run(
+                selected_run_url, wandb_run, pid_started_at
+            )
+            selected_run_claimed = selected_run_id in _list_pid_url_run_ids(pid)
+            if selected_run_url_matches and not selected_run_claimed:
+                wandb_url = selected_run_url
+                wandb_url_source = "selected_run_log"
+                _write_wandb_url_file(pid, wandb_url)
+            elif selected_run_url and selected_run_claimed:
+                selected_run_url_diagnostic["reason"] = "run_id_claimed_by_other_pid"
+            elif selected_run_url:
+                selected_run_url_diagnostic["reason"] = "selected_run_binding_rejected"
+        if not wandb_url and selected_run_id and wandb_mode != "offline":
+            launch_log_path = str((pid_record or {}).get("launch_log_file") or "").strip()
+            log_candidates = [launch_log_path, trainer_stdout_log_path, training_log_path, pid_log_path]
+            seen_logs: set[str] = set()
+            for candidate_log_path in log_candidates:
+                if not candidate_log_path or candidate_log_path in seen_logs:
+                    continue
+                seen_logs.add(candidate_log_path)
+                log_wandb_url = _read_wandb_url_from_log_file(
+                    container_name, candidate_log_path, selected_run_id
+                )
+                if not _wandb_url_matches_run(log_wandb_url, wandb_run, pid_started_at):
+                    continue
+                if selected_run_id in _list_pid_url_run_ids(pid):
+                    selected_run_url_diagnostic["reason"] = "run_id_claimed_by_other_pid"
+                    break
+                wandb_url = log_wandb_url
+                wandb_url_source = "launch_log" if candidate_log_path == launch_log_path else "training_log"
+                _write_wandb_url_file(pid, wandb_url)
+                break
+        if not wandb_url and selected_run_id and wandb_mode != "offline":
+            logger.info(
+                "[train-monitor] wandb_url_probe "
+                "container=%s pid=%s run_id=%s run_dir=%s diagnostic=%s",
+                container_name,
+                pid,
+                selected_run_id,
+                wandb_run_dir,
+                json.dumps(selected_run_url_diagnostic, ensure_ascii=False, sort_keys=True),
+            )
         wandb_url_run_id = _extract_run_id_from_wandb_url(wandb_url)
         training_log_data: Dict[str, Any] = {}
         if training_log_path and (
             not output_log_data or not output_log_data.get("latest")
         ):
-            training_log_data = _read_output_log(container_name, training_log_path, history_limit)
+            training_log_data = _read_output_log(
+                container_name,
+                training_log_path,
+                history_limit,
+                latest_step_hint=wandb_latest_step_hint,
+            )
         trainer_log_path = f"{str(output_dir).rstrip('/')}/trainer_log.jsonl" if output_dir else None
         trainer_log_data: Dict[str, Any] = {}
         if uses_trainer_log_metrics and trainer_log_path:
             trainer_log_data = _read_trainer_log(container_name, trainer_log_path, history_limit)
+        trainer_state_data: Dict[str, Any] = {}
+        if str((training_descriptor or {}).get("backend") or "").strip().lower() == "llamafactory":
+            trainer_state_data = _read_trainer_state_history(
+                container_name,
+                output_dir,
+                history_limit,
+            )
+        job_log_started_at = pid_started_at or run_start_time
+        training_log_data, training_log_ignored = _filter_log_data_for_job_start(
+            training_log_data,
+            job_log_started_at,
+        )
+        trainer_log_data, trainer_log_ignored = _filter_log_data_for_job_start(
+            trainer_log_data,
+            job_log_started_at,
+        )
+        trainer_state_data, trainer_state_ignored = _filter_log_data_for_job_start(
+            trainer_state_data,
+            job_log_started_at,
+        )
+        for log_source, ignored_log in (
+            ("training_log", training_log_ignored),
+            ("trainer_log", trainer_log_ignored),
+            ("trainer_state", trainer_state_ignored),
+        ):
+            if ignored_log:
+                logger.info(
+                    "[train-monitor] prestart_log_ignored "
+                    "container=%s pid=%s source=%s path=%s "
+                    "last_update_time=%s job_started_at=%s reason=%s",
+                    container_name,
+                    pid,
+                    log_source,
+                    ignored_log.get("path"),
+                    ignored_log.get("last_update_time"),
+                    ignored_log.get("job_started_at"),
+                    ignored_log.get("reason"),
+                )
         logger.info(
             "[train-monitor] wandb_url_discovery "
             "container=%s pid=%s wandb_url_file=%s wandb_url_file_exists=%s "
             "pid_file_hit=%s training_log_path=%s training_log_url_hit=%s "
-            "wandb_url_source=%s wandb_url_run_id=%s",
+            "selected_run_url_log_path=%s wandb_url_source=%s wandb_url_run_id=%s",
             container_name,
             pid,
             wandb_url_file,
@@ -4558,6 +5627,7 @@ def monitor_training(
             wandb_url_pid_file_hit,
             training_log_path,
             bool(wandb_url and wandb_url_source == "training_log"),
+            selected_run_url_log_path,
             wandb_url_source,
             _extract_run_id_from_wandb_url(wandb_url),
         )
@@ -4571,7 +5641,12 @@ def monitor_training(
         if wandb_url_run_id and not (wandb_run_dir and wandb_url_run_id in wandb_run_dir):
             matched_run_dir = _find_wandb_run_dir_by_id(container_name, wandb_root, wandb_url_run_id)
             if not matched_run_dir:
-                for candidate_root in (DEFAULT_LOG_WANDB_ROOT, DEFAULT_WANDB_ROOT, DEFAULT_INSINFER_WANDB_ROOT):
+                for candidate_root in (
+                    DEFAULT_LOG_WANDB_ROOT,
+                    DEFAULT_WANDB_ROOT,
+                    DEFAULT_LEGACY_WANDB_ROOT,
+                    DEFAULT_INSINFER_WANDB_ROOT,
+                ):
                     if candidate_root == wandb_root:
                         continue
                     matched_run_dir = _find_wandb_run_dir_by_id(
@@ -4586,13 +5661,24 @@ def monitor_training(
                 wandb_select_reason = "wandb_url_match"
                 wandb_run_dir_corrected = matched_run_dir
                 wandb_data = _read_wandb_run(container_name, wandb_run_dir, history_limit)
+                wandb_latest_step_hint = (wandb_data.get("latest") or {}).get("step")
                 output_log_data = {}
                 output_log_full_data = None
                 output_log_path = os.path.join(wandb_run_dir, "files", "output.log")
-                output_log_data = _read_output_log(container_name, output_log_path, history_limit)
+                output_log_data = _read_output_log(
+                    container_name,
+                    output_log_path,
+                    history_limit,
+                    latest_step_hint=wandb_latest_step_hint,
+                )
                 count = output_log_data.get("count")
                 if isinstance(count, int) and count > history_limit:
-                    output_log_full_data = _read_output_log(container_name, output_log_path, count)
+                    output_log_full_data = _read_output_log(
+                        container_name,
+                        output_log_path,
+                        count,
+                        latest_step_hint=wandb_latest_step_hint,
+                    )
                 output_or_training_log_data = _select_effective_log_data(output_log_data, training_log_data)
                 effective_output_log_data = (
                     _select_effective_log_data(trainer_log_data, output_or_training_log_data)
@@ -4831,6 +5917,9 @@ def monitor_training(
         progress_percent = output_log_payload.get("progress_percent") if output_log_payload else None
         current_step = output_log_payload.get("current_step") if output_log_payload else None
         total_steps = output_log_payload.get("total_steps") if output_log_payload else None
+        final_step_confirmed = _final_training_step_confirmed(
+            current_step, total_steps, progress_percent
+        )
         elapsed_time = output_log_payload.get("elapsed_time") if output_log_payload else None
         remaining_time = output_log_payload.get("remaining_time") if output_log_payload else None
         progress_realtime_confirmed = (
@@ -4841,7 +5930,13 @@ def monitor_training(
         progress_realtime_reason = output_log_payload.get("progress_realtime_reason") if output_log_payload else None
         dpo_sub_stage = output_log_payload.get("sub_stage") if output_log_payload else None
         dpo_sub_stage_text = output_log_payload.get("sub_stage_text") if output_log_payload else None
-        export_dir = dpo_launch_state.get("export_dir")
+        export_dir, export_dir_source = _resolve_export_dir_from_job_logs(
+            container_name,
+            output_dir,
+            launch_log_tail_for_state,
+            training_descriptor,
+        )
+        export_dir_exists = bool(export_dir)
         merge_status = dpo_launch_state.get("merge_status")
         if dpo_launch_state.get("sub_stage"):
             dpo_sub_stage = dpo_launch_state.get("sub_stage")
@@ -4861,6 +5956,19 @@ def monitor_training(
             pid_record,
             force_local_step=bool(resume_history_info),
         )
+        curve_output_log_data = output_log_full_data or output_log_data
+        curve_history, curve_history_source = _select_curve_history(
+            trainer_state_data,
+            wandb_data,
+            trainer_log_data,
+            curve_output_log_data,
+            training_log_data,
+            history_limit,
+        )
+        if curve_history_source and curve_history_source != "trainer_state":
+            curve_history, _ = _apply_resume_history_offset(curve_history, pid_record)
+        if not curve_history:
+            curve_history = _valid_curve_history({"history": history}, history_limit)
         resume_adjustment_info = resume_step_info or resume_history_info
         axis = "step" if latest_step is not None else ("epoch" if latest_epoch is not None else "step")
         axis_note = "step_available" if latest_step is not None else ("epoch_available" if latest_epoch is not None else "epoch_missing_use_step")
@@ -4979,7 +6087,15 @@ def monitor_training(
                     latest_loss = last_finite
                     loss_is_finite = True
 
-        if stale and merge_status != "running" and status != "finished":
+        if _should_fail_for_stale_metrics(
+            stale,
+            training_process_exists,
+            status,
+            error_reason,
+            wandb_run_dir,
+            merge_status,
+            final_step_confirmed,
+        ):
             status = "failed"
             error_reason = error_reason or "metrics_stale"
         status = _apply_finished_wandb_status(
@@ -5011,6 +6127,17 @@ def monitor_training(
                 status = "starting"
         if status == "failed" and not error_reason:
             error_reason = "unknown"
+
+        finalizing_after_last_step = bool(
+            status == "running"
+            and training_process_exists
+            and final_step_confirmed
+            and merge_status not in {"failed", "finished"}
+            and train_type_public in {"lora_sft", "multinode_lora_sft"}
+        )
+        lifecycle_status = _training_lifecycle_status(status, dpo_sub_stage, merge_status)
+        if finalizing_after_last_step and lifecycle_status == "training":
+            lifecycle_status = "exporting"
 
         error_summary = ""
         if status in {"failed", "interrupted", "unknown", "stopped"}:
@@ -5051,6 +6178,12 @@ def monitor_training(
                 last_update_time,
                 completion_reason if status == "finished" else None,
                 completion_source if status == "finished" else None,
+                output_dir if output_dir_exists is True else None,
+                export_dir if export_dir_exists else None,
+                merge_status,
+                train_type,
+                launch_mode,
+                script_name_for_type,
             )
 
         # ===== 新增：统一“先报数”摘要（与是否调用 LLM 无关）=====
@@ -5096,6 +6229,8 @@ def monitor_training(
         llm_err = None
         if merge_status == "running" and dpo_sub_stage == "merge":
             analysis_text = "训练迭代已结束，正在进行 Merge/Export。"
+        elif finalizing_after_last_step:
+            analysis_text = "训练迭代已结束，进程仍在保存或合并模型。"
         elif iteration_finished and training_process_exists:
             analysis_text = "迭代结束，在保存模型。"
         elif allow_llm and llm_ready:
@@ -5144,6 +6279,8 @@ def monitor_training(
                 analysis_text = f"{STARTING_TEXT}（指标数据尚未写入）"
             elif merge_status == "running" and dpo_sub_stage == "merge":
                 analysis_text = "训练迭代已结束，正在进行 Merge/Export。"
+            elif finalizing_after_last_step:
+                analysis_text = "训练迭代已结束，进程仍在保存或合并模型。"
             elif latest_loss is None and training_process_exists:
                 analysis_text = "已检测到训练进程，正在等待 loss、lr 等指标写入。"
 
@@ -5177,7 +6314,16 @@ def monitor_training(
                 "isMultinode": launch_mode == "multinode",
                 "script_name": script_name_for_type,
                 "scriptName": script_name_for_type,
+                "descriptor_id": (training_descriptor or {}).get("id"),
+                "descriptorId": (training_descriptor or {}).get("id"),
+                "lifecycle_status": lifecycle_status,
+                "lifecycleStatus": lifecycle_status,
+                "primary_metric": descriptor_monitoring.get("primaryMetric"),
+                "fallback_metrics": descriptor_monitoring.get("fallbackMetrics") or [],
+                "log_root": descriptor_paths.get("logRoot"),
+                "log_files": descriptor_monitoring.get("logFiles") or [],
                 "output_dir": output_dir,
+                "artifact_output_dir": output_dir if output_dir_exists is True else None,
                 "output_dir_source": output_dir_source,
                 "output_dir_exists": output_dir_exists,
                 "wandb_root": wandb_root,
@@ -5242,16 +6388,19 @@ def monitor_training(
                 "eval_current_step": output_log_payload.get("eval_current_step") if output_log_payload else None,
                 "eval_total_steps": output_log_payload.get("eval_total_steps") if output_log_payload else None,
                 "export_dir": export_dir,
+                "export_dir_source": export_dir_source,
+                "export_dir_exists": export_dir_exists,
                 "merge_status": merge_status,
+                "finalizing_after_last_step": finalizing_after_last_step,
                 "progress_realtime_confirmed": progress_realtime_confirmed,
                 "progress_realtime_reason": progress_realtime_reason,
                 "training_start_signal": output_log_payload.get("training_start_signal") if output_log_payload else False,
                 "latest_step_or_epoch": latest_step if latest_step is not None else latest_epoch,
                 "axis": axis,
                 "axis_note": axis_note,
-                "history_count": history_count,
+                "history_count": len(curve_history),
                 "history_limit": history_limit,
-                "history": history,
+                "history": curve_history,
                 "metrics_waiting": waiting_for_metrics,
                 "last_update_time": last_update_time,
                 "stale": stale,
@@ -5344,6 +6493,7 @@ def monitor_training(
             wandb_root,
             wandb_root_source,
             wandb_url_run_id,
+            pid_started_at,
         )
 
         # 缓存最近一次成功指标，避免偶发异常导致用户无结果可查
@@ -5351,6 +6501,8 @@ def monitor_training(
             _LAST_OK_BY_CONTAINER[container_name] = {
                 "payload": json.loads(json.dumps(payload, ensure_ascii=False)),
                 "cached_at": datetime.now().isoformat(),
+                "pid": pid,
+                "started_at": pid_started_at.isoformat() if pid_started_at else None,
             }
         return _monitor_response(payload)
 
@@ -5358,8 +6510,8 @@ def monitor_training(
         err_text = str(exc)
         tb = traceback.format_exc()
         # 若存在上次成功结果，优先回退，避免用户卡在错误状态
-        if container_name and container_name in _LAST_OK_BY_CONTAINER:
-            cached = _LAST_OK_BY_CONTAINER[container_name]
+        cached = _last_ok_for_job(container_name, pid, pid_started_at)
+        if cached:
             payload = cached.get("payload", {}) or {}
             metrics = payload.get("metrics", {}) if isinstance(payload, dict) else {}
             debug = metrics.get("debug", {}) if isinstance(metrics, dict) else {}

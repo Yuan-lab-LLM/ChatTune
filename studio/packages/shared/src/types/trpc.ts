@@ -458,6 +458,8 @@ export interface ModelInfo {
   version?: string;
   merged?: boolean;
   checkpoints?: string[];
+  artifactType?: "base" | "adapter" | "merged" | "checkpoint" | "inference" | "reward" | "custom";
+  artifactTypes?: Array<"base" | "adapter" | "merged" | "checkpoint" | "inference" | "reward" | "custom">;
   size?: string;
   description?: string;
   createdAt?: string;
@@ -473,7 +475,7 @@ export interface MedicalTestFile {
   type: string;
   size: string;
   description: string;
-  category?: "medical" | "general";
+  category?: "medical" | "general" | "custom";
 }
 
 // Evaluation result info for evaluation results

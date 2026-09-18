@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Button, Card, Alert, Tag } from 'antd';
 import { Database, FileJson, ArrowRight, Terminal, CheckCircle, Play, AlertCircle } from 'lucide-react';
-import { PREPROCESS_CONFIG } from '../config';
+import { buildSftPreprocessCommand, PREPROCESS_CONFIG } from '../config';
 import type { DatasetInfo } from '@shared/types/trpc';
 
 interface Step2PreprocessProps {
@@ -21,7 +21,7 @@ export function Step2Preprocess({
   const [error, setError] = useState<string | null>(null);
   const outputName = `${selectedDataset.name}${PREPROCESS_CONFIG.outputSuffix}`;
   // 命令始终使用中文，不翻译
-  const command = `执行数据预处理，数据类型为${PREPROCESS_CONFIG.targetType}，数据格式为${PREPROCESS_CONFIG.format}，数据在/home/workspace/dataset/${selectedDataset.name}`;
+  const command = buildSftPreprocessCommand(selectedDataset);
 
   const handleConfirm = async () => {
     setIsChecking(true);

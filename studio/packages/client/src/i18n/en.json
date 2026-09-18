@@ -6,7 +6,7 @@
     "start-backend": "Please start the backend and refresh"
   },
   "auth": {
-    "loginHint": "Sign in with an account created by an administrator",
+    "loginDescription": "Sign in to continue to ChatTune Studio.",
     "username": "Username",
     "password": "Password",
     "login": "Sign in",
@@ -170,12 +170,217 @@
     "privateResource": "Private resource",
     "noPrivateResources": "No private resources.",
     "reviewingPublication": "Reviewing...",
+    "publicationPendingTitle": "Pending review",
+    "publicationHistoryTitle": "Review history",
+    "publicationRequester": "Requester",
+    "publicationPublishedDirectly": "Published directly",
+    "noPendingPublicationRequests": "No pending publication requests.",
+    "noPublicationReviewHistory": "No publication review history yet.",
+    "publicationColumnTime": "Time",
+    "publicationColumnRequester": "Requester / Actor",
+    "publicationColumnResource": "Resource",
+    "publicationColumnNode": "Node",
+    "publicationColumnContainer": "Container",
+    "publicationColumnResult": "Result",
+    "publicationColumnReviewer": "Reviewer",
+    "publicationColumnNote": "Note",
+    "publicationStatus": {
+      "pending": "Pending",
+      "approved": "Approved",
+      "rejected": "Rejected"
+    },
     "noRegisteredResources": "No registered resources yet.",
     "recentResourceAudit": "Recent Resource Audit",
     "auditLogTitle": "Audit Log",
     "auditLogDescription": "Review admin actions, resource publication, resource writes, and access-related events.",
     "systemActor": "System",
     "noAuditRecords": "No audit records yet.",
+    "auditActor": "Actor",
+    "auditTarget": "Target",
+    "auditResourceId": "Resource ID",
+    "auditResourceCount": "{{count}} resource(s)",
+    "auditNoDetails": "No additional details.",
+    "auditSensitiveValue": "Hidden",
+    "auditSearch": "Search",
+    "auditSearchPlaceholder": "Event, user, resource, or details",
+    "auditEventType": "Event type",
+    "auditAllEventTypes": "All events",
+    "auditAllResults": "All results",
+    "auditAllModules": "All modules",
+    "auditAllLevels": "All levels",
+    "auditAllOperationTypes": "All operation types",
+    "auditHorizontalScroll": "Scroll the audit log table horizontally",
+    "auditActorId": "Actor ID",
+    "auditActorIdPlaceholder": "User ID",
+    "auditResourceIdPlaceholder": "Resource ID",
+    "auditStartAt": "Start time",
+    "auditEndAt": "End time",
+    "auditDateFormatHint": "Format: YYYY-MM-DD HH:mm",
+    "auditLimit": "Limit",
+    "auditExportFormat": "Format",
+    "auditExport": "Export",
+    "auditExporting": "Exporting...",
+    "auditExportSuccess": "Audit records exported",
+    "auditExportFailed": "Failed to export audit records",
+    "auditAdvancedFilters": "Advanced",
+    "auditClearFilters": "Clear",
+    "auditColumnTime": "Time",
+    "auditColumnActor": "Actor",
+    "auditColumnGroup": "Group",
+    "auditColumnObject": "Object",
+    "auditColumnContent": "Content",
+    "auditColumnResult": "Result",
+    "auditColumnModule": "Module",
+    "auditColumnLevel": "Level",
+    "auditColumnType": "Type",
+    "auditColumnDataId": "Data ID",
+    "auditColumnDetails": "Details",
+    "auditToggleDetails": "Toggle details",
+    "auditDetailSummary": "Changed fields",
+    "auditDetailBefore": "Before",
+    "auditDetailAfter": "After",
+    "auditDetailRaw": "Raw details",
+    "auditEnabled": "Enabled",
+    "auditDisabled": "Disabled",
+    "auditResults": {
+      "success": "Success",
+      "warning": "Attention",
+      "failure": "Failed"
+    },
+    "auditLevels": {
+      "low": "Low",
+      "medium": "Medium",
+      "high": "High"
+    },
+    "auditObjects": {
+      "user": "User",
+      "resource": "Resource",
+      "resourceGroup": "User group",
+      "trainingPool": "GPU resource pool",
+      "trainingQuota": "GPU quota",
+      "trainingReservation": "GPU reservation",
+      "publicationRequest": "Publication request",
+      "systemObject": "System object"
+    },
+    "auditModules": {
+      "auth": "Identity and access",
+      "resource": "Resource management",
+      "resourceGroup": "Resource group management",
+      "trainingResource": "Training resource management",
+      "inferenceAdmin": "Inference management",
+      "other": "Other"
+    },
+    "auditContent": {
+      "userCreated": "Created user {{target}} with role {{role}} in group {{group}}",
+      "passwordReset": "Reset password for user {{target}} and required password change at next sign-in",
+      "roleUpdated": "Updated role for user {{target}}: {{changes}}",
+      "userStatusChanged": "Set user {{target}} status to {{status}}",
+      "sessionsRevoked": "Revoked sign-in sessions for user {{target}}",
+      "userDeleted": "Deleted user {{target}}",
+      "userMoved": "Moved user {{target}} to another group: {{changes}}",
+      "groupNodeSet": "Bound resource group {{group}} to node {{node}}",
+      "groupContainerSet": "Set container for resource group {{group}} to {{container}}. {{changes}}",
+      "poolNodesSet": "Set nodes for resource pool {{pool}}: {{nodes}}",
+      "quotaSet": "Set training quota for group {{group}} in pool {{pool}}: {{changes}}",
+      "quotaDeleted": "Deleted training quota for group {{group}} in pool {{pool}}",
+      "resourceWrite": "Wrote {{bizType}} resource {{itemKey}} in container {{container}} on node {{node}}",
+      "resourceDelete": "Deleted {{bizType}} resource {{itemKey}} in container {{container}} on node {{node}}",
+      "resourcePublished": "Published {{count}} as public",
+      "publicationRequested": "Requested publication for resource {{target}}",
+      "publicationApproved": "Approved publication request for resource {{target}}",
+      "publicationRejected": "Rejected publication request for resource {{target}}. Note: {{note}}"
+    },
+    "auditSources": {
+      "admin": "Admin",
+      "user": "User",
+      "runtime": "Runtime",
+      "system": "System"
+    },
+    "auditEvents": {
+      "resource_write": "Resource written",
+      "resource_delete": "Resource deleted",
+      "resource_published": "Resource published",
+      "publication_requested": "Publication requested",
+      "publication_approved": "Publication approved",
+      "publication_rejected": "Publication rejected",
+      "admin_user_created": "User created",
+      "admin_user_role_updated": "User role updated",
+      "admin_user_password_reset": "User password reset",
+      "admin_user_disabled_set": "User status changed",
+      "admin_user_sessions_revoked": "User sessions revoked",
+      "admin_user_deleted": "User deleted",
+      "admin_user_resource_group_moved": "User moved to group",
+      "admin_resource_group_created": "Resource group created",
+      "admin_resource_group_deleted": "Resource group deleted",
+      "admin_resource_group_container_set": "Training Docker set",
+      "admin_resource_group_evaluate_container_set": "Evaluation Docker set",
+      "admin_resource_group_grpo_container_set": "GRPO Docker set",
+      "admin_resource_group_multinode_container_set": "Multi-node training Docker set",
+      "admin_resource_group_node_set": "Resource group node set",
+      "admin_resource_group_containers_validated": "Resource group Docker revalidated",
+      "admin_training_pool_upserted": "Training pool saved",
+      "admin_training_pool_status_changed": "Training pool status changed",
+      "admin_training_pool_nodes_set": "Training pool nodes set",
+      "admin_training_group_quota_set": "Training quota set",
+      "admin_training_group_quota_deleted": "Training quota deleted",
+      "admin_training_resources_reserved": "Admin reserved training resources",
+      "admin_training_resources_released": "Admin released training resources",
+      "admin_training_resources_stop_and_released": "Stopped and released training resources",
+      "training_reservation_created": "Training reservation created",
+      "training_reservation_released": "Training reservation released",
+      "training_reservation_force_released": "Training reservation force released",
+      "training_reservation_stopped_and_released": "Training reservation stopped and released",
+      "training_reservation_release_failed": "Training reservation release failed",
+      "training_reservation_renewed": "Training reservation renewed",
+      "training_reservation_expired": "Training reservation expired"
+    },
+    "auditFields": {
+      "action": "Action",
+      "bizType": "Resource type",
+      "nodeId": "Node",
+      "containerName": "Container",
+      "itemKey": "Resource key",
+      "ownerUserId": "Owner",
+      "groupId": "Group",
+      "visibility": "Visibility",
+      "resourceIds": "Resources",
+      "sourcePath": "Source path",
+      "requestId": "Request ID",
+      "requesterUserId": "Requester",
+      "requesterUsername": "Requester",
+      "ownerUsername": "Owner",
+      "groupName": "Group",
+      "previousGroupId": "Previous group",
+      "previousGroupName": "Previous group",
+      "poolName": "Pool",
+      "nodeName": "Node",
+      "homeNodeName": "Home node",
+      "nodeNames": "Nodes",
+      "targetUserId": "Target user",
+      "role": "Role",
+      "disabled": "Disabled",
+      "mustChangePassword": "Must change password",
+      "sessionsRevoked": "Sessions revoked",
+      "poolId": "Pool",
+      "nodeIds": "Nodes",
+      "homeNodeId": "Home node",
+      "guaranteedGpuCount": "Guaranteed GPUs",
+      "maxGpuCount": "Max GPUs",
+      "maxConcurrentJobs": "Max concurrent jobs",
+      "maxNodesPerJob": "Max nodes per job",
+      "reservationId": "Reservation ID",
+      "nodeCount": "Node count",
+      "gpusPerNode": "GPUs per node",
+      "status": "Status",
+      "force": "Force",
+      "mode": "Mode",
+      "container": "Container",
+      "pid": "PID",
+      "alreadyExited": "Already exited",
+      "stopped": "Stopped",
+      "note": "Note",
+      "change": "Change"
+    },
     "containerRolesMustDiffer": "Training Docker, evaluation/inference Docker, GRPO Docker, and multi-node training Docker must be different",
     "containerNameInvalid": "Docker container names can only contain letters, numbers, dots, underscores, and hyphens",
     "containerAlreadyBound": "This Docker container is already bound to another user group",
@@ -454,7 +659,8 @@
       "stopped": "Stopped",
       "starting": "Starting",
       "failed": "Failed",
-      "degraded": "Degraded"
+      "degraded": "Degraded",
+      "reserved": "Reserved"
     },
     "servicePortDescription": "{{description}} · Port {{port}}",
     "forceStop": "Force Stop",
@@ -467,17 +673,9 @@
         "name": "VLLM OpenAI API",
         "description": "vLLM OpenAI-compatible API service"
       },
-      "INFERENCE_PORT": {
-        "name": "Inference Service",
-        "description": "Primary inference service"
-      },
-      "UI_PORT": {
-        "name": "UI Service",
-        "description": "Web UI service"
-      },
-      "DATA_ANNOTATION_PORT": {
-        "name": "Data Annotation Service",
-        "description": "Data annotation tool service"
+      "MASTER_PORT": {
+        "name": "Master Port",
+        "description": "Reserved vLLM distributed-communication port"
       }
     },
     "noStatusData": "No service status data",
@@ -563,14 +761,12 @@
   "categoryAll": "All",
   "categoryBeginner": "Beginner",
   "categoryTraining": "Training",
-  "categoryAssessment": "Medical Custom Assessment",
+  "categoryAssessment": "Model Evaluation",
   "categoryEvaluation": "Evaluation",
   "categoryInference": "Inference",
   "categoryData": "Data",
   "categoryManagement": "Management",
   "Beginner": "Beginner",
-  "beginner-train": "Starter Training",
-  "beginner-train-with-dataset-placeholderDesc": "A starter prompt for launching training with a placeholder dataset",
   "lora-train": "LoRA Training",
   "lora-batch-train": "LoRA Batch Training",
   "full-param-batch-train": "Full Parameter Batch Training",
@@ -590,17 +786,13 @@
   "pretrain-full-trainingDesc": "Run full-parameter PT pretraining task",
   "grpo-trainingDesc": "Start GRPO training with the specified model, train file, validation file, and GPU IDs",
   "dual-model-assessment": "Dual Model Assessment",
-  "dual-model-assessmentDesc": "Compare and assess two models",
+  "dual-model-assessmentDesc": "Compare two models with built-in LLaMA-Factory eval or the medical suite",
   "single-model-assessment": "Single Model Assessment",
-  "single-model-assessmentDesc": "Assess single model performance",
+  "single-model-assessmentDesc": "Assess one model with built-in LLaMA-Factory eval or the medical suite",
   "checkpoint-assessment": "Checkpoint Assessment",
-  "checkpoint-assessmentDesc": "Assess model checkpoint",
+  "checkpoint-assessmentDesc": "Assess a checkpoint with built-in LLaMA-Factory eval or the medical suite",
   "start-inference-service": "Start Inference Service",
   "start-inference-serviceDesc": "Start model inference service",
-  "view-inference-test-scripts": "View Inference Test Scripts",
-  "view-inference-test-scriptsDesc": "View available inference function test scripts",
-  "run-inference-test-scripts": "Run Inference Test Scripts",
-  "run-inference-test-scriptsDesc": "Execute inference function test scripts",
   "view-inference-benchmark-tests": "View Inference Benchmark Tests",
   "view-inference-benchmark-testsDesc": "View available inference benchmark tests",
   "run-inference-benchmark-tests": "Run Inference Benchmark Tests",
@@ -1138,7 +1330,7 @@
     "no-results": "No templates found",
     "category": {
       "training": "Training",
-      "assessment": "Medical Custom Assessment",
+      "assessment": "Model Evaluation",
       "evaluation": "Evaluation",
       "inference": "Inference",
       "data": "Data"
@@ -1174,14 +1366,6 @@
     "start-inference-service": {
       "title": "Start Inference Service",
       "description": "Launch the model inference service"
-    },
-    "view-inference-test-scripts": {
-      "title": "View Inference Test Scripts",
-      "description": "View available inference function test scripts"
-    },
-    "run-inference-test-scripts": {
-      "title": "Run Inference Test Scripts",
-      "description": "Execute inference function test scripts"
     },
     "view-inference-benchmark-tests": {
       "title": "View Inference Benchmark Tests",
@@ -1227,7 +1411,7 @@
   "oneClickWorkflow": {
     "button": "One-Click Workflow",
     "title": "One-Click Workflow",
-    "subtitle": "Choose data and an optional evaluation set, then generate a command to send manually.",
+    "subtitle": "Choose training data and an optional post-deployment benchmark set, then generate a command to send manually.",
     "refreshCurrentRunNodeResources": "Refresh current Run node resources",
     "inputHint": "Workflow command filled. Click Send to start.",
     "preview": "Command Preview",
@@ -1251,7 +1435,8 @@
       "notQueried": "Query datasets first"
     },
     "evaluation": {
-      "label": "Evaluation Set",
+      "label": "Post-deployment Benchmark Set",
+      "description": "This set is used for the inference Benchmark after deployment. Post-training model evaluation defaults to general with ceval,cmmlu; edit the generated command to change it.",
       "placeholder": "Optional; Agent defaults to 2024.json when empty",
       "selected": "Selected",
       "defaultHint": "Not specified. Defaults to 2024.json",
@@ -1416,11 +1601,20 @@
       "stageMessage": "Stage Note",
       "datasetRef": "Dataset Reference",
       "evaluationDataset": "Evaluation Set",
+      "workflowBenchmarkDataset": "Post-deployment Benchmark Set",
+      "workflowModelEvaluationScope": "Model Evaluation Scope",
+      "workflowModelEvaluationDatasets": "Model Evaluation Datasets",
       "modelPath": "Model Path",
       "progress": "Progress",
       "labelSeparator": ": ",
       "trainingType": "Training Type",
       "evaluationType": "Assessment Type",
+      "evaluationScope": "Evaluation Scope",
+      "evaluationDatasets": "Evaluation Datasets",
+      "runId": "Run ID",
+      "reportPath": "Report Path",
+      "scores": "Evaluation Scores",
+      "scoreDeltas": "Score Deltas",
       "benchmarkTaskId": "Task ID",
       "benchmarkModel": "Model",
       "benchmarkDataset": "Dataset",
@@ -1467,6 +1661,15 @@
       "viewBenchmarkProgress": "View Evaluation Progress",
       "viewBenchmarkStatus": "View Status",
       "stopBenchmark": "Stop Evaluation",
+      "benchmarkEta": "Estimated remaining",
+      "benchmarkEtaCalculating": "Calculating",
+      "benchmarkEtaUnavailable": "Unavailable",
+      "benchmarkEtaLessThanMinute": "Less than 1 minute",
+      "benchmarkEtaMinutes": "About {{count}} minutes",
+      "benchmarkEtaHours": "About {{count}} hours",
+      "benchmarkEtaHoursMinutes": "About {{hours}} hours {{minutes}} minutes",
+      "benchmarkEtaDays": "About {{count}} days",
+      "benchmarkEtaDaysHours": "About {{days}} days {{hours}} hours",
       "configFile": "Config File",
       "startService": "Start Service",
       "stopService": "Stop Service",
@@ -1480,11 +1683,25 @@
         "preparing": "Preparing",
         "starting": "Starting",
         "running": "Running",
+        "exporting": "Exporting",
         "interrupted": "Interrupted",
         "stopped": "Stopped",
         "finished": "Finished",
         "failed": "Failed",
         "error": "Error"
+      },
+      "evaluationStatuses": {
+        "started": "Started",
+        "pending": "Pending",
+        "preparing": "Preparing",
+        "starting": "Starting",
+        "running": "Running",
+        "finished": "Completed",
+        "completed": "Completed",
+        "failed": "Failed",
+        "interrupted": "Interrupted",
+        "stopped": "Stopped",
+        "unknown": "Unknown"
       },
       "workflowStatuses": {
         "pending": "Pending",
@@ -1492,6 +1709,7 @@
         "starting_external": "Starting",
         "starting": "Starting",
         "running": "Running",
+        "exporting": "Merging/Exporting",
         "timeout": "Timeout",
         "finished": "Completed",
         "failed": "Failed",
@@ -1499,23 +1717,31 @@
       },
       "workflowStages": {
         "train": "Training",
-        "evaluate": "Assessment",
+        "evaluate": "Model Evaluation",
         "publish": "Publishing",
         "deploy": "Deployment",
-        "benchmark": "Benchmark"
+        "benchmark": "Post-deployment Benchmark"
       },
       "typeValues": {
         "loraBatchTraining": "LoRA Batch Training",
         "multinodeLoraBatchTraining": "Dual-node LoRA SFT",
         "fullParamBatchTraining": "Full-Parameter Batch Training",
+        "multinodeFullParamBatchTraining": "Dual-node Full-Parameter SFT",
         "pretrainLoraTraining": "LoRA PT",
         "pretrainFullTraining": "Full-Parameter PT",
         "enhancedTraining": "Enhanced Training",
         "multinodeEnhancedTraining": "Dual-node Enhanced Training",
         "grpoTraining": "GRPO Training",
+        "scheduledTraining": "Scheduled Training",
         "singleModelEvaluation": "Single Model Assessment",
         "dualModelEvaluation": "Dual Model Assessment",
-        "checkpointEvaluation": "Checkpoint Assessment"
+        "checkpointEvaluation": "Checkpoint Assessment",
+        "generalSingleModelEvaluation": "General Single-Model Assessment",
+        "generalDualModelEvaluation": "General Dual-Model Assessment",
+        "generalCheckpointEvaluation": "General Checkpoint Assessment",
+        "medicalSingleModelEvaluation": "Medical Single-Model Assessment",
+        "medicalDualModelEvaluation": "Medical Dual-Model Assessment",
+        "medicalCheckpointEvaluation": "Medical Checkpoint Assessment"
       }
     },
     "guide": {
@@ -1551,7 +1777,7 @@
         "group5": {
           "title": "Evaluation Management",
           "item1": "Query evaluation files, inspect evaluation results, and download result files",
-          "item2": "Upload open-source medical evaluation files and start evaluations from templates"
+          "item2": "Upload evaluation files and use supported templates to start assessments"
         }
       },
       "section3": {
@@ -1763,8 +1989,9 @@
     "container-name": "Docker Container Name",
     "container-required": "Please enter container name",
     "container-default-hint": "Default is training_container, confirm or modify. The system will remember your recently used container names.",
-    "merged": "Training Complete",
-    "not-merged": "Training Incomplete",
+    "merged-artifact": "Merged Model",
+    "merged-output-exists": "Merged Model Available",
+    "merged-output-missing": "No Merged Model",
     "delete": {
       "button": "Delete",
       "confirm-title": "Delete this model?",
@@ -1784,9 +2011,10 @@
         "item7": "Inference: deployed inference models"
       },
       "section2": {
-        "title": "Training Status",
-        "item1": "Training Complete: the model training workflow has finished and it can be used in follow-up steps",
-        "item2": "Training Incomplete: the model training workflow has not finished yet and still needs further processing"
+        "title": "Merged Model Status",
+        "item1": "Merged Model Available: a merged output was found for this training directory",
+        "item2": "No Merged Model: no matching merged output was found",
+        "item3": "Merged Model: this directory is a merged output"
       }
     }
   },
@@ -1819,7 +2047,9 @@
       "category-label": "Evaluation Category",
       "all": "All",
       "medical": "Medical",
-      "general": "General"
+      "general": "General",
+      "custom": "Custom",
+      "unknown": "Uncategorized"
     },
     "guide": {
       "button": "Evaluation Guide",
@@ -1828,12 +2058,12 @@
         "title": "Query Evaluations",
         "item1": "Enter a Docker container name to query available evaluations",
         "item2": "Evaluation types:",
-        "item3": "Medical Evaluation",
-        "item4": "General Evaluation"
+        "item3": "General Evaluation",
+        "item4": "Medical Evaluation"
       },
       "section2": {
         "title": "Upload Evaluations",
-        "item1": "Supports uploading standard medical evaluation datasets",
+        "item1": "Supports uploading .json and .jsonl evaluation files",
         "item2": "Supported formats: .json, .jsonl"
       }
     },
@@ -1897,7 +2127,7 @@
       "container": "Docker Container",
       "file": "Evaluation File",
       "test-type": "Test Type",
-      "test-type-placeholder": "Enter test type, e.g., National Medical Licensing Examination",
+      "test-type-placeholder": "Enter a category such as general, medical, or custom",
       "test-type-required": "Please enter test type",
       "drag": "Click or drag file to this area to upload",
       "hint": "Max 20MB",
@@ -1941,7 +2171,7 @@
     "steps": {
       "step1": {
         "title": "Data Preparation",
-        "description": "Understand datasets and select sample data"
+        "description": "Select any available raw dataset"
       },
       "step2": {
         "title": "Data Preprocessing",
@@ -1958,10 +2188,10 @@
     },
     "commands": {
       "preprocess": "Execute data preprocessing",
-      "training": "Run LoRA batch training",
+      "training": "Run LoRA batch training, TEM=qwen3",
       "description": {
         "preprocess": "Execute data preprocessing, data type is {{type}}, format is {{format}}, dataset at {{dataset}}",
-        "training": "Run LoRA batch training"
+        "training": "Run LoRA batch training, TEM=qwen3"
       }
     },
     "validation": {
@@ -2027,7 +2257,7 @@
       "preprocess": {
         "task": "\"Execute data preprocessing\": tells the system to convert raw data into training-ready data.",
         "dataset": "\"Data at ...\": points to the dataset path this step should process.",
-        "format": "\"Data type / format\": tells the system to output SFT data for the diagnosis task format."
+        "format": "\"data_type=sft\": outputs SFT data; medical Raw data also needs a strategy. Replace the example path with your data directory."
       },
       "training": {
         "task": "\"Run\": tells the system to start a training task.",
@@ -2051,48 +2281,51 @@
       "description": "Including: data preprocessing, model training, monitoring training progress"
     },
     "step1": {
-      "title": "Step 1: Select Sample Dataset",
+      "title": "Step 1: Select Raw Dataset",
       "querying": "Querying datasets...",
       "queryingDesc": "Getting dataset list from container, please wait...",
-      "cacheFound": "Cached data found! Please select medical-example dataset.",
-      "queryComplete": "Query complete! Please select medical-example dataset for demo.",
+      "cacheFound": "Cached raw data found and ready to select.",
+      "queryComplete": "Query complete. Select a Raw dataset that matches your task. Medical data is available for medical use cases.",
       "guide": {
         "title": "Operation Guide",
-        "desc": "Please query datasets in the left data management panel first, then come back here to select the sample dataset.",
+        "desc": "Query datasets in the data management panel, then return here and select any raw dataset.",
         "step1": "Click 'Query Available Datasets' button on the left",
         "step1Desc": "Located in the data management panel",
         "step2": "Enter container name",
         "step2Desc": "Default: training_container",
         "step3": "View dataset list",
-        "step3Desc": "Find medical-example dataset"
+        "step3Desc": "Select a raw dataset"
       },
       "selectRequired": "Please complete query to continue",
       "selectRequiredDesc": "Click 'Query Available Datasets' button, return to wizard after query completes",
       "useCache": "Use Cached Data (Please Select)",
-      "foundExample": "Found Example Dataset (Please Select)",
+      "foundExample": "Available Raw Datasets (Please Select)",
       "cacheDesc": "System detected you queried datasets before, using cached data. Re-query for latest data.",
-      "exampleData": "Sample Data",
+      "exampleData": "Raw Data",
       "recommended": "Recommended",
-      "exampleDesc": "Sample medical record dataset for demo training workflow",
+      "exampleDesc": "Raw dataset for demonstrating a generic LLM SFT workflow",
+      "genericDesc": "Raw data that can be converted to a generic SFT format",
+      "medicalExample": "Medical example",
       "type": "Type",
       "recordCount": "Records",
       "selected": "Selected",
       "select": "Select",
-      "notFound": "Example Dataset Not Found",
-      "notFoundDesc": "Query complete, but medical-example dataset not found.",
+      "notFound": "No Raw Dataset Found",
+      "notFoundDesc": "The query completed, but only preprocessed data or no datasets are available. Upload a raw dataset first.",
       "reasons": {
         "title": "Possible reasons:",
         "reason1": "Sample dataset not uploaded to container yet",
-        "reason2": "Dataset name mismatch (should be medical-example)",
+        "reason2": "Existing datasets are already SFT, DPO, or PT data",
         "contactAdmin": "Please contact admin to add sample dataset."
       },
       "otherDatasets": "Other Datasets",
+      "nonRawDatasets": "Preprocessed datasets do not need this wizard's preprocessing step",
       "unavailable": "Unavailable",
       "moreDatasets": "{{count}} more datasets...",
-      "mustSelectExample": "Must Select Example Dataset",
-      "mustSelectExampleDesc": "Please click medical-example card above to select, required for demo flow.",
+      "mustSelectExample": "Select a Raw Dataset",
+      "mustSelectExampleDesc": "Select any raw dataset card above to continue.",
       "selectionStatus": "Selected: {{name}}",
-      "selectionStatusDesc": "Example dataset selected. Click 'Next' to start preprocessing."
+      "selectionStatusDesc": "Raw dataset selected. Click 'Next' to generate generic SFT data."
     },
     "step2": {
       "title": "Step 2: Data Preprocessing",

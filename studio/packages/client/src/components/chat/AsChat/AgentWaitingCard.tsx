@@ -4,6 +4,7 @@ import { Button } from '@/components/ui/button.tsx';
 import { Input } from '@/components/ui/input.tsx';
 import { trpc } from '@/api/trpc';
 import { useEnvironmentConfig } from '@/hooks/useEnvironmentConfig';
+import type { TrainingParamDescriptor } from '@shared/types/trainingDescriptor';
 
 export interface AgentDatasetOption {
     nodeId?: string;
@@ -25,6 +26,8 @@ export interface AgentModelOption {
     description?: string;
     merged?: boolean;
     checkpoints?: string[];
+    artifactType?: 'base' | 'adapter' | 'merged' | 'checkpoint' | 'inference' | 'reward' | 'custom';
+    artifactTypes?: Array<'base' | 'adapter' | 'merged' | 'checkpoint' | 'inference' | 'reward' | 'custom'>;
 }
 
 interface AgentFileOption {
@@ -46,6 +49,11 @@ export interface AgentWaitingPrompt {
     scriptName?: string;
     detectedFormat?: string;
     excludedInputFolders?: string[];
+    descriptorId?: string;
+    paramSchema?: TrainingParamDescriptor[];
+    resourceSelectors?: string[];
+    invocationStyle?: 'env' | 'argv' | 'keyValue';
+    trainingStage?: 'sft' | 'pt' | 'dpo' | 'grpo';
 }
 
 interface AgentUiProtocol {
@@ -81,6 +89,11 @@ interface AgentUiProtocol {
     inputFolder?: string;
     selectedInputFolder?: string;
     currentArgs?: Record<string, unknown>;
+    descriptorId?: string;
+    paramSchema?: TrainingParamDescriptor[];
+    resourceSelectors?: string[];
+    invocationStyle?: 'env' | 'argv' | 'keyValue';
+    trainingStage?: 'sft' | 'pt' | 'dpo' | 'grpo';
 }
 
 export type AgentProtocol = AgentUiProtocol;
@@ -113,6 +126,21 @@ const STRATEGY_OPTIONS = [
 ];
 
 const GENERAL_PREPROCESS_FORMATS = new Set(['openai', 'sharegpt', 'sft', 'dpo', 'pt', 'text']);
+const SAFE_PARAM_NAME = /^[A-Za-z][A-Za-z0-9_.-]*$/;
+
+const normalizeParamName = (value: string) => value.trim().toLowerCase().replace(/[-_]/g, '');
+
+const descriptorParamForField = (
+    schema: TrainingParamDescriptor[] | undefined,
+    field: string,
+): TrainingParamDescriptor | undefined => {
+    const normalizedField = normalizeParamName(field);
+    return (schema || []).find((param) =>
+        [param.name, ...(param.aliases || [])].some(
+            (candidate) => normalizeParamName(candidate) === normalizedField,
+        ),
+    );
+};
 
 const normalizeScriptName = (value?: string): string => (value || '').trim().toLowerCase();
 
@@ -224,12 +252,17 @@ const isDirectReplyOption = (value: string): boolean => {
         'grpo训练',
         '单模型评估',
         '双模型评估',
+        '单模型',
+        '双模型',
         'ckpt评估',
+        '医疗评测',
+        '通用评测',
         '是',
         '否',
     ].includes(value) ||
         value.includes('=') ||
-        value.endsWith('评估');
+        value.endsWith('评估') ||
+        value.endsWith('评测');
 };
 
 const extractAgentProtocol = (text: string): AgentUiProtocol | null => {
@@ -293,6 +326,13 @@ const extractAgentProtocol = (text: string): AgentUiProtocol | null => {
 };
 
 const fieldsFromProtocol = (protocol: AgentUiProtocol, message: string): string[] => {
+    const filterProtocolFields = (fields: string[]) => {
+        const schema = protocol.paramSchema || [];
+        return unique(fields.filter((field) =>
+            SAFE_PARAM_NAME.test(field) &&
+            (KNOWN_FIELDS.includes(field) || schema.length === 0 || Boolean(descriptorParamForField(schema, field))),
+        ));
+    };
     const normalizeTrainingFields = (fields: string[]) => {
         const hasEnhancedTrainingFields =
             fields.includes('dataset_dir') ||
@@ -305,15 +345,15 @@ const fieldsFromProtocol = (protocol: AgentUiProtocol, message: string): string[
     };
 
     if (protocol.fields?.length) {
-        return normalizeTrainingFields(protocol.fields.filter((field) => KNOWN_FIELDS.includes(field)));
+        return normalizeTrainingFields(filterProtocolFields(protocol.fields));
     }
 
     if (protocol.missingParams?.length) {
-        return normalizeTrainingFields(protocol.missingParams.filter((field) => KNOWN_FIELDS.includes(field)));
+        return normalizeTrainingFields(filterProtocolFields(protocol.missingParams));
     }
 
     if (protocol.requiredParams?.length) {
-        return normalizeTrainingFields(protocol.requiredParams.filter((field) => KNOWN_FIELDS.includes(field)));
+        return normalizeTrainingFields(filterProtocolFields(protocol.requiredParams));
     }
 
     if (protocol.kind === 'data_preprocess_params') {
@@ -355,7 +395,7 @@ const displayWorkflowStatusMessage = (protocol: AgentUiProtocol): string | null 
     const progressPercent = normalizePercent(stage?.progress_percent);
 
     if (progressPercent !== undefined) {
-        const progressLinePattern = /(-\s*进度\s*[:：]\s*)`?[^`\n]*%`?/;
+        const progressLinePattern = /(-\s*(?:整体)?进度\s*[:：]\s*)`?[^`\n]*%`?/;
         if (progressLinePattern.test(message)) {
             message = message.replace(progressLinePattern, `$1\`${progressPercent}%\``);
         } else if (/当前阶段详情[:：]/.test(message)) {
@@ -524,6 +564,11 @@ export const parseAgentWaitingPrompt = (
             scriptName,
             detectedFormat,
             excludedInputFolders: excludedInputFoldersFromProtocol(protocol),
+            descriptorId: protocol.descriptorId,
+            paramSchema: protocol.paramSchema,
+            resourceSelectors: protocol.resourceSelectors,
+            invocationStyle: protocol.invocationStyle,
+            trainingStage: protocol.trainingStage,
         };
     }
 
@@ -601,7 +646,7 @@ const writeSubmittedState = (persistenceKey?: string) => {
     }
 };
 
-const fieldLabel = (field: string): string => {
+const fieldLabel = (field: string, descriptor?: TrainingParamDescriptor): string => {
     const labels: Record<string, string> = {
         model_path: '模型路径',
         dataset_dir: '数据集目录',
@@ -616,10 +661,10 @@ const fieldLabel = (field: string): string => {
         train_files: '训练文件',
         val_files: '验证文件',
     };
-    return labels[field] || field;
+    return descriptor?.label || labels[field] || field;
 };
 
-const fieldPlaceholder = (field: string): string => {
+const fieldPlaceholder = (field: string, descriptor?: TrainingParamDescriptor): string => {
     const placeholders: Record<string, string> = {
         model_path: '/home/workspace/models/base/example-model-name',
         dataset_dir: '/home/workspace/dataset_daily_train/xxx',
@@ -634,6 +679,12 @@ const fieldPlaceholder = (field: string): string => {
         train_files: '/home/workspace/data/train.parquet',
         val_files: '/home/workspace/data/val.parquet',
     };
+    if (descriptor?.default !== undefined) {
+        return `默认：${String(descriptor.default)}`;
+    }
+    if (descriptor?.type === 'template') {
+        return '自动识别；也可手工指定模板';
+    }
     return placeholders[field] || `${field}=...`;
 };
 
@@ -676,6 +727,50 @@ export function AgentWaitingCard({
     onRefreshModels,
     resourceGroupId,
 }: AgentWaitingCardProps) {
+    const trainingMethodsQuery = trpc.queryTrainingMethods.useQuery(undefined, {
+        staleTime: 5 * 60 * 1000,
+    });
+    const resourceCatalogConfigQuery = trpc.queryResourceCatalogConfig.useQuery(undefined, {
+        staleTime: 5 * 60 * 1000,
+    });
+    const catalogDescriptor = useMemo(() => {
+        const lookup = normalizeScriptName(prompt.descriptorId || prompt.scriptName);
+        if (!lookup) return undefined;
+        return trainingMethodsQuery.data?.data?.methods.find((descriptor) =>
+            [
+                descriptor.id,
+                descriptor.entry.sourceScript,
+                descriptor.entry.containerCommand,
+                ...descriptor.aliases,
+            ].some((value) => normalizeScriptName(value) === lookup),
+        );
+    }, [prompt.descriptorId, prompt.scriptName, trainingMethodsQuery.data]);
+    const effectiveParamSchema = catalogDescriptor?.params || prompt.paramSchema || [];
+    const effectiveResourceSelectors = catalogDescriptor?.resourceSelectors || prompt.resourceSelectors || [];
+    const effectiveTrainingStage = catalogDescriptor?.stage || prompt.trainingStage;
+    const configuredContainers = resourceCatalogConfigQuery.data?.data?.containers;
+    const descriptorResourceContainer = effectiveResourceSelectors.includes('grpoTraining')
+        ? configuredContainers?.grpoTraining
+        : effectiveResourceSelectors.includes('multinodeTraining')
+            ? configuredContainers?.multinodeTraining
+            : effectiveResourceSelectors.includes('training')
+                ? configuredContainers?.training
+                : effectiveResourceSelectors.includes('evaluation')
+                    ? configuredContainers?.evaluation
+                    : undefined;
+    const resourceContainer = prompt.resourceContainer?.trim() || descriptorResourceContainer;
+    const paramForField = (field: string) => descriptorParamForField(effectiveParamSchema, field);
+    const modelFields = prompt.fields.filter((field) =>
+        paramForField(field)?.type === 'model' || field === 'model_path',
+    );
+    const standardModelFields = modelFields.filter(
+        (field) => !['model_fir', 'model_sec'].includes(field),
+    );
+    const datasetFields = prompt.fields.filter((field) =>
+        paramForField(field)?.type === 'dataset' || ['dataset_dir', 'input_folder'].includes(field),
+    );
+    const primaryModelField = standardModelFields[0] || 'model_path';
+    const datasetNameField = prompt.fields.find((field) => normalizeParamName(field) === 'datasetname');
     const promptScriptName = normalizeScriptName(prompt.scriptName);
     const isDataPreprocessingPrompt = promptScriptName === 'data_preprocessing';
     const hasDataTypePicker = isDataPreprocessingPrompt && prompt.fields.includes('data_type');
@@ -685,29 +780,51 @@ export function AgentWaitingCard({
         prompt.fields.includes('model_fir') && prompt.fields.includes('model_sec');
     const hasEvaluationModelPicker =
         prompt.fields.includes('model_fir') || prompt.fields.includes('model_sec');
-    const hasCheckpointPicker = prompt.fields.includes('CKPT_PATH');
-    const hasModelPicker = prompt.fields.includes('model_path');
+    const checkpointFields = prompt.fields.filter((field) =>
+        paramForField(field)?.type === 'checkpoint' || field === 'CKPT_PATH',
+    );
+    const hasCheckpointPicker = checkpointFields.length > 0;
+    const evalDatasetField = prompt.fields.find(
+        (field) => normalizeParamName(field) === 'evaldatasets',
+    );
+    const shouldSubmitEvaluationParamsTogether = Boolean(
+        evalDatasetField && (hasEvaluationModelPicker || hasCheckpointPicker),
+    );
+    const hasModelPicker = standardModelFields.length > 0;
     const hasGrpoFilePicker =
         prompt.fields.includes('train_files') || prompt.fields.includes('val_files');
     const trainingPromptText = `${prompt.title}\n${prompt.body}`;
     const isEnhancedTrainingPrompt =
+        effectiveTrainingStage === 'dpo' ||
+        prompt.descriptorId === 'dpo_train_launcher' ||
+        prompt.descriptorId === 'train_multinode_dpo_pipeline' ||
         prompt.fields.includes('dataset_dir') ||
         prompt.fields.includes('dataset_name') ||
         /(?:增强训练|dpo_train_launcher)/i.test(trainingPromptText);
     const isGrpoTrainingPrompt =
-        !isEnhancedTrainingPrompt && (hasGrpoFilePicker || /grpo/i.test(trainingPromptText));
+        !isEnhancedTrainingPrompt && (
+            effectiveTrainingStage === 'grpo' ||
+            prompt.descriptorId === 'grpo_train' ||
+            effectiveResourceSelectors.includes('grpoTraining') ||
+            hasGrpoFilePicker ||
+            /grpo/i.test(trainingPromptText)
+        );
     const hasDatasetPicker =
-        prompt.fields.includes('dataset_dir') ||
+        datasetFields.length > 0 ||
         prompt.fields.includes('dataset_name') ||
         prompt.fields.includes('input_folder');
     const shouldSubmitGrpoParamsTogether = isGrpoTrainingPrompt && hasModelPicker && hasGrpoFilePicker;
     const shouldSubmitModelAndDatasetTogether = hasModelPicker && hasDatasetPicker && !shouldSubmitGrpoParamsTogether;
     const shouldSubmitTrainingParamsTogether =
         shouldSubmitModelAndDatasetTogether && prompt.fields.includes('schedule_time');
-    const requiresDpoDataset = /增强训练/.test(`${prompt.title}\n${prompt.body}`);
+    const requiresDpoDataset =
+        effectiveTrainingStage === 'dpo' ||
+        prompt.descriptorId === 'dpo_train_launcher' ||
+        prompt.descriptorId === 'train_multinode_dpo_pipeline' ||
+        /增强训练/.test(`${prompt.title}\n${prompt.body}`);
     const hasDatasetNameFileOptions =
         prompt.fields.length === 1 &&
-        prompt.fields.includes('dataset_name') &&
+        Boolean(datasetNameField) &&
         (prompt.options || []).length > 0;
     const datasetNameOptions = useMemo(
         () =>
@@ -724,13 +841,13 @@ export function AgentWaitingCard({
                         (hasDataTypePicker && field === 'data_type') ||
                         (hasDataTypeStrategyPicker && field === 'strategy') ||
                         (hasEvaluationModelPicker && ['model_fir', 'model_sec'].includes(field)) ||
-                        (hasCheckpointPicker && field === 'CKPT_PATH') ||
-                        (hasModelPicker && field === 'model_path') ||
+                        (hasCheckpointPicker && checkpointFields.includes(field)) ||
+                        (hasModelPicker && standardModelFields.includes(field)) ||
                         (hasGrpoFilePicker && ['train_files', 'val_files'].includes(field)) ||
-                        (hasDatasetPicker && ['dataset_dir', 'dataset_name', 'input_folder'].includes(field))
+                        (hasDatasetPicker && (datasetFields.includes(field) || field === datasetNameField))
                     ),
             ),
-        [hasCheckpointPicker, hasDataTypePicker, hasDataTypeStrategyPicker, hasDatasetPicker, hasEvaluationModelPicker, hasGrpoFilePicker, hasModelPicker, prompt.fields],
+        [checkpointFields, datasetFields, datasetNameField, hasCheckpointPicker, hasDataTypePicker, hasDataTypeStrategyPicker, hasDatasetPicker, hasEvaluationModelPicker, hasGrpoFilePicker, hasModelPicker, prompt.fields, standardModelFields],
     );
     const [values, setValues] = useState<Record<string, string>>({});
     const [dataType, setDataType] = useState('');
@@ -738,6 +855,7 @@ export function AgentWaitingCard({
     const [selectedModel, setSelectedModel] = useState<AgentModelOption | null>(null);
     const [selectedModelFir, setSelectedModelFir] = useState<AgentModelOption | null>(null);
     const [selectedModelSec, setSelectedModelSec] = useState<AgentModelOption | null>(null);
+    const [selectedCheckpointPath, setSelectedCheckpointPath] = useState('');
     const [selectedDataset, setSelectedDataset] = useState<AgentDatasetOption | null>(null);
     const [selectedTrainFile, setSelectedTrainFile] = useState<AgentFileOption | null>(null);
     const [selectedValFile, setSelectedValFile] = useState<AgentFileOption | null>(null);
@@ -764,7 +882,7 @@ export function AgentWaitingCard({
     const [isRefreshingDatasets, setIsRefreshingDatasets] = useState(false);
     const [isRefreshingModels, setIsRefreshingModels] = useState(false);
     const queryGrpoResourcesMutation = trpc.queryGrpoResources.useMutation();
-    const usesProtocolResources = Boolean(prompt.resourceContainer && !isGrpoTrainingPrompt);
+    const usesProtocolResources = Boolean(resourceContainer && !isGrpoTrainingPrompt);
     const effectiveDatasets = resourceDatasets ?? (usesProtocolResources ? [] : datasets);
     const effectivePromptModels = resourceModels ?? (usesProtocolResources ? [] : models);
     const excludedInputFolders = new Set((prompt.excludedInputFolders || []).map(normalizeDatasetPath));
@@ -777,7 +895,7 @@ export function AgentWaitingCard({
         ? datasetNameOptions.map((name) => ({
             name,
             type: 'dpo',
-            path: prompt.knownParams?.dataset_dir,
+            path: prompt.knownParams?.[datasetFields[0]] || prompt.knownParams?.dataset_dir,
         }))
         : requiresDpoDataset
           ? inputFolderDatasets.filter((dataset) => (dataset.type || '').toLowerCase() === 'dpo')
@@ -785,11 +903,28 @@ export function AgentWaitingCard({
     const effectiveModels = isGrpoTrainingPrompt ? grpoModels : effectivePromptModels;
 
     const filledFields = editableFields.filter((field) => (values[field] || '').trim().length > 0);
+    const requiredEditableFields = editableFields.filter(
+        (field) => paramForField(field)?.required !== false,
+    );
+    const missingEvaluationSelections = shouldSubmitEvaluationParamsTogether
+        ? [
+            prompt.fields.includes('model_fir') && !selectedModelFir ? '评估模型' : '',
+            prompt.fields.includes('model_sec') && !selectedModelSec ? '第二个评估模型' : '',
+            checkpointFields.length > 0 && !selectedCheckpointPath ? 'Checkpoint' : '',
+            ...requiredEditableFields
+                .filter((field) => !(values[field] || '').trim())
+                .map((field) => fieldLabel(field, paramForField(field))),
+        ].filter(Boolean)
+        : [];
+    const canSubmitEvaluationParams =
+        shouldSubmitEvaluationParamsTogether && missingEvaluationSelections.length === 0;
     const canSubmitFields = shouldSubmitTrainingParamsTogether
         ? Boolean(selectedModel && selectedDataset && (values.schedule_time || '').trim())
         : shouldSubmitGrpoParamsTogether
           ? Boolean(selectedModel && selectedTrainFile && selectedValFile)
-        : filledFields.length > 0;
+          : shouldSubmitEvaluationParamsTogether
+            ? canSubmitEvaluationParams
+            : filledFields.length > 0;
 
     const loadGrpoResources = async () => {
         if (!isGrpoTrainingPrompt) return;
@@ -833,7 +968,7 @@ export function AgentWaitingCard({
     }, [persistenceKey]);
 
     useEffect(() => {
-        const container = prompt.resourceContainer?.trim();
+        const container = resourceContainer?.trim();
         if (!container || isGrpoTrainingPrompt || hasSubmitted) {
             return;
         }
@@ -891,7 +1026,7 @@ export function AgentWaitingCard({
         loadedResourceKey,
         onRefreshDatasets,
         onRefreshModels,
-        prompt.resourceContainer,
+        resourceContainer,
     ]);
 
     const submitReply = (text: string) => {
@@ -946,7 +1081,7 @@ export function AgentWaitingCard({
     const datasetPath = datasetOptionPath;
 
     const shouldSendDatasetName = (dataset: AgentDatasetOption) => {
-        if (!prompt.fields.includes('dataset_name')) {
+        if (!datasetNameField) {
             return false;
         }
         return !(requiresDpoDataset && /^20\d{6}$/.test(dataset.name));
@@ -959,12 +1094,21 @@ export function AgentWaitingCard({
         return joinPathAndName(model.path, model.name);
     };
 
+    const hasArtifactType = (model: AgentModelOption, artifactType: string) =>
+        model.artifactType === artifactType || (model.artifactTypes || []).includes(
+            artifactType as NonNullable<AgentModelOption['artifactType']>,
+        );
+
     const isMergedModel = (model: AgentModelOption, normalizedPath: string, baseName: string) => {
+        const hasExplicitArtifactType = Boolean(model.artifactType || model.artifactTypes?.length);
+        if (hasExplicitArtifactType) {
+            return hasArtifactType(model, 'merged');
+        }
         const modelType = (model.type || '').toLowerCase();
         const isDpoExportModel =
             ['dpo', 'daily_trained'].includes(modelType) &&
             /(?:^|\/)dpo_train\/internal\/export(?:\/|$)/.test(normalizedPath);
-        return model.merged === true || /(?:^|[_-])merged$/i.test(baseName) || isDpoExportModel;
+        return hasArtifactType(model, 'merged') || model.merged === true || /(?:^|[_-])merged$/i.test(baseName) || isDpoExportModel;
     };
 
     const isAllowedEnhancedTrainingModel = (model: AgentModelOption) => {
@@ -973,6 +1117,7 @@ export function AgentWaitingCard({
         const baseName = normalizedPath.split('/').pop() || model.name;
         const modelType = (model.type || '').toLowerCase();
         return (
+            hasArtifactType(model, 'base') ||
             modelType === 'base_train' ||
             /(?:^|\/)base_train(?:\/|$)/.test(normalizedPath) ||
             isMergedModel(model, normalizedPath, baseName)
@@ -985,13 +1130,15 @@ export function AgentWaitingCard({
         const baseName = normalizedPath.split('/').pop() || model.name;
         const modelType = (model.type || '').toLowerCase();
         const isBaseModel =
+            hasArtifactType(model, 'base') ||
             modelType === 'base_train' ||
             /(?:^|\/)base_train(?:\/|$)/.test(normalizedPath) ||
             /(?:^|\/)base(?:\/|$)/.test(normalizedPath);
         const isSftOrDpoModel =
             ['sft', 'dpo', 'pt', 'batch_trained', 'pretrain', 'daily_trained'].includes(modelType) ||
             /(?:^|\/)(?:batch_train|pretrain|daily_train|dpo_train)(?:\/|$)/.test(normalizedPath);
-        return isBaseModel || (isSftOrDpoModel && isMergedModel(model, normalizedPath, baseName));
+        const isInferenceModel = hasArtifactType(model, 'inference') || modelType === 'inference';
+        return isBaseModel || isInferenceModel || (isSftOrDpoModel && isMergedModel(model, normalizedPath, baseName));
     };
 
     const isCheckpointSourceModel = (model: AgentModelOption) => {
@@ -1008,7 +1155,8 @@ export function AgentWaitingCard({
             ['sft', 'dpo', 'pt', 'batch_trained', 'pretrain', 'daily_trained'].includes(modelType) ||
             /(?:^|\/)(?:batch_train|pretrain|daily_train|dpo_train)(?:\/|$)/.test(normalizedPath);
 
-        return isSftOrDpoModel && !isMergedModel(model, normalizedPath, baseName);
+        const explicitlyCheckpointed = hasArtifactType(model, 'checkpoint');
+        return (explicitlyCheckpointed || isSftOrDpoModel) && !isMergedModel(model, normalizedPath, baseName);
     };
 
     const selectableModels = requiresDpoDataset && !isGrpoTrainingPrompt
@@ -1023,14 +1171,11 @@ export function AgentWaitingCard({
 
     const datasetParts = (dataset: AgentDatasetOption) => {
         const parts: string[] = [];
-        if (prompt.fields.includes('dataset_dir')) {
-            parts.push(`dataset_dir=${datasetPath(dataset)}`);
+        for (const field of datasetFields) {
+            parts.push(`${field}=${datasetPath(dataset)}`);
         }
         if (shouldSendDatasetName(dataset)) {
-            parts.push(`dataset_name=${dataset.name}`);
-        }
-        if (prompt.fields.includes('input_folder')) {
-            parts.push(`input_folder=${datasetPath(dataset)}`);
+            parts.push(`${datasetNameField}=${dataset.name}`);
         }
         return parts;
     };
@@ -1043,7 +1188,7 @@ export function AgentWaitingCard({
             return null;
         }
 
-        const parts = [`model_path=${modelPath(model)}`, ...datasetParts(dataset)];
+        const parts = [`${primaryModelField}=${modelPath(model)}`, ...datasetParts(dataset)];
         if (prompt.fields.includes('schedule_time')) {
             const scheduleTime = (values.schedule_time || '').trim();
             if (!scheduleTime) {
@@ -1118,7 +1263,7 @@ export function AgentWaitingCard({
             return;
         }
 
-        submitReply(`model_path=${modelPath(model)}`);
+        submitReply(`${primaryModelField}=${modelPath(model)}`);
     };
 
     const chooseGrpoFile = (field: 'train_files' | 'val_files', file: AgentFileOption) => {
@@ -1135,6 +1280,14 @@ export function AgentWaitingCard({
     const chooseEvaluationModel = (model: AgentModelOption) => {
         if (!hasDualModelPicker) {
             const field = prompt.fields.includes('model_sec') ? 'model_sec' : 'model_fir';
+            if (shouldSubmitEvaluationParamsTogether) {
+                if (field === 'model_sec') {
+                    setSelectedModelSec(model);
+                } else {
+                    setSelectedModelFir(model);
+                }
+                return;
+            }
             submitReply(`${field}=${modelPath(model)}`);
             return;
         }
@@ -1146,7 +1299,9 @@ export function AgentWaitingCard({
 
         if (!selectedModelSec) {
             setSelectedModelSec(model);
-            submitReply(`model_fir=${modelPath(selectedModelFir)}，model_sec=${modelPath(model)}`);
+            if (!shouldSubmitEvaluationParamsTogether) {
+                submitReply(`model_fir=${modelPath(selectedModelFir)}，model_sec=${modelPath(model)}`);
+            }
             return;
         }
 
@@ -1155,14 +1310,19 @@ export function AgentWaitingCard({
     };
 
     const chooseCheckpoint = (model: AgentModelOption, checkpoint: string) => {
-        submitReply(`CKPT_PATH=${modelPath(model)}/${checkpoint}`);
+        const checkpointPath = `${modelPath(model)}/${checkpoint}`;
+        if (shouldSubmitEvaluationParamsTogether) {
+            setSelectedCheckpointPath(checkpointPath);
+            return;
+        }
+        submitReply(`${checkpointFields[0] || 'CKPT_PATH'}=${checkpointPath}`);
     };
 
     const refreshDatasets = async () => {
         if (!onRefreshDatasets) return;
         setIsRefreshingDatasets(true);
         try {
-            const nextDatasets = await onRefreshDatasets(prompt.resourceContainer);
+            const nextDatasets = await onRefreshDatasets(resourceContainer);
             setResourceDatasets(nextDatasets);
         } finally {
             setIsRefreshingDatasets(false);
@@ -1173,7 +1333,7 @@ export function AgentWaitingCard({
         if (!onRefreshModels) return;
         setIsRefreshingModels(true);
         try {
-            const nextModels = await onRefreshModels(prompt.resourceContainer);
+            const nextModels = await onRefreshModels(resourceContainer);
             setResourceModels(nextModels);
         } finally {
             setIsRefreshingModels(false);
@@ -1181,6 +1341,27 @@ export function AgentWaitingCard({
     };
 
     const submitFields = () => {
+        if (shouldSubmitEvaluationParamsTogether) {
+            if (!canSubmitEvaluationParams) {
+                return;
+            }
+            const parts: string[] = [];
+            if (prompt.fields.includes('model_fir') && selectedModelFir) {
+                parts.push(`model_fir=${modelPath(selectedModelFir)}`);
+            }
+            if (prompt.fields.includes('model_sec') && selectedModelSec) {
+                parts.push(`model_sec=${modelPath(selectedModelSec)}`);
+            }
+            if (checkpointFields.length > 0 && selectedCheckpointPath) {
+                parts.push(`${checkpointFields[0] || 'CKPT_PATH'}=${selectedCheckpointPath}`);
+            }
+            parts.push(
+                ...filledFields.map((field) => `${field}=${(values[field] || '').trim()}`),
+            );
+            submitReply(parts.join('，'));
+            return;
+        }
+
         if (shouldSubmitTrainingParamsTogether) {
             submitModelAndDataset(selectedModel, selectedDataset);
             return;
@@ -1356,21 +1537,29 @@ export function AgentWaitingCard({
                                                     {path}
                                                 </span>
                                                 <div className="mt-3 flex flex-wrap gap-2">
-                                                    {(model.checkpoints || []).map((checkpoint) => (
-                                                        <Button
-                                                            key={checkpoint}
-                                                            size="sm"
-                                                            variant="outline"
-                                                            className="h-7 rounded-full px-3 text-xs"
-                                                            disabled={hasSubmitted}
-                                                            onClick={(event) => {
-                                                                event.stopPropagation();
-                                                                chooseCheckpoint(model, checkpoint);
-                                                            }}
-                                                        >
-                                                            {checkpoint}
-                                                        </Button>
-                                                    ))}
+                                                    {(model.checkpoints || []).map((checkpoint) => {
+                                                        const checkpointPath = `${modelPath(model)}/${checkpoint}`;
+                                                        const selected = selectedCheckpointPath === checkpointPath;
+                                                        return (
+                                                            <Button
+                                                                key={checkpoint}
+                                                                size="sm"
+                                                                variant="outline"
+                                                                aria-pressed={selected}
+                                                                className={`h-7 rounded-full px-3 text-xs ${selected
+                                                                    ? 'border-sky-400 bg-sky-50 text-sky-700 ring-1 ring-sky-100 dark:border-sky-400/60 dark:bg-sky-500/15 dark:text-sky-200'
+                                                                    : ''
+                                                                    }`}
+                                                                disabled={hasSubmitted}
+                                                                onClick={(event) => {
+                                                                    event.stopPropagation();
+                                                                    chooseCheckpoint(model, checkpoint);
+                                                                }}
+                                                            >
+                                                                {checkpoint}
+                                                            </Button>
+                                                        );
+                                                    })}
                                                 </div>
                                             </div>
                                         );
@@ -1426,7 +1615,19 @@ export function AgentWaitingCard({
                                                     chooseEvaluationModel(model);
                                                 }}
                                             >
-                                                <span className="block truncate text-sm font-semibold">{model.name}</span>
+                                                <span className="flex items-center justify-between gap-2">
+                                                    <span className="min-w-0 truncate text-sm font-semibold">{model.name}</span>
+                                                    {isFirst && (
+                                                        <span className="shrink-0 rounded-full bg-sky-100 px-2 py-0.5 text-[10px] font-semibold text-sky-700 dark:bg-sky-500/20 dark:text-sky-200">
+                                                            {hasDualModelPicker ? '模型一' : '已选择'}
+                                                        </span>
+                                                    )}
+                                                    {isSecond && (
+                                                        <span className="shrink-0 rounded-full bg-indigo-100 px-2 py-0.5 text-[10px] font-semibold text-indigo-700 dark:bg-indigo-500/20 dark:text-indigo-200">
+                                                            {hasDualModelPicker ? '模型二' : '已选择'}
+                                                        </span>
+                                                    )}
+                                                </span>
                                                 <span className="mt-1 block truncate text-xs text-slate-500 dark:text-slate-400">
                                                     {path}
                                                 </span>
@@ -1634,9 +1835,9 @@ export function AgentWaitingCard({
                                     <div className="text-xs font-semibold text-slate-500 dark:text-slate-400">
                                         {datasetNameOptions.length > 0 ? '选择数据集文件' : '选择数据集'}
                                     </div>
-                                    {datasetNameOptions.length > 0 && prompt.knownParams?.dataset_dir && (
+                                    {datasetNameOptions.length > 0 && (prompt.knownParams?.[datasetFields[0]] || prompt.knownParams?.dataset_dir) && (
                                         <div className="mt-1 text-[11px] text-slate-400 dark:text-slate-500">
-                                            来源：{prompt.knownParams.dataset_dir}
+                                            来源：{prompt.knownParams?.[datasetFields[0]] || prompt.knownParams?.dataset_dir}
                                         </div>
                                     )}
                                 </div>
@@ -1702,26 +1903,97 @@ export function AgentWaitingCard({
 
                     {editableFields.length > 0 && (
                         <div className="mt-4 space-y-3 rounded-[20px] border border-slate-200/80 bg-slate-50/62 p-3.5 dark:border-white/10 dark:bg-slate-950/34">
-                            {editableFields.map((field) => (
-                                <label key={field} className="block">
-                                    <span className="mb-1.5 block text-xs font-semibold text-slate-500 dark:text-slate-400">
-                                        {fieldLabel(field)}
-                                    </span>
-                                    <Input
-                                        value={values[field] || ''}
-                                        placeholder={fieldPlaceholder(field)}
-                                        className="h-10 rounded-2xl border-slate-200 bg-white font-mono text-xs dark:border-white/10 dark:bg-slate-950"
-                                        disabled={hasSubmitted}
-                                        onClick={(event) => event.stopPropagation()}
-                                        onChange={(event) =>
-                                            setValues((prev) => ({
-                                                ...prev,
-                                                [field]: event.target.value,
-                                            }))
-                                        }
-                                    />
-                                </label>
-                            ))}
+                            {editableFields.map((field) => {
+                                const descriptor = paramForField(field);
+                                const protocolTemplateOptions = descriptor?.type === 'template'
+                                    ? (prompt.options || [])
+                                    : [];
+                                const descriptorOptions = descriptor?.options || [];
+                                const options = descriptor?.type === 'boolean'
+                                    ? [
+                                        { value: 'true', label: '是' },
+                                        { value: 'false', label: '否' },
+                                    ]
+                                    : (descriptorOptions.length > 0 ? descriptorOptions : protocolTemplateOptions)
+                                        .map((value) => ({ value, label: value }));
+                                const selectedMultipleValues = new Set(
+                                    (values[field] || '').split(',').map((value) => value.trim()).filter(Boolean),
+                                );
+                                return (
+                                    <div key={field} className="block">
+                                        <span className="mb-1.5 block text-xs font-semibold text-slate-500 dark:text-slate-400">
+                                            {fieldLabel(field, descriptor)}
+                                        </span>
+                                        {options.length > 0 && descriptor?.multiple ? (
+                                            <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                                                {options.map((option) => {
+                                                    const selected = selectedMultipleValues.has(option.value);
+                                                    return (
+                                                        <button
+                                                            key={option.value}
+                                                            type="button"
+                                                            aria-pressed={selected}
+                                                            disabled={hasSubmitted}
+                                                            className={`rounded-xl border px-3 py-2 text-left font-mono text-xs transition ${selected
+                                                                ? 'border-sky-400 bg-sky-50 text-sky-700 dark:border-sky-400/60 dark:bg-sky-500/15 dark:text-sky-200'
+                                                                : 'border-slate-200 bg-white text-slate-600 hover:border-sky-300 dark:border-white/10 dark:bg-slate-950 dark:text-slate-300'
+                                                                }`}
+                                                            onClick={(event) => {
+                                                                event.stopPropagation();
+                                                                const ordered = Array.from(selectedMultipleValues);
+                                                                const existingIndex = ordered.indexOf(option.value);
+                                                                if (existingIndex >= 0) ordered.splice(existingIndex, 1);
+                                                                else ordered.push(option.value);
+                                                                setValues((prev) => ({ ...prev, [field]: ordered.join(',') }));
+                                                            }}
+                                                        >
+                                                            {option.label}
+                                                        </button>
+                                                    );
+                                                })}
+                                            </div>
+                                        ) : options.length > 0 ? (
+                                            <select
+                                                value={values[field] || ''}
+                                                className="h-10 w-full rounded-2xl border border-slate-200 bg-white px-3 font-mono text-xs dark:border-white/10 dark:bg-slate-950"
+                                                disabled={hasSubmitted}
+                                                onClick={(event) => event.stopPropagation()}
+                                                onChange={(event) =>
+                                                    setValues((prev) => ({
+                                                        ...prev,
+                                                        [field]: event.target.value,
+                                                    }))
+                                                }
+                                            >
+                                                <option value="">请选择</option>
+                                                {options.map((option) => (
+                                                    <option key={option.value} value={option.value}>{option.label}</option>
+                                                ))}
+                                            </select>
+                                        ) : (
+                                            <Input
+                                                type={descriptor?.type === 'number' ? 'number' : 'text'}
+                                                value={values[field] || ''}
+                                                placeholder={fieldPlaceholder(field, descriptor)}
+                                                className="h-10 rounded-2xl border-slate-200 bg-white font-mono text-xs dark:border-white/10 dark:bg-slate-950"
+                                                disabled={hasSubmitted}
+                                                onClick={(event) => event.stopPropagation()}
+                                                onChange={(event) =>
+                                                    setValues((prev) => ({
+                                                        ...prev,
+                                                        [field]: event.target.value,
+                                                    }))
+                                                }
+                                            />
+                                        )}
+                                    </div>
+                                );
+                            })}
+                            {shouldSubmitEvaluationParamsTogether && missingEvaluationSelections.length > 0 && (
+                                <div className="text-xs leading-5 text-amber-600 dark:text-amber-300">
+                                    还需选择：{missingEvaluationSelections.join('、')}
+                                </div>
+                            )}
                             <Button
                                 size="sm"
                                 className="h-9 gap-1.5 rounded-full px-4 text-[13px]"
@@ -1732,7 +2004,7 @@ export function AgentWaitingCard({
                                 }}
                             >
                                 <Sparkles className="h-3.5 w-3.5" />
-                                发送已填信息
+                                {shouldSubmitEvaluationParamsTogether ? '提交评估参数' : '发送已填信息'}
                                 <ArrowRight className="h-3.5 w-3.5" />
                             </Button>
                         </div>

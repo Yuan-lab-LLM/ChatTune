@@ -64,7 +64,7 @@ ChatTune 的核心能力与具体领域解耦。Agent 编排、训练、评估�
 ### 训练与评估
 
 - LoRA SFT、全参 SFT、DPO/偏好增强训练和 GRPO。
-- 单模型评估、双模型对比评估和 Checkpoint 评估。
+- 保留现有医疗综合单模型、双模型对比和 Checkpoint 评估作为兼容能力；新增单模型、双模型和 Checkpoint 的 LLaMA-Factory 内置通用评测。
 - 启动前参数、模型模板、Docker、GPU 占用和资源配额检查。
 - 训练与评估任务的状态查询、进度监控和安全停止。
 - 默认适配 Qwen3 训练模板；其他模型可通过 `TEM` / `template` 显式指定，实际支持范围取决于所使用的训练镜像。
@@ -73,7 +73,7 @@ ChatTune 的核心能力与具体领域解耦。Agent 编排、训练、评估�
 
 - 查看和修改模型路径、端口、GPU、张量并行度、显存比例和最大 Token 等配置。
 - 启动、停止和重启推理服务，查询节点、状态与日志。
-- 运行功能测试、自定义评测套件、领域 Benchmark 和通用 Benchmark。
+- 运行已注册的推理 Benchmark，包括领域 Benchmark 和通用 Benchmark。
 - 仓库内置 C-Eval、CMMLU、MMLU、CMB-Single 等通用 Benchmark，以及 MedQA、MedMCQA 等医疗示例资源；相关数据集适用各自许可证，详见 [NOTICE](NOTICE)。
 
 ### Studio 与平台治理
@@ -160,7 +160,7 @@ bash runtime.sh stop
 登录 Studio 后，可以直接输入：
 
 ```text
-执行数据预处理，data_type=sft，strategy=diagnosis
+执行数据预处理
 执行 LoRA 批量训练，MBS=1，ACC=8，LR=1e-7
 执行增强训练，model_path=/path/to/model，dataset_dir=/path/to/data，dataset_name=my_dpo
 执行单模型评估，model_fir=/path/to/model
@@ -201,7 +201,8 @@ bash runtime.sh stop
 ├── agent/                        # Agent API、工作流编排、工具与资源 API
 ├── agent-studio-runtime-bridge/  # Studio 与 Agent API 的桥接服务
 ├── docker_scripts/               # 任务容器创建与内置评测资源
-├── medflow/                      # 可选的历史兼容推理示例、Agent、测试与 Benchmark
+├── inference-ops/                # 独立的 vLLM 运维 controller/worker 与 Benchmark
+├── medflow/                      # 暂存的旧业务目录；inference-ops 不依赖它
 └── docs/                         # 部署、使用和管理文档
 ```
 

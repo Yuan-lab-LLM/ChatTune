@@ -1,0 +1,9 @@
+NODES:
+  local:
+    ENABLED: true
+    NAME: local
+    # The single-machine runtime node id is local.
+    RESOURCE_NODE_ID: local
+    HOST: 127.0.0.1
+    TOOL_URL: http://127.0.0.1:8899/worker/tool
+    ROLE: worker

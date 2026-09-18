@@ -289,10 +289,11 @@ const TemplateLibraryDialog = ({
 
                 {/* 分类过滤（仅在非搜索模式下显示） */}
                 {!searchQuery.trim() && (
-                    <div className="flex gap-2 mt-4 flex-wrap text-xs">
+                    <div className="flex flex-wrap gap-x-1 gap-y-2 mt-4 text-xs">
                         <Button
                             variant={selectedCategory === null ? 'default' : 'outline'}
                             size="sm"
+                            className="gap-1 px-2 has-[>svg]:px-2"
                             onClick={() => setSelectedCategory(null)}
                         >
                             {t('categoryAll') || '全部'}
@@ -304,11 +305,12 @@ const TemplateLibraryDialog = ({
                                     key={cat.id}
                                     variant={selectedCategory === cat.id ? 'default' : 'outline'}
                                     size="sm"
+                                    className="gap-1 px-2 has-[>svg]:px-2"
                                     onClick={() => setSelectedCategory(cat.id === selectedCategory ? null : cat.id)}
                                 >
-                                    {IconComponent && <IconComponent className="w-4 h-4 mr-1" />}
+                                    {IconComponent && <IconComponent className="w-4 h-4" />}
                                     {translateCategoryName(cat.name)}
-                                    <span className="ml-1 text-[11px] opacity-60">({cat.templates.length})</span>
+                                    <span className="text-[11px] opacity-60">({cat.templates.length})</span>
                                 </Button>
                             );
                         })}

@@ -14,11 +14,15 @@ export interface ValidationResult {
 }
 
 // 端口范围验证
-export const validatePort = (port: number, fieldName: string): ValidationError | null => {
+export const validatePort = (
+  port: number,
+  fieldName: string,
+  section: keyof InferenceConfig = 'ports',
+): ValidationError | null => {
   if (!port || port <= 0) {
     return {
       field: fieldName,
-      section: 'ports',
+      section,
       message: `${fieldName} 不能为空`,
       type: 'error',
     };
@@ -26,7 +30,7 @@ export const validatePort = (port: number, fieldName: string): ValidationError |
   if (port < 1 || port > 65535) {
     return {
       field: fieldName,
-      section: 'ports',
+      section,
       message: `${fieldName} 必须在 1-65535 范围内`,
       type: 'error',
     };
@@ -34,7 +38,7 @@ export const validatePort = (port: number, fieldName: string): ValidationError |
   if (port <= 1024) {
     return {
       field: fieldName,
-      section: 'ports',
+      section,
       message: `${fieldName} (${port}) 为系统保留端口（1-1024），可能需要 root 权限`,
       type: 'warning',
     };
@@ -118,22 +122,6 @@ export const validateTensorParallel = (size: number): ValidationError | null => 
   return null;
 };
 
-// Max Tokens 验证
-export const validateMaxTokens = (tokens: number): ValidationError | null => {
-  if (tokens === undefined || tokens === null || tokens === 0) {
-    return null; // 允许为空
-  }
-  if (tokens < 1 || tokens > 32768) {
-    return {
-      field: 'MAX_TOKENS',
-      section: 'runtime',
-      message: 'Max Tokens 应在 1-32768 范围内',
-      type: 'error',
-    };
-  }
-  return null;
-};
-
 // 必需字段验证
 export const validateRequired = (
   value: string | undefined,
@@ -152,44 +140,6 @@ export const validateRequired = (
 };
 
 // 检查端口重复
-export const validateDuplicatePorts = (ports: {
-  VLLM_OPENAI_PORT?: number;
-  INFERENCE_PORT?: number;
-  UI_PORT?: number;
-  DATA_ANNOTATION_PORT?: number;
-}): ValidationError[] => {
-  const errors: ValidationError[] = [];
-  const portMap = new Map<number, string[]>();
-
-  const portEntries = [
-    { name: 'VLLM_OPENAI_PORT', value: ports.VLLM_OPENAI_PORT },
-    { name: 'INFERENCE_PORT', value: ports.INFERENCE_PORT },
-    { name: 'UI_PORT', value: ports.UI_PORT },
-    { name: 'DATA_ANNOTATION_PORT', value: ports.DATA_ANNOTATION_PORT },
-  ];
-
-  portEntries.forEach(({ name, value }) => {
-    if (value && value > 0) {
-      const existing = portMap.get(value) || [];
-      existing.push(name);
-      portMap.set(value, existing);
-    }
-  });
-
-  portMap.forEach((names, value) => {
-    if (names.length > 1) {
-      errors.push({
-        field: names.join(', '),
-        section: 'ports',
-        message: `端口号 ${value} 被多个服务使用：${names.join(', ')}`,
-        type: 'error',
-      });
-    }
-  });
-
-  return errors;
-};
-
 // 完整配置验证
 export const validateConfig = (config: Partial<InferenceConfig>): ValidationResult => {
   const errors: ValidationError[] = [];
@@ -202,9 +152,6 @@ export const validateConfig = (config: Partial<InferenceConfig>): ValidationResu
     // 单个端口验证
     const portFields = [
       { key: 'VLLM_OPENAI_PORT', value: ports.VLLM_OPENAI_PORT },
-      { key: 'INFERENCE_PORT', value: ports.INFERENCE_PORT },
-      { key: 'UI_PORT', value: ports.UI_PORT },
-      { key: 'DATA_ANNOTATION_PORT', value: ports.DATA_ANNOTATION_PORT },
     ];
 
     portFields.forEach(({ key, value }) => {
@@ -218,9 +165,6 @@ export const validateConfig = (config: Partial<InferenceConfig>): ValidationResu
       }
     });
 
-    // 端口重复验证
-    const duplicateErrors = validateDuplicatePorts(ports);
-    errors.push(...duplicateErrors);
   }
 
   // 验证环境变量
@@ -245,6 +189,28 @@ export const validateConfig = (config: Partial<InferenceConfig>): ValidationResu
       } else {
         warnings.push(cudaError);
       }
+    }
+
+    const masterPortError = validatePort(env.MASTER_PORT || 0, 'MASTER_PORT', 'env');
+    if (masterPortError) {
+      if (masterPortError.type === 'error') {
+        errors.push(masterPortError);
+      } else {
+        warnings.push(masterPortError);
+      }
+    }
+
+    if (
+      env.MASTER_PORT &&
+      config.ports?.VLLM_OPENAI_PORT &&
+      env.MASTER_PORT === config.ports.VLLM_OPENAI_PORT
+    ) {
+      errors.push({
+        field: 'MASTER_PORT',
+        section: 'env',
+        message: 'MASTER_PORT 不能与 VLLM_OPENAI_PORT 重复',
+        type: 'error',
+      });
     }
 
     // 必需字段验证
@@ -277,14 +243,6 @@ export const validateConfig = (config: Partial<InferenceConfig>): ValidationResu
       }
     }
 
-    const maxTokensError = validateMaxTokens(runtime.MAX_TOKENS || 0);
-    if (maxTokensError) {
-      if (maxTokensError.type === 'error') {
-        errors.push(maxTokensError);
-      } else {
-        warnings.push(maxTokensError);
-      }
-    }
   }
 
   return {

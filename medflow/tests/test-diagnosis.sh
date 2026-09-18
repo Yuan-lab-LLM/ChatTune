@@ -1,17 +1,15 @@
-# v4-生成诊断
+#!/usr/bin/env bash
 
-ip=$1
-port=$2
-if [ -z "$ip" ] || [ -z "$port" ]; then
-    echo "错误：请提供 IP 地址和端口号作为参数。"
-    echo "用法：$0 <IP地址> <端口号>"
-    exit 1
-fi
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=medical-smoke-lib.sh
+source "$SCRIPT_DIR/medical-smoke-lib.sh"
 
-curl -X 'POST' \
-  "http://$ip:$port/inference?request_type=v4" \
-  -H 'accept: application/json' \
-  -H 'Content-Type: application/json' \
-  -d @data/diagnosis.json
+medical_smoke_init
+BASE_URL=$(medical_smoke_base_url "${1:-}" "${2:-}" "${MEDFLOW_BASE_URL:-}")
 
-  echo -e "\n==================================\n"
+medical_smoke_request \
+    "diagnosis (v4)" \
+    POST \
+    "$BASE_URL/inference?request_type=v4" \
+    "$SCRIPT_DIR/data/diagnosis.json" \
+    nonempty-json

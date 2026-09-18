@@ -9,6 +9,12 @@ import { Step2Preprocess } from './steps/Step2Preprocess';
 import { Step3Training } from './steps/Step3Training';
 import { Step4Monitor } from './steps/Step4Monitor';
 import type { QuickStartWizardProps, QuickStartWizardRef } from './types';
+import {
+  buildSftPreprocessCommand,
+  DEFAULT_PREFERRED_DATASET_ID,
+  DEFAULT_TRAINING_COMMAND,
+  isRawDataset,
+} from './config';
 
 export const QuickStartWizard = forwardRef<QuickStartWizardRef, QuickStartWizardProps>(function QuickStartWizard({
   open,
@@ -19,7 +25,7 @@ export const QuickStartWizard = forwardRef<QuickStartWizardRef, QuickStartWizard
   datasets,
   selectedDataset,
   onSelectDataset,
-  requiredDatasetId = 'medical-example',
+  requiredDatasetId = DEFAULT_PREFERRED_DATASET_ID,
   inputRequests,
   runs,
   focusOnLatestRun,
@@ -171,10 +177,12 @@ export const QuickStartWizard = forwardRef<QuickStartWizardRef, QuickStartWizard
         if (cachedDatasets && datasets.length === 0) {
           try {
             const parsed = JSON.parse(cachedDatasets);
-            const hasExample = parsed.some((d: DatasetInfo) => d.name === requiredDatasetId);
-            if (hasExample) {
-              // 有缓存且包含示例数据，自动使用缓存
-              onSelectDataset(parsed.find((d: DatasetInfo) => d.name === requiredDatasetId) || null);
+            const preferredDataset = parsed.find((d: DatasetInfo) => isRawDataset(d) && d.name === requiredDatasetId)
+              || parsed.find((d: DatasetInfo) => isRawDataset(d) && !/medical|病历/i.test(`${d.name} ${d.path || ''}`))
+              || parsed.find((d: DatasetInfo) => isRawDataset(d));
+            if (preferredDataset) {
+              // 有可用 raw 数据时，优先选择通用对话数据。
+              onSelectDataset(preferredDataset);
               // 这里需要通知外部更新 datasets 状态
             }
           } catch (e) {
@@ -282,7 +290,8 @@ export const QuickStartWizard = forwardRef<QuickStartWizardRef, QuickStartWizard
     }
 
     // 命令始终使用中文，不翻译
-    const command = `执行数据预处理，数据类型为sft，数据格式为diagnosis，数据在/home/workspace/dataset/${selectedDataset?.name}`;
+    if (!selectedDataset) return false;
+    const command = buildSftPreprocessCommand(selectedDataset);
 
     // 保存命令并标记为已填入
     setFilledCommand(command);
@@ -310,7 +319,7 @@ export const QuickStartWizard = forwardRef<QuickStartWizardRef, QuickStartWizard
     }
 
     // 命令始终使用中文，不翻译
-    const command = '运行lora批量训练';
+    const command = DEFAULT_TRAINING_COMMAND;
 
     // 保存命令并标记为已填入
     setIsTrainingCommandFilled(true);
@@ -347,8 +356,8 @@ export const QuickStartWizard = forwardRef<QuickStartWizardRef, QuickStartWizard
 
   // 处理数据集选择
   const handleSelectDataset = (dataset: DatasetInfo) => {
-    // 只有示例数据集才能选择
-    if (dataset.name === requiredDatasetId) {
+    // 通用向导可选择任意 raw 数据；医疗示例继续作为兼容模板。
+    if (isRawDataset(dataset)) {
       onSelectDataset(dataset);
       selectWizardDataset({
         id: dataset.name,
@@ -365,8 +374,8 @@ export const QuickStartWizard = forwardRef<QuickStartWizardRef, QuickStartWizard
   // 判断是否可以选择下一步
   const canProceedToNext = useMemo(() => {
     if (state.currentStep === 0) {
-      // 第一步：必须选择了示例数据集
-      return selectedDataset?.name === requiredDatasetId;
+      // 第一步：选择任意 raw 数据集即可继续。
+      return Boolean(selectedDataset && isRawDataset(selectedDataset));
     }
     return state.canProceed;
   }, [state.currentStep, state.canProceed, selectedDataset, requiredDatasetId]);

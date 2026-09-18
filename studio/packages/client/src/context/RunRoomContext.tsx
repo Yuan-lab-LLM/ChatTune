@@ -163,6 +163,15 @@ const wandbFromMetrics = (metrics: unknown): WandbExtraction | null => {
     return { url: null, pending: true };
   }
 
+  if (
+    Object.prototype.hasOwnProperty.call(data, "wandb_url") ||
+    Object.prototype.hasOwnProperty.call(data, "wandbUrl") ||
+    Object.prototype.hasOwnProperty.call(data, "wandb_url_pending") ||
+    Object.prototype.hasOwnProperty.call(data, "wandbUrlPending")
+  ) {
+    return { url: null, pending: false };
+  }
+
   return null;
 };
 
@@ -170,8 +179,15 @@ const extractWandbFromProtocol = (payload: unknown): WandbExtraction | null => {
   const data = asRecord(payload);
   if (!data) return null;
 
+  const nestedProtocol = asRecord(data.protocol);
+  if (nestedProtocol) {
+    const nested = extractWandbFromProtocol(nestedProtocol);
+    if (nested) return nested;
+  }
+
   const direct = wandbFromMetrics(data.metrics) ?? wandbFromMetrics(data);
   if (direct?.url) return direct;
+  if (data.type === "monitor_status" && direct) return direct;
 
   const stages = asRecord(data.stages);
   const currentStage = typeof data.currentStage === "string" ? data.currentStage : null;

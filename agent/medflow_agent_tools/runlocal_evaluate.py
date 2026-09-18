@@ -16,12 +16,17 @@ import shlex
 import threading
 import time
 import logging
+import uuid
 from datetime import datetime
 from typing import Dict, List, Any, Optional, Union, Callable,Tuple
 from agentscope.tool import ToolResponse
 
 logger = logging.getLogger(__name__)
 from ._config_defaults import get_default_docker_container
+from ._evaluation_descriptors import (
+    find_evaluation_descriptor,
+    list_evaluation_descriptors,
+)
 from agentscope.message import TextBlock
 from ._train_monitor_helpers import (
     build_background_shell_command,
@@ -29,14 +34,10 @@ from ._train_monitor_helpers import (
     require_assigned_gpu_env,
 )
 from ._template_policy import (
-    DEFAULT_TEMPLATE,
-    MODEL_HINT_KEYS,
     TEMPLATE_PARAM_KEYS,
     first_nonempty,
-    non_qwen3_template_required_issue,
-    normalize_template,
-    template_validation_issue,
-    text_mentions_non_qwen3_model,
+    resolve_model_template,
+    verify_model_template_resolution,
 )
 from .runlocal_train import (
     MANUAL_GPU_ENV_KEYS,
@@ -56,15 +57,63 @@ _RUNTIME_DIR = os.path.abspath(
 _BACKGROUND_TASK_REGISTRY = os.path.join(_RUNTIME_DIR, "background_task_registry.jsonl")
 _EVALUATE_PID_REGISTRY = os.path.join(_RUNTIME_DIR, "evaluate_pid_registry.jsonl")
 
+GENERIC_EVAL_DATASETS = ("ceval", "cmbsingle", "cmmlu", "medmcqa", "medqa", "mmlu")
+GENERIC_EVAL_SCRIPTS = {
+    "generic_single_model_eval",
+    "generic_compare_models_eval",
+    "generic_ckpt_eval",
+}
+
+
+def _normalize_generic_eval_datasets(value: Any) -> List[str]:
+    raw_items = value if isinstance(value, (list, tuple)) else str(value or "").split(",")
+    normalized: List[str] = []
+    for raw in raw_items:
+        name = str(raw or "").strip().lower()
+        if not name:
+            continue
+        if not re.fullmatch(r"[a-z][a-z0-9_]*", name) or name not in GENERIC_EVAL_DATASETS:
+            raise ValueError(
+                f"不支持的通用评测集 {name!r}；可选项：{', '.join(GENERIC_EVAL_DATASETS)}"
+            )
+        if name not in normalized:
+            normalized.append(name)
+    if not normalized:
+        raise ValueError("通用评测至少需要选择一个 eval_datasets")
+    return normalized
+
+
+def _normalize_evaluation_scope(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace(" ", "")
+    aliases = {
+        "medical": "medical",
+        "医疗": "medical",
+        "医疗评测": "medical",
+        "医疗评估": "medical",
+        "general": "general",
+        "通用": "general",
+        "通用评测": "general",
+        "通用评估": "general",
+    }
+    if normalized not in aliases:
+        raise ValueError("evaluation_scope 只能是 medical 或 general")
+    return aliases[normalized]
+
 
 def _evaluate_type(script_name: Optional[str]) -> Tuple[str, str]:
     lower = str(script_name or "").lower()
+    if "generic_single_model_eval" in lower:
+        return "single_model", "LLaMA-Factory 通用单模型评测"
+    if "generic_compare_models_eval" in lower:
+        return "compare_between_models", "LLaMA-Factory 通用双模型评测"
+    if "generic_ckpt_eval" in lower:
+        return "ckpt", "LLaMA-Factory 通用 checkpoint 评测"
     if "single_model_evaluation_vpn" in lower:
-        return "single_model", "单模型评估"
+        return "single_model", "内置医疗单模型评估"
     if "ckpt_eval" in lower:
-        return "ckpt", "checkpoint评估"
+        return "ckpt", "内置医疗 checkpoint 评估"
     if "compare_between_models_vpn" in lower:
-        return "compare_between_models", "双模型评估"
+        return "compare_between_models", "内置医疗双模型评估"
     return "unknown", "模型评估"
 
 
@@ -83,6 +132,16 @@ def _evaluate_protocol_hint(
         "scriptName": script_name,
         "content": message,
     }
+    descriptor = find_evaluation_descriptor(script_name)
+    if descriptor:
+        hint.update({
+            "descriptorId": descriptor["id"],
+            "paramSchema": descriptor["params"],
+            "resourceSelectors": descriptor["resourceSelectors"],
+            "evaluationScope": descriptor["evaluationScope"],
+            "supportsCustomDataset": descriptor["supportsCustomDataset"],
+            "builtInSuites": descriptor["builtInSuites"],
+        })
     if protocol_type == "need_input":
         required_params = fields.get("requiredParams") or []
         fields.setdefault("status", "needs_input")
@@ -110,6 +169,16 @@ def _evaluate_protocol_hint(
         fields.setdefault("action", "start")
         fields.setdefault("jobType", "assessment")
     hint.update({key: value for key, value in fields.items() if value is not None})
+    script_args = hint.get("scriptArgs")
+    if isinstance(script_args, dict) and script_name in GENERIC_EVAL_SCRIPTS:
+        try:
+            hint.setdefault("evalDatasets", _normalize_generic_eval_datasets(script_args.get("eval_datasets")))
+        except ValueError:
+            pass
+        run_id = str(script_args.get("run_id") or "").strip()
+        if run_id:
+            hint.setdefault("runId", run_id)
+            hint.setdefault("reportPath", f"/home/workspace/eval/llamafactory/{run_id}/summary.txt")
     return hint
 
 
@@ -148,6 +217,7 @@ def _evaluate_completed_from_output(stdout: str, stderr: str) -> bool:
         "Skipping report generation because report already exists",
         "single_model_valuation_evaluation_report.txt",
         "compare_between_models_evaluation_report.txt",
+        "Generic evaluation finished. Run ID:",
         "| RESULT |",
     ]
     return any(marker in output for marker in completion_markers)
@@ -369,63 +439,31 @@ def _evaluate_template_value(
 ) -> str:
     env_vars = env_vars or {}
     cli_args = cli_args or {}
-    if script_name == "ckpt_eval":
+    if script_name in {"ckpt_eval", "generic_ckpt_eval"}:
         return first_nonempty(
             [
                 env_vars.get("TEM"),
                 env_vars.get("template"),
                 cli_args.get("TEM"),
                 cli_args.get("template"),
-                DEFAULT_TEMPLATE,
             ]
         )
     return ""
 
 
-def _evaluate_model_hint(
-    script_name: str,
-    env_vars: Optional[Dict[str, Any]],
-    cli_args: Optional[Dict[str, Any]],
-) -> str:
-    env_vars = env_vars or {}
-    cli_args = cli_args or {}
-    if script_name != "ckpt_eval":
-        return ""
-    return first_nonempty(
-        [
-            env_vars.get("CKPT_PATH"),
-            cli_args.get("CKPT_PATH"),
-        ]
-    )
-
-
-def _evaluate_template_policy_issue(
-    script_name: str,
-    container: str,
-    env_vars: Optional[Dict[str, Any]],
-    cli_args: Optional[Dict[str, Any]],
-    *,
-    explicit_template: bool,
-    model_hint: str = "",
-) -> Optional[Dict[str, Any]]:
-    if script_name != "ckpt_eval":
-        return None
-    template = _evaluate_template_value(script_name, env_vars, cli_args)
-    template_issue = template_validation_issue(template, param="TEM", container=container)
-    if template_issue:
-        return template_issue
-    detected_model_hint = model_hint or _evaluate_model_hint(script_name, env_vars, cli_args)
-    if (
-        not explicit_template
-        and normalize_template(template) == DEFAULT_TEMPLATE
-        and text_mentions_non_qwen3_model(detected_model_hint)
-    ):
-        return non_qwen3_template_required_issue(
-            param="TEM",
-            container=container,
-            model_hint=detected_model_hint,
+def _base_model_from_adapter_config(raw_config: str, config_path: str) -> str:
+    try:
+        config = json.loads(str(raw_config or ""))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"LoRA adapter_config.json 格式无效：{config_path}。") from exc
+    if not isinstance(config, dict):
+        raise ValueError(f"LoRA adapter_config.json 必须是 JSON 对象：{config_path}。")
+    base_model = str(config.get("base_model_name_or_path") or "").strip()
+    if not base_model:
+        raise ValueError(
+            f"LoRA adapter_config.json 缺少 base_model_name_or_path：{config_path}。"
         )
-    return None
+    return base_model
 
 
 def run_evaluate_preflight(
@@ -440,16 +478,6 @@ def run_evaluate_preflight(
     container_issue = _validate_evaluate_container_preflight(container)
     if container_issue:
         return container_issue
-
-    template_issue = _evaluate_template_policy_issue(
-        script_name,
-        container,
-        env_vars,
-        cli_args,
-        explicit_template=False,
-    )
-    if template_issue:
-        return template_issue
 
     def run_shell(command: str) -> Any:
         try:
@@ -483,6 +511,20 @@ def run_evaluate_preflight(
             )
         return None
 
+    def check_file(path: str, reason: str, label: str, **fields: Any) -> Optional[Dict[str, Any]]:
+        check = run_shell(f"test -f {shlex.quote(path)}")
+        if isinstance(check, dict):
+            return check
+        if check.returncode != 0:
+            return _evaluate_preflight_issue(
+                reason,
+                f"{label}不存在：{path}（容器：{container}）。",
+                container=container,
+                path=path,
+                **fields,
+            )
+        return None
+
     if script_name == "single_model_evaluation_vpn":
         model_path = str(cli_args.get("model_fir") or env_vars.get("model_fir") or "").strip()
         model_issue = check_dir(model_path, "model_path_missing", "评估模型路径", param="model_fir")
@@ -499,6 +541,150 @@ def run_evaluate_preflight(
         checkpoint_issue = check_dir(checkpoint_path, "checkpoint_missing", "checkpoint 路径", param="CKPT_PATH")
         if checkpoint_issue:
             return checkpoint_issue
+    elif script_name in GENERIC_EVAL_SCRIPTS:
+        if script_name == "generic_single_model_eval":
+            model_issue = check_dir(
+                str(cli_args.get("model_fir") or "").strip(),
+                "model_path_missing",
+                "评测模型路径",
+                param="model_fir",
+            )
+            if model_issue:
+                return model_issue
+        elif script_name == "generic_compare_models_eval":
+            for param_name, label in (("model_fir", "第一个评测模型路径"), ("model_sec", "第二个评测模型路径")):
+                model_issue = check_dir(
+                    str(cli_args.get(param_name) or "").strip(),
+                    "model_path_missing",
+                    label,
+                    param=param_name,
+                )
+                if model_issue:
+                    return model_issue
+        else:
+            checkpoint_path = str(cli_args.get("CKPT_PATH") or "").strip()
+            checkpoint_issue = check_dir(
+                checkpoint_path,
+                "checkpoint_missing",
+                "checkpoint 路径",
+                param="CKPT_PATH",
+            )
+            if checkpoint_issue:
+                return checkpoint_issue
+            adapter_config_issue = check_file(
+                f"{checkpoint_path}/adapter_config.json",
+                "adapter_config_missing",
+                "LoRA adapter_config.json",
+                param="CKPT_PATH",
+            )
+            if adapter_config_issue:
+                return adapter_config_issue
+            adapter_config_path = f"{checkpoint_path}/adapter_config.json"
+            adapter_config_result = run_shell(
+                f"cat {shlex.quote(adapter_config_path)}"
+            )
+            if isinstance(adapter_config_result, dict):
+                return adapter_config_result
+            if adapter_config_result.returncode != 0:
+                return _evaluate_preflight_issue(
+                    "adapter_config_unreadable",
+                    f"无法读取 LoRA adapter_config.json：{adapter_config_path}。",
+                    container=container,
+                    path=adapter_config_path,
+                    param="CKPT_PATH",
+                )
+            try:
+                base_model = _base_model_from_adapter_config(
+                    str(adapter_config_result.stdout or ""),
+                    adapter_config_path,
+                )
+            except ValueError as exc:
+                return _evaluate_preflight_issue(
+                    "adapter_config_invalid",
+                    str(exc),
+                    container=container,
+                    path=adapter_config_path,
+                    param="CKPT_PATH",
+                )
+            if not base_model.startswith("/"):
+                return _evaluate_preflight_issue(
+                    "base_model_unavailable",
+                    f"adapter 记录的基础模型不是容器内绝对路径：{base_model}。",
+                    container=container,
+                    path=adapter_config_path,
+                    param="CKPT_PATH",
+                    baseModel=base_model,
+                )
+            base_model_issue = check_dir(
+                base_model,
+                "base_model_unavailable",
+                "adapter 基础模型路径",
+                param="CKPT_PATH",
+                baseModel=base_model,
+            )
+            if base_model_issue:
+                return base_model_issue
+            adapter_weights_check = run_shell(
+                "test -f "
+                + shlex.quote(f"{checkpoint_path}/adapter_model.safetensors")
+                + " || test -f "
+                + shlex.quote(f"{checkpoint_path}/adapter_model.bin")
+            )
+            if isinstance(adapter_weights_check, dict):
+                return adapter_weights_check
+            if adapter_weights_check.returncode != 0:
+                return _evaluate_preflight_issue(
+                    "adapter_weights_missing",
+                    f"checkpoint 中缺少 LoRA adapter_model.safetensors 或 adapter_model.bin：{checkpoint_path}。",
+                    container=container,
+                    path=checkpoint_path,
+                    param="CKPT_PATH",
+                )
+
+        try:
+            datasets = _normalize_generic_eval_datasets(cli_args.get("eval_datasets"))
+        except ValueError as exc:
+            return _evaluate_preflight_issue(
+                "invalid_eval_datasets",
+                str(exc),
+                required_params=["eval_datasets"],
+                allowed=list(GENERIC_EVAL_DATASETS),
+            )
+        for dataset in datasets:
+            dataset_root = f"/home/workspace/evaluation/{dataset}"
+            for suffix, label in (
+                (f"{dataset}.py", "数据集加载脚本"),
+                ("mapping.json", "数据集映射"),
+                (f"{dataset}.zip", "数据集压缩包"),
+            ):
+                issue = check_file(
+                    f"{dataset_root}/{suffix}",
+                    "evaluation_dataset_missing",
+                    f"{dataset} {label}",
+                    dataset=dataset,
+                )
+                if issue:
+                    return issue
+        command_check = run_shell("test -x /usr/local/insinfersystem/llamafactory-cli")
+        if isinstance(command_check, dict):
+            return command_check
+        if command_check.returncode != 0:
+            return _evaluate_preflight_issue(
+                "llamafactory_eval_unavailable",
+                "评测容器中缺少可执行的 /usr/local/insinfersystem/llamafactory-cli。",
+                container=container,
+            )
+        entrypoint = str(script_info.get("docker_executable") or "").strip()
+        entrypoint_check = run_shell(f"test -x {shlex.quote(entrypoint)}")
+        if isinstance(entrypoint_check, dict):
+            return entrypoint_check
+        if entrypoint_check.returncode != 0:
+            return _evaluate_preflight_issue(
+                "generic_eval_entrypoint_missing",
+                f"评测容器中缺少通用评测入口：{entrypoint}。",
+                container=container,
+                path=entrypoint,
+            )
 
     if resource_request:
         snapshot_issue = _validate_evaluate_gpu_snapshot_preflight(container)
@@ -602,7 +788,7 @@ class ScriptManager:
             
             "compare_between_models_vpn": {
                 "path": "compare_between_models_vpn",
-                "description": "双模型评估工具，仅当训练结束后才可以调用",
+                "description": "内置医疗综合双模型评估工具，仅当训练结束后才可以调用",
                 "aliases": ["双模型评估"],
                 "supports_background": True,
                 "long_running": True,
@@ -644,7 +830,7 @@ class ScriptManager:
             },
             "single_model_evaluation_vpn": {
                 "path": "single_model_evaluation_vpn",
-                "description": "单模型评估工具，仅当训练结束后才可以调用",
+                "description": "内置医疗综合单模型评估工具，仅当训练结束后才可以调用",
                 "aliases": ["单模型评估"],
                 "supports_background": True,
                 "long_running": True,
@@ -683,12 +869,11 @@ class ScriptManager:
             },
             "ckpt_eval": {
                 "path": "ckpt_eval",
-                "description": "checkpoint评估工具，仅当训练结束后才可以调用",
+                "description": "内置医疗综合 checkpoint 评估工具，仅当训练结束后才可以调用",
                 "aliases": ["checkpoint assessment", "ckpt assessment", "checkpoint评估", "ckpt评估"],
                 "supports_background": True,
                 "long_running": True,
                 "default_env": {
-                    "TEM": "qwen3",
                     "CKPT_PATH": ""
                 },
                 "supported_params": ["TEM", "CKPT_PATH"],
@@ -710,8 +895,114 @@ class ScriptManager:
                     "task_type_text": "checkpoint评估",
                 },
             },
+            "generic_single_model_eval": {
+                "path": "generic_single_model_eval",
+                "description": "仅运行 LLaMA-Factory 内置 eval 的通用单模型评测",
+                "aliases": ["通用单模型评测", "通用单模型评估"],
+                "supports_background": True,
+                "long_running": True,
+                "cli_args_only": True,
+                "default_cli_args": {"model_fir": "", "eval_datasets": ""},
+                "supported_cli_params": ["model_fir", "eval_datasets", "run_id"],
+                "required_cli_params": ["model_fir", "eval_datasets"],
+                "param_mapping": {
+                    "模型": "model_fir",
+                    "模型路径": "model_fir",
+                    "第一个模型": "model_fir",
+                    "第一个模型路径": "model_fir",
+                    "评测集": "eval_datasets",
+                    "评估集": "eval_datasets",
+                    "数据集": "eval_datasets",
+                },
+                "supported_params": [],
+                "default_args": {"background": True, "capture_output": False},
+                "docker_container": DEFAULT_DOCKER_CONTAINER,
+                "docker_working_dir": "/usr/local/insinfersystem",
+                "docker_executable": "/usr/local/insinfersystem/generic_single_model_eval",
+                "requires_docker": True,
+                "resource_request": {
+                    "enabled": True, "node_count": 1, "gpus_per_node": 4,
+                    "gpu_count_env": "MEDFLOW_DEFAULT_GPU_COUNT_SINGLE_MODEL_EVAL",
+                    "task_category": "assessment",
+                    "task_type": "single_model",
+                    "task_type_text": "LLaMA-Factory 通用单模型评测",
+                },
+            },
+            "generic_compare_models_eval": {
+                "path": "generic_compare_models_eval",
+                "description": "仅运行 LLaMA-Factory 内置 eval 的通用双模型评测",
+                "aliases": ["通用双模型评测", "通用双模型评估"],
+                "supports_background": True,
+                "long_running": True,
+                "cli_args_only": True,
+                "default_cli_args": {"model_fir": "", "model_sec": "", "eval_datasets": ""},
+                "supported_cli_params": ["model_fir", "model_sec", "eval_datasets", "run_id"],
+                "required_cli_params": ["model_fir", "model_sec", "eval_datasets"],
+                "param_mapping": {
+                    "第一个模型": "model_fir",
+                    "第一个模型路径": "model_fir",
+                    "第二个模型": "model_sec",
+                    "第二个模型路径": "model_sec",
+                    "评测集": "eval_datasets",
+                    "评估集": "eval_datasets",
+                    "数据集": "eval_datasets",
+                },
+                "supported_params": [],
+                "default_args": {"background": True, "capture_output": False},
+                "docker_container": DEFAULT_DOCKER_CONTAINER,
+                "docker_working_dir": "/usr/local/insinfersystem",
+                "docker_executable": "/usr/local/insinfersystem/generic_compare_models_eval",
+                "requires_docker": True,
+                "resource_request": {
+                    "enabled": True, "node_count": 1, "gpus_per_node": 8,
+                    "gpu_count_env": "MEDFLOW_DEFAULT_GPU_COUNT_COMPARE_MODELS",
+                    "task_category": "assessment",
+                    "task_type": "compare_between_models",
+                    "task_type_text": "LLaMA-Factory 通用双模型评测",
+                },
+            },
+            "generic_ckpt_eval": {
+                "path": "generic_ckpt_eval",
+                "description": "仅运行 LLaMA-Factory 内置 eval 的通用 checkpoint 对比评测",
+                "aliases": ["通用ckpt评测", "通用checkpoint评测", "通用ckpt评估", "通用checkpoint评估"],
+                "supports_background": True,
+                "long_running": True,
+                "cli_args_only": True,
+                "default_cli_args": {"CKPT_PATH": "", "eval_datasets": ""},
+                "supported_cli_params": ["CKPT_PATH", "TEM", "eval_datasets", "run_id"],
+                "required_cli_params": ["CKPT_PATH", "eval_datasets"],
+                "param_mapping": {
+                    "ckpt": "CKPT_PATH",
+                    "checkpoint": "CKPT_PATH",
+                    "checkpoint路径": "CKPT_PATH",
+                    "ckpt路径": "CKPT_PATH",
+                    "模型模板": "TEM",
+                    "模板": "TEM",
+                    "评测集": "eval_datasets",
+                    "评估集": "eval_datasets",
+                    "数据集": "eval_datasets",
+                },
+                "supported_params": [],
+                "default_args": {"background": True, "capture_output": False},
+                "docker_container": DEFAULT_DOCKER_CONTAINER,
+                "docker_working_dir": "/usr/local/insinfersystem",
+                "docker_executable": "/usr/local/insinfersystem/generic_ckpt_eval",
+                "requires_docker": True,
+                "resource_request": {
+                    "enabled": True, "node_count": 1, "gpus_per_node": 8,
+                    "gpu_count_env": "MEDFLOW_DEFAULT_GPU_COUNT_CKPT_EVAL",
+                    "task_category": "assessment",
+                    "task_type": "ckpt",
+                    "task_type_text": "LLaMA-Factory 通用 checkpoint 评测",
+                },
+            },
             
         }
+        for descriptor in list_evaluation_descriptors():
+            script_info = self.scripts.get(descriptor["id"])
+            if script_info is not None:
+                script_info["evaluation_descriptor"] = descriptor
+                script_info["descriptorId"] = descriptor["id"]
         
         # 添加脚本配置验证
         self._validate_scripts()
@@ -1232,7 +1523,54 @@ def run_script_by_name_evaluate(
             error_reason="script_not_found",
             recoverable=True,
         )
-    
+
+    additional_args = dict(additional_args or {})
+    requested_scope = additional_args.pop("evaluation_scope", None)
+    if requested_scope is not None:
+        try:
+            normalized_scope = _normalize_evaluation_scope(requested_scope)
+        except ValueError as exc:
+            return _evaluate_error_response(
+                str(script_query),
+                str(exc),
+                error_reason="invalid_evaluation_scope",
+                required_params=["evaluation_scope"],
+                recoverable=True,
+                options=["medical", "general"],
+            )
+        scope_routes = {
+            "single_model_evaluation_vpn": {
+                "medical": "single_model_evaluation_vpn",
+                "general": "generic_single_model_eval",
+            },
+            "generic_single_model_eval": {
+                "medical": "single_model_evaluation_vpn",
+                "general": "generic_single_model_eval",
+            },
+            "compare_between_models_vpn": {
+                "medical": "compare_between_models_vpn",
+                "general": "generic_compare_models_eval",
+            },
+            "generic_compare_models_eval": {
+                "medical": "compare_between_models_vpn",
+                "general": "generic_compare_models_eval",
+            },
+            "ckpt_eval": {"medical": "ckpt_eval", "general": "generic_ckpt_eval"},
+            "generic_ckpt_eval": {"medical": "ckpt_eval", "general": "generic_ckpt_eval"},
+        }
+        current_name = str(script_info.get("name") or "")
+        routed_name = scope_routes.get(current_name, {}).get(normalized_scope)
+        if routed_name:
+            script_info = manager.find_script(routed_name) or script_info
+        if normalized_scope == "medical":
+            if "eval_datasets" in additional_args:
+                return _evaluate_error_response(
+                    str(script_query),
+                    "医疗评测不接受 eval_datasets；请移除该参数，或将 evaluation_scope 改为 general",
+                    error_reason="evaluation_scope_dataset_conflict",
+                    recoverable=True,
+                )
+
     script_name = script_info["name"]
     resource_request = _resource_request_config(script_info)
     # 获取脚本是否使用位置参数
@@ -1248,8 +1586,6 @@ def run_script_by_name_evaluate(
         key for key in MANUAL_GPU_ENV_KEYS
         if resource_request and key in (env_vars or {}) and str((env_vars or {}).get(key) or "").strip()
     ]
-    explicit_template_provided = False
-    non_qwen3_model_hints: List[str] = []
     
      # 修改：为特定脚本添加特殊处理
     if script_name == "create_command_vpn":
@@ -1267,18 +1603,12 @@ def run_script_by_name_evaluate(
             pname = str(param_name).strip()
             pname_lower = pname.lower()
             normalized = pname_lower.replace("_", "-")
+            if script_name == "generic_ckpt_eval" and (pname in TEMPLATE_PARAM_KEYS or pname_lower in {"tem", "template"}):
+                cli_params_to_update["TEM"] = str(param_value).strip()
+                continue
             if script_name == "ckpt_eval" and (pname in TEMPLATE_PARAM_KEYS or pname_lower in {"tem", "template"}):
-                explicit_template_provided = True
                 params_to_update["TEM"] = str(param_value).strip()
                 continue
-            if script_name == "ckpt_eval" and (pname in MODEL_HINT_KEYS or pname_lower in MODEL_HINT_KEYS):
-                hint = str(param_value).strip()
-                if text_mentions_non_qwen3_model(hint):
-                    non_qwen3_model_hints.append(hint)
-                    continue
-                if "qwen3" in hint.lower() or "qwen-3" in hint.lower():
-                    params_to_update["TEM"] = DEFAULT_TEMPLATE
-                    continue
             if pname in {"container", "容器", "docker", "docker_container", "container_name"} or pname_lower in {"container", "docker", "docker_container", "container_name"}:
                 params_to_update["container"] = str(param_value).strip()
                 continue
@@ -1317,7 +1647,11 @@ def run_script_by_name_evaluate(
                         # 如果是使用位置参数的脚本，并且是位置参数名，添加到位置参数列表
                         positional_args.append(str(param_value))
                     elif cli_param in script_info.get("supported_cli_params", []):
-                        cli_params_to_update[cli_param] = str(param_value)
+                        cli_params_to_update[cli_param] = (
+                            ",".join(str(item) for item in param_value)
+                            if cli_param == "eval_datasets" and isinstance(param_value, (list, tuple))
+                            else str(param_value)
+                        )
                     else:
                         unknown_params.append(f"{param_name} ({cli_param})")
                 else:
@@ -1395,22 +1729,115 @@ def run_script_by_name_evaluate(
     # 更新命令行参数
     for cli_param, value in cli_params_to_update.items():
         cli_args[cli_param] = value
+    if script_name in GENERIC_EVAL_SCRIPTS and cli_args.get("eval_datasets"):
+        try:
+            cli_args["eval_datasets"] = ",".join(
+                _normalize_generic_eval_datasets(cli_args["eval_datasets"])
+            )
+        except ValueError as exc:
+            return _evaluate_error_response(
+                script_name,
+                str(exc),
+                error_reason="invalid_eval_datasets",
+                required_params=["eval_datasets"],
+                recoverable=True,
+                allowed=list(GENERIC_EVAL_DATASETS),
+            )
     selected_container = str(params_to_update.get("container") or (env_vars or {}).get("container") or script_info.get("docker_container") or DEFAULT_DOCKER_CONTAINER)
-    template_issue = _evaluate_template_policy_issue(
-        script_name,
-        selected_container,
-        params_to_update,
-        cli_args,
-        explicit_template=explicit_template_provided,
-        model_hint=first_nonempty(non_qwen3_model_hints),
-    )
-    if template_issue:
-        return _evaluate_error_response(
-            script_name,
-            str(template_issue["message"]),
-            error_reason=str(template_issue["error_reason"]),
-            recoverable=True,
-            **{key: value for key, value in template_issue.items() if key not in {"message", "error_reason"}},
+    if script_info.get("cli_args_only", False):
+        all_params_provided, missing_params, _ = check_required_params(script_info, cli_args)
+        if not all_params_provided:
+            current_args = {
+                "additional_args": additional_args or {},
+                "cli_params_to_update": cli_params_to_update,
+                "params_to_update": params_to_update,
+                "positional_args": positional_args,
+            }
+            return _evaluate_error_response(
+                script_name,
+                "评估任务缺少必需参数，已阻止启动：" + "、".join(missing_params) + "。",
+                error_reason="missing_required_params",
+                required_params=script_info.get("required_cli_params", []),
+                missing_params=missing_params,
+                recoverable=True,
+                currentArgs=current_args,
+            )
+        invalid_params = validate_cli_param_values(script_info, cli_args)
+        if invalid_params:
+            return _evaluate_error_response(
+                script_name,
+                "评估任务的必需参数无效，已阻止启动：" + "、".join(invalid_params) + "。",
+                error_reason="invalid_required_params",
+                required_params=script_info.get("required_cli_params", []),
+                missing_params=[],
+                recoverable=True,
+                invalidParams=invalid_params,
+            )
+    template_resolution: Optional[Dict[str, Any]] = None
+    if script_name in {"ckpt_eval", "generic_ckpt_eval"}:
+        checkpoint_path = first_nonempty([
+            cli_args.get("CKPT_PATH"),
+            params_to_update.get("CKPT_PATH"),
+            (env_vars or {}).get("CKPT_PATH"),
+        ])
+        if not checkpoint_path:
+            return _evaluate_error_response(
+                script_name,
+                "缺少 checkpoint 路径，已阻止启动。",
+                error_reason="missing_required_params",
+                required_params=["CKPT_PATH"],
+                missing_params=["CKPT_PATH"],
+                recoverable=True,
+            )
+        container_issue = _validate_evaluate_container_preflight(selected_container)
+        if container_issue:
+            return _evaluate_error_response(
+                script_name,
+                str(container_issue.get("message") or "评估容器预检失败"),
+                error_reason=str(container_issue.get("error_reason") or "container_preflight_failed"),
+                recoverable=True,
+                **{key: value for key, value in container_issue.items() if key not in {"message", "error_reason"}},
+            )
+        explicit_template = _evaluate_template_value(script_name, params_to_update, cli_args)
+        template_resolution = resolve_model_template(
+            selected_container,
+            checkpoint_path,
+            "evaluation",
+            explicit_template=explicit_template,
+        )
+        if template_resolution.get("status") != "resolved":
+            reason = str(template_resolution.get("error_reason") or "template_resolution_failed")
+            needs_template = reason in {"template_resolution_ambiguous", "template_resolution_unknown"}
+            current_args = {
+                "additional_args": additional_args or {},
+                "cli_params_to_update": cli_params_to_update,
+                "params_to_update": params_to_update,
+                "positional_args": positional_args,
+            }
+            return _evaluate_error_response(
+                script_name,
+                str(template_resolution.get("message") or "无法唯一识别模型模板，请请选择。"),
+                error_reason=reason,
+                required_params=["TEM"] if needs_template else None,
+                missing_params=["TEM"] if needs_template else [],
+                recoverable=True,
+                options=list(template_resolution.get("options") or []),
+                availableOptions=template_resolution.get("availableOptions"),
+                evidence=template_resolution.get("evidence") or {},
+                currentArgs=current_args,
+                container=selected_container,
+            )
+        resolved_template = str(template_resolution["template"])
+        if script_name == "generic_ckpt_eval":
+            cli_args["TEM"] = resolved_template
+            cli_params_to_update["TEM"] = resolved_template
+        else:
+            params_to_update["TEM"] = resolved_template
+        logger.info(
+            "checkpoint template resolved: template=%s source=%s evidence=%s",
+            resolved_template,
+            template_resolution.get("source"),
+            template_resolution.get("evidence") or {},
         )
     
     # 检查必需参数
@@ -1572,6 +1999,11 @@ def run_script_by_name_evaluate(
     
     # 将命令行参数合并到args中
     args.update(cli_args)
+    if script_name in GENERIC_EVAL_SCRIPTS and not args.get("run_id"):
+        args["run_id"] = (
+            datetime.now().strftime("%Y%m%dT%H%M%S")
+            + f"-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        )
     
     # 准备传递给run_local_script的kwargs
     run_kwargs = {
@@ -1579,6 +2011,7 @@ def run_script_by_name_evaluate(
         "script_args": args,
         "positional_args": positional_args,  # 添加位置参数
         "env_vars": final_env_vars,
+        "template_resolution": template_resolution,
         **kwargs
     }
     
@@ -1676,6 +2109,26 @@ def run_script_by_name_evaluate(
                 recoverable=True,
                 **{key: value for key, value in validation_issue.items() if key not in {"message", "error_reason"}},
             )
+        if template_resolution:
+            changed_issue = verify_model_template_resolution(
+                docker_kwargs["docker_container"],
+                checkpoint_path,
+                "evaluation",
+                template_resolution,
+                explicit_template=explicit_template or None,
+            )
+            if changed_issue:
+                return _evaluate_error_response(
+                    script_name,
+                    str(changed_issue["message"]),
+                    error_reason=str(changed_issue["error_reason"]),
+                    recoverable=True,
+                    **{
+                        key: value
+                        for key, value in changed_issue.items()
+                        if key not in {"message", "error_reason"}
+                    },
+                )
         reservation_id = None
         if resource_request:
             try:
@@ -2045,6 +2498,7 @@ def run_docker_in_background(
     check_startup: bool = True,  # 新增：是否检查启动状态
     startup_check_delay: int = 5,  # 新增：启动检查延迟时间（秒）
     script_name: str = None,
+    template_resolution: Optional[Dict[str, Any]] = None,
     **kwargs
 ) -> ToolResponse:
     """
@@ -2356,6 +2810,8 @@ def run_docker_in_background(
                             command=" ".join(command),
                             scriptArgs=script_args or {},
                             envKeys=sorted((env_vars or {}).keys()),
+                            templateResolution=template_resolution,
+                            warnings=(template_resolution or {}).get("warnings"),
                             stdout=stdout,
                             stderr=stderr,
                             **monitor_fields,
@@ -2399,6 +2855,8 @@ def run_docker_in_background(
                 command=" ".join(command),
                 scriptArgs=script_args or {},
                 envKeys=sorted((env_vars or {}).keys()),
+                templateResolution=template_resolution,
+                warnings=(template_resolution or {}).get("warnings"),
             ),
         })
     
