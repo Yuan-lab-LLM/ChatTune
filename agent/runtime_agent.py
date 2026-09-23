@@ -37,6 +37,17 @@ from utils.request_sections import (
     request_kind_from_protocol_kind,
     request_kind_from_text,
 )
+from utils.dataset_output_context import (
+    attach_output_to_filter_choice_protocol,
+    begin_dataset_output_capture,
+    build_advanced_filter_request,
+    classify_advanced_filter_choice,
+    current_last_dataset_output as _current_last_dataset_output,
+    pending_output_manifest_entry,
+    record_last_dataset_output,
+    reset_dataset_output_capture,
+    resolve_pending_dataset_output_path,
+)
 from utils.benchmark_status import (
     format_benchmark_remaining,
     query_inference_benchmark_status,
@@ -267,6 +278,10 @@ from medflow_agent_tools.runlocal_train import (
     _local_gpu_snapshot_for_runtime_request,
     _release_resource_allocation,
     _runtime_training_resource_request,
+)
+from medflow_agent_tools.dataset_access import (
+    allowed_dataset_entries,
+    require_allowed_dataset_path,
 )
 from resource_api import (
     _read_training_allocation,
@@ -597,7 +612,14 @@ REQUEST_INFERENCE_OWNER_ALIASES: ContextVar[tuple[str, ...]] = ContextVar(
     "request_inference_owner_aliases",
     default=(),
 )
-
+REQUEST_ACTOR_USER_ID: ContextVar[str] = ContextVar(
+    "request_actor_user_id",
+    default="",
+)
+REQUEST_DATASET_ACCESS_MANIFEST: ContextVar[Optional[tuple[dict[str, Any], ...]]] = ContextVar(
+    "request_dataset_access_manifest",
+    default=None,
+)
 INFERENCE_RESOURCE_RESERVATIONS: Dict[str, Dict[str, Any]] = {}
 INFERENCE_RESOURCE_RESERVATIONS_LOCK = threading.Lock()
 INFERENCE_RESOURCE_HEARTBEATS: Dict[str, threading.Event] = {}
@@ -1003,6 +1025,168 @@ def _inference_response_sources(payload: Any) -> List[Dict[str, Any]]:
     return sources
 
 
+def _inference_api_response_data(payload: Any) -> Dict[str, Any]:
+    """Normalize structured inference data from all supported API envelopes."""
+    if not isinstance(payload, dict):
+        return {}
+
+    data: Dict[str, Any] = {}
+    for key in ("data", "response_data"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            data.update(value)
+
+    # Keep compatibility with worker/tool endpoints that return structured
+    # fields at the top level instead of under data.
+    for key in (
+        "config_draft",
+        "service_instances",
+        "service_instance",
+        "service_start",
+        "service_stop",
+        "admin_cleanup",
+        "benchmark_stop",
+        "benchmark_jobs",
+        "benchmark_reports",
+        "nodes",
+    ):
+        if payload.get(key) is not None:
+            data.setdefault(key, payload[key])
+    return data
+
+
+def _inference_start_protocol_decision(
+    action: str,
+    result: str,
+    response_data: Any = None,
+    api_status: str = "",
+) -> Dict[str, Any]:
+    """Classify an inference start/restart result without relying on prose alone."""
+    action = str(action or "").strip().lower()
+    if action not in {"service_start", "service_restart"}:
+        return {"kind": "not_applicable", "structured": False}
+
+    data = _inference_api_response_data(response_data)
+    sources = _inference_response_sources(data)
+    start_records = [
+        source.get("service_start")
+        for source in sources
+        if isinstance(source.get("service_start"), dict)
+    ]
+    instance_records: List[Dict[str, Any]] = []
+    for source in sources:
+        instance = source.get("service_instance")
+        if isinstance(instance, dict):
+            instance_records.append(instance)
+        instances = source.get("service_instances")
+        items = instances.get("items") if isinstance(instances, dict) else None
+        if isinstance(items, list):
+            instance_records.extend(item for item in items if isinstance(item, dict))
+
+    structured = bool(start_records or instance_records)
+    active_statuses = {"starting", "running", "degraded"}
+    failed_statuses = {"failed", "failure", "error", "timeout"}
+
+    # A positive submission marker is the strongest signal for an async start.
+    submitted = next(
+        (item for item in start_records if item.get("submitted") is True),
+        None,
+    )
+    if submitted is not None:
+        status = str(submitted.get("status") or "starting").strip().lower()
+        return {
+            "kind": "submitted",
+            "status": status if status in active_statuses else "starting",
+            "reason": "structured_service_start_submitted",
+            "confidence": 0.99,
+            "structured": True,
+        }
+
+    explicit_failure = any(
+        item.get("success") is False
+        or str(item.get("status") or "").strip().lower() in failed_statuses
+        or item.get("error")
+        for item in start_records
+    )
+    instance_statuses = {
+        str(item.get("status") or "").strip().lower()
+        for item in instance_records
+    }
+    if explicit_failure or instance_statuses & failed_statuses:
+        return {
+            "kind": "failed",
+            "status": "failed",
+            "reason": "structured_service_start_failed",
+            "confidence": 0.99,
+            "structured": True,
+        }
+    if instance_statuses & active_statuses:
+        active_status = next(
+            (status for status in ("running", "degraded", "starting") if status in instance_statuses),
+            "starting",
+        )
+        return {
+            "kind": "submitted",
+            "status": active_status,
+            "reason": "structured_service_instance_active",
+            "confidence": 0.95,
+            "structured": True,
+        }
+
+    normalized_api_status = str(api_status or "").strip().lower()
+    if normalized_api_status in failed_statuses:
+        return {
+            "kind": "failed",
+            "status": "failed",
+            "reason": f"api_status_{normalized_api_status}",
+            "confidence": 0.98,
+            "structured": structured,
+        }
+
+    text = str(result or "")
+    failure_patterns = (
+        r"(?:启动|重启)(?:推理)?(?:服务|任务)?\s*(?:失败|异常|报错)",
+        r"(?:无法|未能|未成功)(?:正常)?\s*(?:启动|重启)",
+        r"(?:startup|start|restart)\s*(?:failed|failure|error|timeout)",
+        r"(?:状态|status)\s*[:：=]\s*(?:failed|failure|error|timeout|失败|异常)",
+    )
+    if any(re.search(pattern, text, re.IGNORECASE) for pattern in failure_patterns):
+        return {
+            "kind": "failed",
+            "status": "failed",
+            "reason": "explicit_start_failure_text",
+            "confidence": 0.9,
+            "structured": structured,
+        }
+
+    # Text fallback intentionally recognizes only positive async-start markers.
+    start_patterns = (
+        r"启动任务已提交",
+        r"(?:正在|后台|已)启动",
+        r"启动中",
+        r"启动了新的推理服务实例",
+        r"已触发重启",
+        r"\bstarting\b",
+        r"\bstarted\b",
+    )
+    if any(re.search(pattern, text, re.IGNORECASE) for pattern in start_patterns):
+        return {
+            "kind": "submitted",
+            "status": "starting",
+            "reason": "text_async_start_signal",
+            "confidence": 0.78,
+            "structured": structured,
+        }
+
+    return {
+        "kind": "unknown",
+        "status": "unknown",
+        "reason": "start_result_status_unknown",
+        "confidence": 0.35,
+        "structured": structured,
+    }
+
+
 def _inference_instance_for_reservation(
     payload: Any,
     reservation_id: str,
@@ -1226,27 +1410,44 @@ def _start_inference_resource_heartbeat(
         daemon=True,
     ).start()
 
-def _release_inference_resource_context(resource_context: Optional[Dict[str, Any]]) -> None:
+def _release_inference_resource_context(resource_context: Optional[Dict[str, Any]]) -> bool:
     if not isinstance(resource_context, dict):
-        return
+        return False
     reservation_id = str(resource_context.get("reservation_id") or "").strip()
     if not reservation_id:
-        return
-    _stop_inference_resource_heartbeat(reservation_id)
-    with INFERENCE_RESOURCE_RESERVATIONS_LOCK:
-        INFERENCE_RESOURCE_RESERVATIONS.pop(reservation_id, None)
+        return False
     try:
-        _release_resource_allocation(reservation_id, _inference_resource_env(str(resource_context.get("runtime_node_id") or "")))
+        released = _release_resource_allocation(
+            reservation_id,
+            _inference_resource_env(str(resource_context.get("runtime_node_id") or "")),
+        )
     except Exception:
         logger.exception("Failed to release inference reservation %s", reservation_id)
+        return False
+    if released:
+        _stop_inference_resource_heartbeat(reservation_id)
+        with INFERENCE_RESOURCE_RESERVATIONS_LOCK:
+            INFERENCE_RESOURCE_RESERVATIONS.pop(reservation_id, None)
+    return released
 
 
-def _release_known_inference_reservations() -> None:
-    with INFERENCE_RESOURCE_RESERVATIONS_LOCK:
-        contexts = list(INFERENCE_RESOURCE_RESERVATIONS.values())
-        INFERENCE_RESOURCE_RESERVATIONS.clear()
-    for resource_context in contexts:
-        _release_inference_resource_context(resource_context)
+def _release_stopped_inference_reservation(payload: Any) -> None:
+    """Release only the reservation explicitly confirmed by a stop response."""
+    for source in _inference_response_sources(payload):
+        stop = source.get("service_stop")
+        if not isinstance(stop, dict):
+            inference_stop = source.get("inference_service_stop")
+            stop = inference_stop.get("service_stop") if isinstance(inference_stop, dict) else None
+        if not isinstance(stop, dict) or stop.get("stopped") is not True or stop.get("release_ready") is not True:
+            continue
+        reservation_id = str(stop.get("reservation_id") or "").strip()
+        if not reservation_id:
+            continue
+        with INFERENCE_RESOURCE_RESERVATIONS_LOCK:
+            resource_context = INFERENCE_RESOURCE_RESERVATIONS.get(reservation_id)
+        if resource_context:
+            _release_inference_resource_context(resource_context)
+        return
 
 def _current_training_container() -> str:
     return REQUEST_TRAINING_CONTAINER.get() or DEFAULT_DOCKER_CONTAINER
@@ -1320,6 +1521,15 @@ def _current_user_role() -> str:
     return REQUEST_USER_ROLE.get().strip().lower()
 
 
+def _current_actor_user_id() -> str:
+    return REQUEST_ACTOR_USER_ID.get().strip()
+
+
+def _current_dataset_access_manifest() -> Optional[list[dict[str, Any]]]:
+    value = REQUEST_DATASET_ACCESS_MANIFEST.get()
+    return None if value is None else [dict(item) for item in value]
+
+
 def _current_inference_owner_user_id() -> str:
     return REQUEST_INFERENCE_OWNER_USER_ID.get().strip()
 
@@ -1355,7 +1565,31 @@ def run_group_data(*args, **kwargs):
     env_vars = dict(kwargs.get("env_vars") or {})
     env_vars.setdefault("container", container)
     kwargs["env_vars"] = env_vars
+    kwargs["dataset_access_manifest"] = _current_dataset_access_manifest()
+    kwargs["actor_user_id"] = _current_actor_user_id()
+    kwargs["actor_is_normal_user"] = _current_user_role() == "user"
     response = run_script_by_name_data(*args, **kwargs)
+    registered_dataset = (response.metadata or {}).get("registered_dataset")
+    if isinstance(registered_dataset, dict):
+        record_last_dataset_output(registered_dataset)
+    if isinstance(registered_dataset, dict) and registered_dataset.get("storage_state") == "ready":
+        current_manifest = _current_dataset_access_manifest() or []
+        source_path = str(registered_dataset.get("source_path") or "").strip()
+        current_manifest = [
+            item for item in current_manifest
+            if item.get("sourcePath") != source_path
+        ]
+        current_manifest.append({
+            "resourceId": registered_dataset.get("resource_id"),
+            "datasetType": registered_dataset.get("dataset_type"),
+            "datasetName": registered_dataset.get("dataset_name"),
+            "sourcePath": source_path,
+            "ownerUserId": _current_actor_user_id(),
+            "visibility": "private",
+            "storageState": "ready",
+            "containerName": registered_dataset.get("container") or container,
+        })
+        REQUEST_DATASET_ACCESS_MANIFEST.set(tuple(current_manifest))
     script_query = str(kwargs.get("script_query") or (args[0] if args else ""))
     if any(keyword in script_query.lower() for keyword in ["preprocess", "preprocessing", "data_preprocessing", "预处理"]):
         response_text = _tool_response_text(response)
@@ -1398,6 +1632,9 @@ def run_group_data_collect(*args, **kwargs):
     env_vars = dict(kwargs.get("env_vars") or {})
     env_vars.setdefault("container", container)
     kwargs["env_vars"] = env_vars
+    kwargs["dataset_access_manifest"] = _current_dataset_access_manifest()
+    kwargs["actor_user_id"] = _current_actor_user_id()
+    kwargs["actor_is_normal_user"] = _current_user_role() == "user"
     return run_script_by_name_data_collect(*args, **kwargs)
 
 
@@ -1411,6 +1648,8 @@ def run_group_train(script_query: str, *args, **kwargs):
     if training_pool_id:
         env_vars["MEDFLOW_TRAINING_POOL_ID"] = training_pool_id
     kwargs["env_vars"] = env_vars
+    kwargs["dataset_access_manifest"] = _current_dataset_access_manifest()
+    kwargs["actor_user_id"] = _current_actor_user_id()
     if _is_grpo_training_query(script_query):
         container = _current_grpo_container()
         env_vars.setdefault("container", container)
@@ -1476,11 +1715,17 @@ _WORKFLOW_EVENT_CONSUMER_ID = f"agent3-{os.getpid()}-{int(time.time())}"
 
 
 def _workflow_inference_has_async_start_signal(text: str) -> bool:
-    import re
-    #deepseek
-    # 匹配“提交”（无论是否带成功） 或 “启动中/后台启动” 或 “执行结果”
-    pattern = r"(重启|启动).*提交|正在.*启动|后台启动|执行结果"
-    if re.search(pattern, (text or "")):
+    content = str(text or "")
+    patterns = (
+        r"(?:重启|启动)[\s\S]*提交",
+        r"正在[\s\S]*启动",
+        r"后台启动",
+        r"启动中",
+        r"启动了新的推理服务实例",
+        r"执行结果",
+        r"\b(?:starting|started)\b",
+    )
+    if any(re.search(pattern, content, re.IGNORECASE) for pattern in patterns):
         return True
     return any(
         keyword in (text or "")
@@ -1571,9 +1816,18 @@ def _append_workflow_stage_log(
 
 
 def _workflow_inference_has_failure_signal(text: str) -> bool:
+    content = str(text or "")
+    explicit_failure_patterns = (
+        r"(?:启动|重启)(?:推理)?(?:服务|任务)?\s*(?:失败|异常|报错)",
+        r"(?:无法|未能|未成功)(?:正常)?\s*(?:启动|重启)",
+        r"(?:startup|start|restart)\s*(?:failed|failure|error|timeout)",
+        r"(?:状态|status)\s*[:：=]\s*(?:failed|failure|error|timeout|失败|异常)",
+    )
+    if any(re.search(pattern, content, re.IGNORECASE) for pattern in explicit_failure_patterns):
+        return True
     if _workflow_inference_has_async_start_signal(text):
         return False
-    return any(keyword in (text or "") for keyword in ["失败", "超时", "未能正常启动"])
+    return any(keyword in content for keyword in ["失败", "超时", "未能正常启动"])
 
 def _workflow_inference_structured_failure(payload: Any) -> bool:
     if not isinstance(payload, dict):
@@ -1583,10 +1837,32 @@ def _workflow_inference_structured_failure(payload: Any) -> bool:
     status = str(payload.get("status") or payload.get("tool_status") or "").strip().lower()
     if status in {"failed", "failure", "error", "timeout"}:
         return True
-    protocol = payload.get("protocol") if isinstance(payload.get("protocol"), dict) else {}
-    protocol_type = str(protocol.get("type") or "")
-    protocol_status = str(protocol.get("status") or "").strip().lower()
-    return protocol_type in {"job_failed", "error"} or protocol_status in {"failed", "failure", "error", "timeout"}
+    for source in _inference_response_sources(payload):
+        protocol_type = str(source.get("type") or "").strip().lower()
+        protocol_status = str(
+            source.get("status") or source.get("tool_status") or ""
+        ).strip().lower()
+        if protocol_type in {"job_failed", "error"}:
+            return True
+        if protocol_status in {"failed", "failure", "error", "timeout"}:
+            return True
+        service_start = source.get("service_start")
+        if isinstance(service_start, dict):
+            if service_start.get("success") is False:
+                return True
+            if str(service_start.get("status") or "").strip().lower() in {
+                "failed", "failure", "error", "timeout"
+            }:
+                return True
+        service_instances = source.get("service_instances")
+        items = service_instances.get("items") if isinstance(service_instances, dict) else None
+        if isinstance(items, list) and any(
+            isinstance(item, dict)
+            and str(item.get("status") or "").strip().lower() in {"failed", "failure", "error", "timeout"}
+            for item in items
+        ):
+            return True
+    return False
 
 
 def _workflow_benchmark_has_not_found_signal(text: str) -> bool:
@@ -1850,6 +2126,33 @@ def _workflow_start_train(workflow: Dict[str, Any]) -> Dict[str, Any]:
     context = workflow["context"]
     train_type = context.get("train_type") or "lora"
     launch_mode = context.get("launch_mode")
+    dataset_resource_id = str(context.get("dataset_resource_id") or "").strip()
+    actor_user_id = str(context.get("actor_user_id") or "").strip()
+    if dataset_resource_id and actor_user_id:
+        runtime_node_id = str(os.getenv("MEDFLOW_RESOURCE_NODE_ID") or "").strip()
+        if not runtime_node_id:
+            raise RuntimeError("工作流恢复数据集权限时缺少 MEDFLOW_RESOURCE_NODE_ID")
+        fresh_dataset = _runtime_training_resource_request(
+            "resolveDatasetForRuntime",
+            {
+                "runtimeNodeId": runtime_node_id,
+                "actorUserId": actor_user_id,
+                "container": _workflow_training_container(workflow),
+                "resourceId": dataset_resource_id,
+            },
+        )
+        if not isinstance(fresh_dataset, dict) or not fresh_dataset.get("sourcePath"):
+            raise RuntimeError("工作流数据集已删除或不再可用")
+        fresh_path = str(fresh_dataset["sourcePath"])
+        context["dataset_path"] = fresh_path
+        if train_type == "enhanced":
+            context["dataset_dir"] = fresh_path
+        manifest = [
+            item for item in (context.get("dataset_access_manifest") or [])
+            if isinstance(item, dict) and item.get("resourceId") != dataset_resource_id
+        ]
+        manifest.append(fresh_dataset)
+        context["dataset_access_manifest"] = manifest
     if train_type == "enhanced":
         script_query = "多机增强训练" if launch_mode == "multinode" else "增强训练"
         additional_args = {
@@ -1881,7 +2184,7 @@ def _workflow_start_train(workflow: Dict[str, Any]) -> Dict[str, Any]:
             dataset_root = "/home/workspace/dataset_batch_train"
         additional_args = {
             "data_identifier": dataset_ref,
-            "data_dir": f"{dataset_root}/{dataset_ref}",
+            "data_dir": str(context.get("dataset_path") or f"{dataset_root}/{dataset_ref}"),
         }
         additional_args.update(context.get("train_args") or {})
     additional_args["container"] = _workflow_training_container(workflow)
@@ -1894,6 +2197,8 @@ def _workflow_start_train(workflow: Dict[str, Any]) -> Dict[str, Any]:
             "MEDFLOW_TRAINING_POOL_ID": str(context.get("training_pool_id") or "").strip(),
         },
         background=True,
+        dataset_access_manifest=context.get("dataset_access_manifest") or [],
+        actor_user_id=str(context.get("actor_user_id") or ""),
     )
     result = _workflow_response_payload(response)
     if not (response.metadata or {}).get("success", False):
@@ -2880,6 +3185,25 @@ def _workflow_inference_resource_result_fields(result: Dict[str, Any]) -> Dict[s
         "inference_runtime_node_id": resource_context.get("runtime_node_id"),
     }
 
+
+def _workflow_persist_inference_resource_context(
+    workflow: Optional[Dict[str, Any]],
+    resource_context: Optional[Dict[str, Any]],
+) -> None:
+    """Persist an inference reservation before the workflow can advance."""
+    if not isinstance(workflow, dict) or not isinstance(resource_context, dict):
+        return
+    fields = _workflow_inference_resource_result_fields({"resource_context": resource_context})
+    if not fields:
+        return
+    workflow.setdefault("context", {}).update(fields)
+    persisted = get_workflow_manager().update_context(workflow["workflow_id"], **fields)
+    if not persisted:
+        logger.warning(
+            "Could not persist inference resource context for workflow %s",
+            workflow.get("workflow_id"),
+        )
+
 def _workflow_context_inference_resource_context(context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     resource_context = context.get("inference_resource_context")
     if isinstance(resource_context, dict):
@@ -3178,15 +3502,150 @@ def _workflow_start_benchmark(workflow: Dict[str, Any]) -> Dict[str, Any]:
 def _workflow_inference_service_stop_command() -> str:
     return "停止推理服务 确认停止"
 
+
+def _workflow_inference_stop_resource_context(workflow: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    context = workflow.get("context") if isinstance(workflow.get("context"), dict) else {}
+    sources: List[Dict[str, Any]] = []
+
+    def add_source(value: Any) -> None:
+        if isinstance(value, dict) and value:
+            sources.append(dict(value))
+
+    add_source(_workflow_context_inference_resource_context(context))
+    add_source(
+        {
+            "reservation_id": context.get("inference_reservation_id"),
+            "runtime_node_id": context.get("inference_runtime_node_id"),
+        }
+    )
+    stages = workflow.get("stages") if isinstance(workflow.get("stages"), dict) else {}
+    for stage_name in ("benchmark", "deploy"):
+        stage = stages.get(stage_name) if isinstance(stages.get(stage_name), dict) else {}
+        add_source(stage.get("inference_resource_context"))
+        add_source(stage.get("resource_context"))
+        add_source(
+            {
+                "reservation_id": stage.get("inference_reservation_id"),
+                "runtime_node_id": stage.get("inference_runtime_node_id"),
+            }
+        )
+        result = stage.get("result") if isinstance(stage.get("result"), dict) else {}
+        add_source(result.get("resource_context"))
+        add_source(
+            {
+                "reservation_id": result.get("inference_reservation_id"),
+                "runtime_node_id": result.get("inference_runtime_node_id"),
+            }
+        )
+    benchmark_stage = stages.get("benchmark") if isinstance(stages.get("benchmark"), dict) else {}
+    add_source(recover_benchmark_resource_context(benchmark_stage))
+
+    resource_context: Dict[str, Any] = {}
+    reservation_id = ""
+    runtime_node_id = ""
+    for source in sources:
+        source_reservation_id = str(
+            source.get("reservation_id") or source.get("reservationId") or ""
+        ).strip()
+        source_runtime_node_id = str(
+            source.get("runtime_node_id") or source.get("runtimeNodeId") or ""
+        ).strip()
+        if source_reservation_id and reservation_id and source_reservation_id != reservation_id:
+            raise RuntimeError("工作流推理资源预约 ID 不一致，已拒绝停止")
+        if source_runtime_node_id and runtime_node_id and source_runtime_node_id != runtime_node_id:
+            raise RuntimeError("工作流推理资源节点 ID 不一致，已拒绝停止")
+        reservation_id = reservation_id or source_reservation_id
+        runtime_node_id = runtime_node_id or source_runtime_node_id
+        for key, value in source.items():
+            if value is not None and resource_context.get(key) is None:
+                resource_context[key] = value
+
+    reservation_id = str(context.get("inference_reservation_id") or reservation_id).strip()
+    runtime_node_id = str(context.get("inference_runtime_node_id") or runtime_node_id).strip()
+    if not reservation_id or not runtime_node_id:
+        return None
+    if resource_context.get("reservation_id") and resource_context["reservation_id"] != reservation_id:
+        raise RuntimeError("工作流推理资源预约 ID 不一致，已拒绝停止")
+    if resource_context.get("runtime_node_id") and resource_context["runtime_node_id"] != runtime_node_id:
+        raise RuntimeError("工作流推理资源节点 ID 不一致，已拒绝停止")
+    resource_context.update({"reservation_id": reservation_id, "runtime_node_id": runtime_node_id})
+    return resource_context
+
+
+def _workflow_stop_inference_reservation(workflow: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Stop the service bound to this workflow and release only its reservation."""
+    resource_context = _workflow_inference_stop_resource_context(workflow)
+    if resource_context is None:
+        return None
+    context = workflow.get("context") or {}
+    owner_kwargs = _workflow_inference_owner_kwargs(context)
+    reservation_id = resource_context["reservation_id"]
+    response = requests.post(
+        config.agents.inference.inference_agent_url,
+        json={
+            "command": "停止推理服务",
+            "user_id": owner_kwargs.get("owner_user_id") or "workflow-manager",
+            "user_aliases": owner_kwargs.get("owner_aliases") or [],
+            "user_role": str(context.get("user_role") or "").strip().lower(),
+            "thread_id": "workflow-manager",
+            "container": _workflow_evaluation_container(workflow),
+            "resource_context": resource_context,
+        },
+        headers=_inference_ops_headers(),
+        timeout=360,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("推理服务停止响应格式无效")
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    stop = data.get("service_stop") if isinstance(data.get("service_stop"), dict) else {}
+    if (
+        str(payload.get("status") or "").lower() != "ok"
+        or stop.get("stopped") is not True
+        or stop.get("release_ready") is not True
+        or str(stop.get("reservation_id") or "").strip() != reservation_id
+    ):
+        raise RuntimeError(str(payload.get("result") or "推理服务未确认预约实例已停止"))
+    instance_id = str(stop.get("instance_id") or "").strip()
+    released = _release_inference_resource_context(resource_context)
+    cleanup = {
+        "status": "released" if released else "failed",
+        "reservation_id": reservation_id,
+        "runtime_node_id": resource_context["runtime_node_id"],
+        "instance_id": instance_id,
+    }
+    result = str(payload.get("result") or "推理服务已停止").strip()
+    if released:
+        result += f"\n资源池预约已释放: reservation_id={reservation_id}"
+    else:
+        result += (
+            f"\n资源池预约释放失败: reservation_id={reservation_id}。"
+            "请在资源预约审计中核实 GPU 空闲后重试清理。"
+        )
+    return {"success": True, "result": result, "resource_cleanup": cleanup}
+
 def _workflow_stop_inference_service(workflow: Dict[str, Any]) -> Dict[str, Any]:
     context = workflow.get("context") or {}
     stop_command = _workflow_inference_service_stop_command()
-    result = _workflow_inference_command(
-        stop_command,
-        _workflow_evaluation_container(workflow),
-        resource_group_id=str(context.get("resource_group_id") or "").strip(),
-        training_pool_id=str(context.get("training_pool_id") or "").strip(),
+    result = _workflow_stop_inference_reservation(workflow)
+    if result is not None:
+        stop_command = "停止推理服务"
+    else:
+        result = _workflow_inference_command(
+            stop_command,
+            _workflow_evaluation_container(workflow),
+            resource_group_id=str(context.get("resource_group_id") or "").strip(),
+            training_pool_id=str(context.get("training_pool_id") or "").strip(),
             **_workflow_inference_owner_kwargs(context),
+        )
+        warning = "工作流未保存推理预约 ID；请在资源预约审计中核查并清理占用。"
+        result["result"] = f"{result.get('result') or ''}\n{warning}".strip()
+        result["resource_cleanup"] = {"status": "unknown", "reservation_id": ""}
+    if not result.get("success"):
+        raise RuntimeError(result.get("error") or result.get("result") or "停止推理服务失败")
+    get_workflow_manager().update_context(
+        workflow["workflow_id"], inference_resource_cleanup=result["resource_cleanup"],
     )
     result["stop_command"] = stop_command
     result["service_log_command"] = "查看推理服务日志"
@@ -3563,7 +4022,7 @@ def _workflow_inference_command(
     prepare_resource_context = globals().get("_inference_request_resource_context")
     release_resource_context = globals().get("_release_inference_resource_context", lambda _context: None)
 
-    release_known_reservations = globals().get("_release_known_inference_reservations", lambda: None)
+    release_stopped_reservation = globals().get("_release_stopped_inference_reservation", lambda _payload: None)
     command_may_stop_service = globals().get("_inference_command_may_stop_service", lambda _command: False)
 
     current_owner = globals().get("_current_inference_owner_user_id")
@@ -3639,14 +4098,10 @@ def _workflow_inference_command(
             )
         else:
             release_resource_context(resource_context)
-    ###deepseek
-    #_inference_payload_is_service_stop = globals().get("_inference_payload_is_service_stop", lambda _payload: False)
-    #if _inference_payload_is_service_stop(payload):
-    #    release_known_reservations()
     if command_may_stop_service(command) and _inference_stop_response_is_success(command, payload):
-        release_known_reservations()
+        release_stopped_reservation(payload)
 
-    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    data = _inference_api_response_data(payload)
     lowered = result.lower()
     all_running = _workflow_all_running_from_payload(payload, result)
     benchmark_status = str(data.get("status") or data.get("benchmark_status") or "").lower()
@@ -3669,7 +4124,32 @@ def _workflow_inference_command(
             if any(keyword in result for keyword in keywords):
                 benchmark_status = status_value
                 break
-    failed = status_value in {"error", "failed", "timeout"} or _workflow_inference_has_failure_signal(result)
+    normalized_command = str(command or "").strip().lower()
+    is_service_start = any(
+        keyword in normalized_command
+        for keyword in ("启动推理服务", "重启推理服务", "service_start", "service_restart", "start inference", "restart inference")
+    )
+    if is_service_start:
+        action = "service_restart" if any(
+            keyword in normalized_command
+            for keyword in ("重启", "service_restart", "restart inference", "restart")
+        ) else "service_start"
+        start_decision = _inference_start_protocol_decision(
+            action,
+            result,
+            data,
+            api_status=status_value,
+        )
+        if not start_decision.get("structured"):
+            logger.warning(
+                "[inference-protocol] workflow structured start data missing; using text fallback "
+                "command=%s reason=%s",
+                command,
+                start_decision.get("reason"),
+            )
+        failed = start_decision.get("kind") == "failed"
+    else:
+        failed = status_value in {"error", "failed", "timeout"} or _workflow_inference_has_failure_signal(result)
     model_name = _workflow_inference_model_name(data)
     if model_name is None:
         model_name = _workflow_inference_model_name(payload)
@@ -3691,13 +4171,24 @@ def _workflow_stop_task(workflow: Dict[str, Any]) -> Dict[str, Any]:
     stage = workflow["stages"][stage_name]
     if stage_name == "benchmark":
         context = workflow.get("context") or {}
-        stop_benchmark_result = _workflow_inference_command(
-            _workflow_benchmark_stop_command(workflow),
-            _workflow_evaluation_container(workflow),
-            resource_group_id=str(context.get("resource_group_id") or "").strip(),
-            training_pool_id=str(context.get("training_pool_id") or "").strip(),
-            **_workflow_inference_owner_kwargs(context),
-        )
+        try:
+            stop_benchmark_result = _workflow_inference_command(
+                _workflow_benchmark_stop_command(workflow),
+                _workflow_evaluation_container(workflow),
+                resource_group_id=str(context.get("resource_group_id") or "").strip(),
+                training_pool_id=str(context.get("training_pool_id") or "").strip(),
+                **_workflow_inference_owner_kwargs(context),
+            )
+        except Exception as exc:
+            logger.exception(
+                "Benchmark stop command failed; continuing inference resource cleanup for workflow %s",
+                workflow.get("workflow_id"),
+            )
+            stop_benchmark_result = {
+                "success": False,
+                "error": str(exc),
+                "result": f"停止 benchmark 任务失败：{exc}",
+            }
         benchmark_log_fields = _append_workflow_stage_log(
             workflow,
             "benchmark",
@@ -4477,6 +4968,26 @@ class OrchestratorSystem:
             message,
             **fields,
         )
+
+    def _attach_preprocessing_output_to_filter_choice(
+        self,
+        protocol: Optional[Dict[str, Any]],
+        output_path: str,
+        registered_dataset: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        updated = attach_output_to_filter_choice_protocol(
+            protocol,
+            output_path,
+            registered_dataset,
+        )
+        if updated is protocol:
+            return protocol
+        return self._normalize_protocol(
+            updated,
+            str(updated.get("message") or ""),
+            source=updated.get("source"),
+            confidence=updated.get("confidence"),
+        ) or protocol
 
     def _pending_state(
         self,
@@ -5888,22 +6399,40 @@ class OrchestratorSystem:
         if action in {"service_status", "service_instances"}:
             return self._with_protocol("inference_status", "inference", result, jobType="inference_service", **fields)
         if action in {"service_start", "service_restart"}:
-            if _workflow_inference_structured_failure(response_data):
+            decision = _inference_start_protocol_decision(
+                action,
+                result,
+                response_data,
+            )
+            if not decision.get("structured"):
+                logger.warning(
+                    "[inference-protocol] structured start data missing; using text fallback "
+                    "command=%s reason=%s",
+                    task_description,
+                    decision.get("reason"),
+                )
+            if decision.get("kind") == "submitted":
+                fields.setdefault("status", decision.get("status") or "starting")
+                fields["protocolReason"] = decision.get("reason")
+                return self._with_protocol(
+                    "job_started",
+                    "inference",
+                    result,
+                    jobType="inference_service",
+                    confidence=decision.get("confidence"),
+                    **fields,
+                )
+            if decision.get("kind") == "failed":
+                fields["errorReason"] = decision.get("reason")
                 return self._with_protocol(
                     "job_failed",
                     "inference",
                     result,
                     jobType="inference_service",
                     status="failed",
+                    confidence=decision.get("confidence"),
                     **fields,
                 )
-            if _inference_service_start_submitted(response_data):
-                return self._with_protocol(
-                    "job_started",
-                    "inference", 
-                    result,
-                    jobType="inference_service", 
-                    **fields)
             if _inference_start_result_needs_input(result):
                 return self._with_protocol(
                     "need_input",
@@ -5916,25 +6445,15 @@ class OrchestratorSystem:
                     status="blocked",
                     **fields,
                 )
-            #deepseek
-            if action == "service_restart":
-                import re
-
-                # 匹配“启动”或“重启” + 任意内容 + “提交”，且包含“成功”或“完成”
-                pattern = r"(启动|重启).*(?:成功.*提交|已提交|正在.*启动)|提交.*(?:成功|已提交)"
-                if re.search(pattern, result):
-                    return self._with_protocol(
-                        "job_started", 
-                        "inference", 
-                        result, 
-                        jobType="inference_service", 
-                        **fields)
+            fields["operationState"] = "unknown"
+            fields["protocolReason"] = decision.get("reason")
             return self._with_protocol(
-                "job_failed",
+                "inference_status",
                 "inference",
                 result,
                 jobType="inference_service",
-                status="failed",
+                status="unknown",
+                confidence=decision.get("confidence"),
                 **fields,
             )
         if action == "service_stop_preview":
@@ -7446,6 +7965,21 @@ class OrchestratorSystem:
             response_metadata.get("protocol") if isinstance(response_metadata, dict) else None,
             context_response_text,
         )
+        dataset_output_path = ""
+        if agent_name == "dataprocessor":
+            dataset_output = _current_last_dataset_output()
+            output_path = str((dataset_output or {}).get("source_path") or "").strip()
+            if output_path:
+                dataset_output_path = output_path
+                original_task_for_pending = (
+                    f"{original_task_for_pending}\n"
+                    f"[系统上下文] 本次数据处理产物路径：input_folder={output_path}"
+                )
+                response_protocol = self._attach_preprocessing_output_to_filter_choice(
+                    response_protocol,
+                    output_path,
+                    dataset_output,
+                )
         if agent_name == "monitor" and response_protocol and response_protocol.get("type") == "monitor_status":
             display_text, response_protocol = self._finalize_monitor_status_protocol(
                 response_protocol,
@@ -7631,6 +8165,12 @@ class OrchestratorSystem:
                 required_params=required_params,
                 missing_params=missing_params,
             )
+            if agent_name == "dataprocessor" and dataset_output_path:
+                protocol = self._attach_preprocessing_output_to_filter_choice(
+                    protocol,
+                    dataset_output_path,
+                    dataset_output,
+                ) or protocol
             if request_kind == "param" and context_known:
                 protocol = self._normalize_protocol(
                     {**protocol, "knownParams": context_known},
@@ -7728,18 +8268,6 @@ class OrchestratorSystem:
             task_description = f"{task_description} {params_str}".strip()
             logger.debug(f"[Orchestrator] 接收到额外参数: {kwargs}")
 
-        lowered_task = task_description.lower()
-        if "medical-example" in lowered_task and not any(
-            key in lowered_task for key in ["sft", "dpo", "inspection", "diagnosis", "prescription", "data_type", "strategy"]
-        ):
-            raw_path = "/home/workspace/dataset/medical-example"
-            return ToolResponse(content=[
-                TextBlock(
-                    type="text",
-                    text=self._build_preprocess_guidance("medical-example", raw_path),
-                )
-            ])
-
         additional_params = ""
         if "dataprocessor" in self.pending_parameters:
             original_task = self.pending_parameters["dataprocessor"]["original_task"]
@@ -7761,6 +8289,9 @@ class OrchestratorSystem:
     def _list_dataset_candidates_in_container(self, container: str, dataset_dir: str) -> List[str]:
         """列出数据目录内可作为 dataset_name 的 json 文件名（不含 .json）。"""
         try:
+            manifest = _current_dataset_access_manifest()
+            if manifest is not None:
+                require_allowed_dataset_path(dataset_dir, manifest, container)
             info_command = f"cat {shlex.quote(dataset_dir.rstrip('/') + '/dataset_info.json')} 2>/dev/null"
             info_process = subprocess.run(
                 ["docker", "exec", container, "sh", "-c", info_command],
@@ -7889,12 +8420,24 @@ class OrchestratorSystem:
         except Exception:
             return None
 
-    def _choose_dataset_name(self, candidates: List[str]) -> Optional[str]:
+    def _choose_dataset_name(
+        self,
+        candidates: List[str],
+        requested: Optional[str] = None,
+    ) -> Optional[str]:
         """在多个候选 dataset_name 中挑选明显更像训练主文件的一个。"""
-        if not candidates:
+        normalized_candidates = [
+            str(candidate).strip()
+            for candidate in candidates
+            if str(candidate).strip()
+        ]
+        requested_name = str(requested or "").strip()
+        if requested_name and requested_name in normalized_candidates:
+            return requested_name
+        if not normalized_candidates:
             return None
-        if len(candidates) == 1:
-            return candidates[0]
+        if len(normalized_candidates) == 1:
+            return normalized_candidates[0]
 
         def score(name: str) -> int:
             lower = name.lower()
@@ -7913,7 +8456,10 @@ class OrchestratorSystem:
                 value -= 100
             return value
 
-        ranked = sorted(((score(name), name) for name in candidates), reverse=True)
+        ranked = sorted(
+            ((score(name), name) for name in normalized_candidates),
+            reverse=True,
+        )
         top_score, top_name = ranked[0]
         second_score = ranked[1][0] if len(ranked) > 1 else -10**9
         if top_score >= 50 and top_score > second_score:
@@ -7944,10 +8490,6 @@ class OrchestratorSystem:
         ref_match = re.search(r"(?<![A-Za-z0-9_.-])(20\d{6}(?:_[A-Za-z0-9][A-Za-z0-9_.-]*)?)(?![A-Za-z0-9_.-])", scrubbed)
         if ref_match:
             return ref_match.group(1)
-
-        dataset_date = self._extract_dataset_date(scrubbed)
-        if dataset_date:
-            return dataset_date
 
         lowered = text.lower()
         known_datasets = [
@@ -8055,6 +8597,32 @@ class OrchestratorSystem:
         ]
         return any(keyword in (text or "") for keyword in keywords)
 
+    def _authorized_dataset_paths(self, container: str, dataset_ref: str) -> Optional[Dict[str, str]]:
+        """Resolve dataset families from the request manifest without probing container roots."""
+        manifest = _current_dataset_access_manifest()
+        if manifest is None:
+            return None
+        paths: Dict[str, str] = {}
+        for entry in allowed_dataset_entries(manifest, container):
+            if str(entry.get("datasetName") or "") == dataset_ref:
+                paths[str(entry.get("datasetType") or "")] = str(entry["sourcePath"])
+        return paths
+
+    def _authorized_dataset_entry_for_path(
+        self,
+        container: str,
+        dataset_path: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve an exact explicit path without deriving a date from its name."""
+        manifest = _current_dataset_access_manifest()
+        if manifest is None:
+            return None
+        requested_path = str(dataset_path or "").strip().rstrip("/")
+        for entry in allowed_dataset_entries(manifest, container):
+            if str(entry.get("sourcePath") or "").strip().rstrip("/") == requested_path:
+                return entry
+        return None
+
     def _build_trainer_system_hints(self, task_description: str) -> str:
         """给 trainer 补充确定性上下文，减少参数幻觉和无谓追问。"""
         hints = [
@@ -8102,20 +8670,39 @@ class OrchestratorSystem:
                 arg_text = ", ".join(f"{key}={value}" for key, value in sorted(multinode_args.items()))
                 hints.append(f"- 已从用户请求中识别到多机参数：{arg_text}。调用工具时应放入 additional_args。")
 
-        dataset_ref = self._extract_dataset_reference(task_description)
+        container = self._training_container_for_request(task_description)
+        named_values = self._extract_named_param_values(task_description)
+        explicit_dataset_dir = str(
+            named_values.get("dataset_dir") or ""
+        ).strip().rstrip("/")
+        explicit_dataset_entry = (
+            self._authorized_dataset_entry_for_path(container, explicit_dataset_dir)
+            if explicit_dataset_dir
+            else None
+        )
+        dataset_ref = (
+            str((explicit_dataset_entry or {}).get("datasetName") or "").strip()
+            or self._extract_dataset_reference(task_description)
+        )
         if not dataset_ref:
             return "\n".join(hints)
 
-        container = self._training_container_for_request(task_description)
-        batch_path = f"/home/workspace/dataset_batch_train/{dataset_ref}"
-        daily_path = f"/home/workspace/dataset_daily_train/{dataset_ref}"
-        pretrain_path = f"/home/workspace/dataset_pretrain/{dataset_ref}"
-        raw_path = f"/home/workspace/dataset/{dataset_ref}"
+        authorized_paths = self._authorized_dataset_paths(container, dataset_ref)
+        batch_path = (authorized_paths or {}).get("sft") or f"/home/workspace/dataset_batch_train/{dataset_ref}"
+        daily_path = (authorized_paths or {}).get("dpo") or f"/home/workspace/dataset_daily_train/{dataset_ref}"
+        pretrain_path = (authorized_paths or {}).get("pt") or f"/home/workspace/dataset_pretrain/{dataset_ref}"
+        raw_path = (authorized_paths or {}).get("raw") or f"/home/workspace/dataset/{dataset_ref}"
 
-        batch_exists = self._docker_path_exists(container, batch_path)
-        daily_exists = self._docker_path_exists(container, daily_path)
-        pretrain_exists = self._docker_path_exists(container, pretrain_path)
-        raw_exists = self._docker_path_exists(container, raw_path)
+        if authorized_paths is None:
+            batch_exists = self._docker_path_exists(container, batch_path)
+            daily_exists = self._docker_path_exists(container, daily_path)
+            pretrain_exists = self._docker_path_exists(container, pretrain_path)
+            raw_exists = self._docker_path_exists(container, raw_path)
+        else:
+            batch_exists = "sft" in authorized_paths
+            daily_exists = "dpo" in authorized_paths
+            pretrain_exists = "pt" in authorized_paths
+            raw_exists = "raw" in authorized_paths
 
         hints.append(f"- 识别到数据标识：{dataset_ref}。")
         if batch_exists is True:
@@ -8224,25 +8811,42 @@ class OrchestratorSystem:
         if not has_training_keyword and not has_training_dataset_path:
             return None
 
-        dataset_ref = self._extract_dataset_reference(text)
+        is_multinode = self._is_multinode_training_request(text)
+        container = self._training_container_for_request(text)
+        named_values = self._extract_named_param_values(text)
+        explicit_dataset_dir = str(
+            named_values.get("dataset_dir") or ""
+        ).strip().rstrip("/")
+        explicit_dataset_entry = (
+            self._authorized_dataset_entry_for_path(container, explicit_dataset_dir)
+            if explicit_dataset_dir
+            else None
+        )
+        dataset_ref = (
+            str((explicit_dataset_entry or {}).get("datasetName") or "").strip()
+            or self._extract_dataset_reference(text)
+        )
         if not dataset_ref:
             return None
 
-        is_multinode = self._is_multinode_training_request(text)
-        container = self._training_container_for_request(text)
+        authorized_paths = self._authorized_dataset_paths(container, dataset_ref)
+        batch_path = (authorized_paths or {}).get("sft") or f"/home/workspace/dataset_batch_train/{dataset_ref}"
+        daily_path = (authorized_paths or {}).get("dpo") or f"/home/workspace/dataset_daily_train/{dataset_ref}"
+        pretrain_path = (authorized_paths or {}).get("pt") or f"/home/workspace/dataset_pretrain/{dataset_ref}"
+        raw_path = (authorized_paths or {}).get("raw") or f"/home/workspace/dataset/{dataset_ref}"
 
-        batch_path = f"/home/workspace/dataset_batch_train/{dataset_ref}"
-        daily_path = f"/home/workspace/dataset_daily_train/{dataset_ref}"
-        pretrain_path = f"/home/workspace/dataset_pretrain/{dataset_ref}"
-        raw_path = f"/home/workspace/dataset/{dataset_ref}"
-
-        batch_exists = self._docker_path_exists(container, batch_path)
-        daily_exists = self._docker_path_exists(container, daily_path)
-        pretrain_exists = self._docker_path_exists(container, pretrain_path)
-        raw_exists = self._docker_path_exists(container, raw_path)
+        if authorized_paths is None:
+            batch_exists = self._docker_path_exists(container, batch_path)
+            daily_exists = self._docker_path_exists(container, daily_path)
+            pretrain_exists = self._docker_path_exists(container, pretrain_path)
+            raw_exists = self._docker_path_exists(container, raw_path)
+        else:
+            batch_exists = "sft" in authorized_paths
+            daily_exists = "dpo" in authorized_paths
+            pretrain_exists = "pt" in authorized_paths
+            raw_exists = "raw" in authorized_paths
         requested_train_type = self._normalize_train_type(self._infer_train_type(text))
         has_training_type = self._has_training_type(text)
-        named_values = self._extract_named_param_values(text)
         explicit_paths = [
             value.strip().rstrip("/")
             for key, value in named_values.items()
@@ -8939,8 +9543,20 @@ class OrchestratorSystem:
             return raw_message
 
         named_values = self._extract_named_param_values(raw_message)
+        safe_optional_params = {
+            "input_folder",
+            "dataset_dir",
+            "dataset_name",
+            "model_path",
+            "train_files",
+            "val_files",
+            "data_type",
+            "strategy",
+        }
         merged_values: Dict[str, str] = {
-            key: value for key, value in named_values.items() if key in expected_params and value
+            key: value
+            for key, value in named_values.items()
+            if (key in expected_params or key in safe_optional_params) and value
         }
 
         if "schedule_time" in expected_params:
@@ -8974,7 +9590,16 @@ class OrchestratorSystem:
             merged_values = self._normalize_dpo_dataset_params(merged_values)
 
         if merged_values:
-            ordered_items = [f"{param}={merged_values[param]}" for param in expected_params if param in merged_values]
+            ordered_params = list(expected_params) + [
+                param
+                for param in merged_values
+                if param not in expected_params
+            ]
+            ordered_items = [
+                f"{param}={merged_values[param]}"
+                for param in ordered_params
+                if param in merged_values
+            ]
             if ordered_items:
                 return "，".join(ordered_items)
 
@@ -9122,7 +9747,48 @@ class OrchestratorSystem:
         if has_training_type and requested_train_type not in {None, "lora", "full", "pretrain_lora", "pretrain_full", "enhanced"}:
             return None
 
-        dataset_ref = self._extract_dataset_reference(task_description)
+        container = self._training_container_for_request(task_description)
+        named_values = self._extract_named_param_values(task_description)
+        explicit_dataset_dir = str(
+            named_values.get("dataset_dir") or ""
+        ).strip().rstrip("/")
+        explicit_dataset_entry = (
+            self._authorized_dataset_entry_for_path(container, explicit_dataset_dir)
+            if explicit_dataset_dir
+            else None
+        )
+        if (
+            explicit_dataset_dir
+            and _current_dataset_access_manifest() is not None
+            and explicit_dataset_entry is None
+        ):
+            message = (
+                f"数据集路径 {explicit_dataset_dir} 不在目标容器 {container} 的授权清单中，"
+                "不能启动训练。多机训练只接受已在多机容器登记且实际可用的数据集。"
+                if is_multinode
+                else f"数据集路径 {explicit_dataset_dir} 不在当前用户的授权清单中，不能启动训练。"
+            )
+            protocol = self._with_protocol(
+                "job_failed",
+                "trainer",
+                message,
+                status="failed",
+                action="start",
+                jobType="train",
+                errorReason="dataset_access_denied",
+                errorRecoverable=True,
+                container=container,
+                datasetDir=explicit_dataset_dir,
+            )
+            self.last_response_protocol = protocol
+            return ToolResponse(
+                content=[TextBlock(type="text", text=message)],
+                metadata={"success": False, "protocol": protocol, "protocol_hint": protocol},
+            )
+        dataset_ref = (
+            str((explicit_dataset_entry or {}).get("datasetName") or "").strip()
+            or self._extract_dataset_reference(task_description)
+        )
         if not dataset_ref:
             if is_multinode and not multinode_family:
                 return self._trainer_need_input_response(
@@ -9134,17 +9800,22 @@ class OrchestratorSystem:
 
             return None
 
-        container = self._training_container_for_request(task_description)
-        batch_path = f"/home/workspace/dataset_batch_train/{dataset_ref}"
-        daily_path = f"/home/workspace/dataset_daily_train/{dataset_ref}"
-        pretrain_path = f"/home/workspace/dataset_pretrain/{dataset_ref}"
-        raw_path = f"/home/workspace/dataset/{dataset_ref}"
+        authorized_paths = self._authorized_dataset_paths(container, dataset_ref)
+        batch_path = (authorized_paths or {}).get("sft") or f"/home/workspace/dataset_batch_train/{dataset_ref}"
+        daily_path = (authorized_paths or {}).get("dpo") or f"/home/workspace/dataset_daily_train/{dataset_ref}"
+        pretrain_path = (authorized_paths or {}).get("pt") or f"/home/workspace/dataset_pretrain/{dataset_ref}"
+        raw_path = (authorized_paths or {}).get("raw") or f"/home/workspace/dataset/{dataset_ref}"
 
-        batch_exists = self._docker_path_exists(container, batch_path)
-        daily_exists = self._docker_path_exists(container, daily_path)
-        pretrain_exists = self._docker_path_exists(container, pretrain_path)
-        raw_exists = self._docker_path_exists(container, raw_path)
-        named_values = self._extract_named_param_values(task_description)
+        if authorized_paths is None:
+            batch_exists = self._docker_path_exists(container, batch_path)
+            daily_exists = self._docker_path_exists(container, daily_path)
+            pretrain_exists = self._docker_path_exists(container, pretrain_path)
+            raw_exists = self._docker_path_exists(container, raw_path)
+        else:
+            batch_exists = "sft" in authorized_paths
+            daily_exists = "dpo" in authorized_paths
+            pretrain_exists = "pt" in authorized_paths
+            raw_exists = "raw" in authorized_paths
         explicit_paths = [
             value.strip().rstrip("/")
             for key, value in named_values.items()
@@ -9255,10 +9926,10 @@ class OrchestratorSystem:
         if daily_exists is True:
             candidates = self._list_dataset_candidates_in_container(container, daily_path)
             provided_dataset_name = (named_values.get("dataset_name") or "").strip()
-            if provided_dataset_name:
-                dataset_name = provided_dataset_name
-            else:
-                dataset_name = self._choose_dataset_name(candidates)
+            dataset_name = self._choose_dataset_name(
+                candidates,
+                requested=provided_dataset_name,
+            )
             dataset_dir = named_values.get("dataset_dir") or daily_path
             known_params = {
                 key: value
@@ -9270,8 +9941,15 @@ class OrchestratorSystem:
                 if value
             }
             if not dataset_name:
+                invalid_name_hint = (
+                    f"你提供的 dataset_name={provided_dataset_name} 不是 "
+                    f"{dataset_dir}/dataset_info.json 中的可训练条目。"
+                    if provided_dataset_name and candidates
+                    else ""
+                )
                 message = (
                     f"检测到DPO数据目录 {dataset_dir}，默认应执行增强训练，"
+                    f"{invalid_name_hint}"
                     "但未能唯一推断 dataset_name。"
                     f"当前候选有：{', '.join(candidates[:8]) if candidates else '无'}。"
                     "请明确告诉我要使用哪个数据集名称。"
@@ -9383,8 +10061,17 @@ class OrchestratorSystem:
             if not dataset_dir:
                 dataset_ref = self._extract_dataset_reference(task_description)
                 if dataset_ref:
-                    candidate_dir = f"/home/workspace/dataset_daily_train/{dataset_ref}"
-                    if self._docker_path_exists(request_container, candidate_dir) is True:
+                    authorized_paths = self._authorized_dataset_paths(request_container, dataset_ref)
+                    candidate_dir = (
+                        (authorized_paths or {}).get("dpo")
+                        or f"/home/workspace/dataset_daily_train/{dataset_ref}"
+                    )
+                    candidate_allowed = (
+                        self._docker_path_exists(request_container, candidate_dir) is True
+                        if authorized_paths is None
+                        else "dpo" in authorized_paths
+                    )
+                    if candidate_allowed:
                         dataset_dir = candidate_dir
                         named_values["dataset_dir"] = dataset_dir
                         task_description = f"{task_description}\ndataset_dir={dataset_dir}"
@@ -9561,7 +10248,7 @@ class OrchestratorSystem:
             result = str(response_data.get("result") or "")
             if not result:
                 raise ValueError("推理服务未返回 result")
-            data = response_data.get("data") or {}
+            data = _inference_api_response_data(response_data)
             status_value = str(response_data.get("status") or "").lower()
             stop_response_success = _inference_stop_response_is_success(command, response_data)
             protocol = self._inference_protocol_for_result(command, result, data)
@@ -9586,7 +10273,7 @@ class OrchestratorSystem:
                 else:
                     _release_inference_resource_context(resource_context)
             if _inference_protocol_is_service_stop(protocol):
-                _release_known_inference_reservations()
+                _release_stopped_inference_reservation(resource_payload)
             success = stop_response_success or status_value not in {"error", "failed", "timeout"}
         except Exception as exc:
             _release_inference_resource_context(resource_context)
@@ -11804,6 +12491,16 @@ exit 0
             else:
                 lines.append(f"\n失败原因：{workflow['error']}")
                 lines.append("可以发送：`继续上次失败的一键工作流`")
+        cleanup = (workflow.get("context") or {}).get("inference_resource_cleanup")
+        if workflow.get("status") == "stopped" and isinstance(cleanup, dict):
+            reservation_id = str(cleanup.get("reservation_id") or "").strip()
+            if cleanup.get("status") == "failed":
+                lines.append(
+                    f"\n资源清理失败：预约 `{reservation_id}` 仍可能占用 GPU；"
+                    "请在资源预约审计中核实空闲后重试释放。"
+                )
+            elif cleanup.get("status") == "unknown":
+                lines.append("\n资源清理待核查：工作流缺少推理预约 ID，请在资源预约审计中核查占用。")
         if workflow.get("status") == "finished":
             lines.append(f"\n可以发送：`{_benchmark_result_entry(workflow)}`")
         return "\n".join(lines)
@@ -12570,17 +13267,32 @@ exit 0
             if launch_mode == "multinode"
             else self.training_container
         )
-        batch_path = f"/home/workspace/dataset_batch_train/{dataset_ref}"
-        daily_path = f"/home/workspace/dataset_daily_train/{dataset_ref}"
-        pretrain_path = f"/home/workspace/dataset_pretrain/{dataset_ref}"
+        manifest = _current_dataset_access_manifest()
+        if manifest is None:
+            raise ValueError("当前请求缺少数据集授权清单，不能启动工作流训练。")
+        authorized = allowed_dataset_entries(manifest, request_container)
+        by_type = {
+            dataset_type: next(
+                (
+                    entry for entry in authorized
+                    if entry.get("datasetType") == dataset_type
+                    and entry.get("datasetName") == dataset_ref
+                ),
+                None,
+            )
+            for dataset_type in ("sft", "dpo", "pt")
+        }
+        batch_path = str((by_type["sft"] or {}).get("sourcePath") or "")
+        daily_path = str((by_type["dpo"] or {}).get("sourcePath") or "")
+        pretrain_path = str((by_type["pt"] or {}).get("sourcePath") or "")
 
         # A bare dataset identifier does not carry its training family. Locate it
         # first so one-click workflows route SFT to LoRA, DPO to enhanced
         # training, and PT/text to LoRA PT instead of guessing from precedence.
         if requested_train_type is None:
-            batch_exists = self._docker_path_exists(request_container, batch_path)
-            daily_exists = self._docker_path_exists(request_container, daily_path)
-            pretrain_exists = self._docker_path_exists(request_container, pretrain_path)
+            batch_exists = bool(by_type["sft"])
+            daily_exists = bool(by_type["dpo"])
+            pretrain_exists = bool(by_type["pt"])
             existing_families = [
                 ("SFT", batch_path, "lora训练或全参训练") if batch_exists is True else None,
                 ("DPO", daily_path, "增强训练") if daily_exists is True else None,
@@ -12619,6 +13331,15 @@ exit 0
                 "pretrain_full": "batch_train_pretrain_full",
             }.get(train_type, "batch_train_lora")
             dataset_path = pretrain_path if train_type in {"pretrain_lora", "pretrain_full"} else batch_path
+            if not dataset_path:
+                expected_type = "pt" if train_type in {"pretrain_lora", "pretrain_full"} else "sft"
+                raise ValueError(f"数据集 {dataset_ref} 不在当前用户的 {expected_type} 授权清单中。")
+            selected_entry = require_allowed_dataset_path(
+                dataset_path,
+                manifest,
+                request_container,
+                {"pt"} if train_type in {"pretrain_lora", "pretrain_full"} else {"sft"},
+            )
             train_args = self._workflow_batch_train_args(message)
             preflight_env = {
                 "DATASET_DIR": dataset_path,
@@ -12645,6 +13366,10 @@ exit 0
                 "resource_group_id": _current_resource_group_id().strip(),
                 "training_pool_id": _current_training_pool_id().strip(),
                 "train_args": train_args,
+                "dataset_path": dataset_path,
+                "dataset_resource_id": selected_entry.get("resourceId"),
+                "dataset_access_manifest": manifest,
+                "actor_user_id": _current_actor_user_id(),
             }
             if launch_mode == "multinode":
                 context["launch_mode"] = "multinode"
@@ -12654,11 +13379,30 @@ exit 0
             return context
         values = self._extract_named_param_values(message)
         dataset_dir = values.get("dataset_dir") or daily_path
-        dataset_name = values.get("dataset_name") or self._infer_dataset_name_from_dir(dataset_dir, container=request_container)
+        if not dataset_dir:
+            raise ValueError(f"数据集 {dataset_ref} 不在当前用户的 dpo 授权清单中。")
+        selected_entry = require_allowed_dataset_path(
+            dataset_dir,
+            manifest,
+            request_container,
+            {"dpo"},
+        )
+        candidates = self._list_dataset_candidates_in_container(request_container, dataset_dir)
+        provided_dataset_name = str(values.get("dataset_name") or "").strip()
+        dataset_name = self._choose_dataset_name(
+            candidates,
+            requested=provided_dataset_name,
+        )
         if not dataset_name:
-            candidates = self._list_dataset_candidates_in_container(request_container, dataset_dir)
+            invalid_name_hint = (
+                f"你提供的 dataset_name={provided_dataset_name} 不是 "
+                f"{dataset_dir}/dataset_info.json 中的可训练条目。"
+                if provided_dataset_name and candidates
+                else ""
+            )
             raise ValueError(
                 "无法唯一确定增强训练 dataset_name。"
+                f"{invalid_name_hint}"
                 f"当前候选：{', '.join(candidates[:8]) if candidates else '无'}。"
                 "请在口令中补充 dataset_name=<数据集名称>。"
             )
@@ -12679,6 +13423,9 @@ exit 0
             "model_path": model_path,
             "dataset_dir": dataset_dir,
             "dataset_name": dataset_name,
+            "dataset_resource_id": selected_entry.get("resourceId"),
+            "dataset_access_manifest": manifest,
+            "actor_user_id": _current_actor_user_id(),
         }
         if launch_mode == "multinode":
             context["launch_mode"] = "multinode"
@@ -12832,6 +13579,8 @@ exit 0
             if isinstance(inference_payload.get("resource_context"), dict)
             else None
         )
+        if workflow and resource_context:
+            _workflow_persist_inference_resource_context(workflow, resource_context)
         text = self._response_to_text(response) or ""
         protocol_type = str(protocol.get("type") or "")
         protocol_status = str(protocol.get("status") or "").lower()
@@ -13661,6 +14410,24 @@ exit 0
             },
         )
 
+    async def _stop_workflow_inference_service(self, workflow: Dict[str, Any]) -> str:
+        result = _workflow_stop_inference_reservation(workflow)
+        if result is None:
+            command = _workflow_inference_service_stop_command()
+            legacy_result = await self._workflow_inference_event(command, workflow)
+            if not legacy_result.get("success"):
+                raise RuntimeError(legacy_result.get("text") or "停止推理服务失败")
+            warning = "工作流未保存推理预约 ID；请在资源预约审计中核查并清理占用。"
+            text = f"{legacy_result.get('text') or ''}\n{warning}".strip()
+            cleanup = {"status": "unknown", "reservation_id": ""}
+        else:
+            text = result["result"]
+            cleanup = result["resource_cleanup"]
+        get_workflow_manager().update_context(
+            workflow["workflow_id"], inference_resource_cleanup=cleanup,
+        )
+        return text
+
     async def _stop_workflow_runtime(self, workflow: Dict[str, Any]) -> Optional[str]:
         """Stop the active runtime task with the same cleanup used by standalone jobs."""
         stage_name = str(workflow.get("current_stage") or "")
@@ -13669,16 +14436,22 @@ exit 0
         container = str(stage.get("container") or "").strip() or None
         if stage_name == "benchmark":
             command = _workflow_benchmark_stop_command(workflow)
-            benchmark_result = await self._workflow_inference_event(command, workflow)
-            service_command = _workflow_inference_service_stop_command()
-            service_result = await self._workflow_inference_event(service_command, workflow)
+            try:
+                benchmark_result = await self._workflow_inference_event(command, workflow)
+            except Exception as exc:
+                logger.exception(
+                    "Benchmark stop command failed; continuing inference resource cleanup for workflow %s",
+                    workflow.get("workflow_id"),
+                )
+                benchmark_result = {
+                    "success": False,
+                    "text": f"停止 benchmark 任务失败：{exc}",
+                }
+            service_text = await self._stop_workflow_inference_service(workflow)
             benchmark_text = benchmark_result.get("text") or f"已发送{command}指令"
-            service_text = service_result.get("text") or f"已发送{service_command}指令"
             return f"{benchmark_text}\n\n{service_text}"
         if stage_name == "deploy":
-            command = _workflow_inference_service_stop_command()
-            result = await self._workflow_inference_event(command, workflow)
-            return result.get("text") or f"已发送{command}指令"
+            return await self._stop_workflow_inference_service(workflow)
         if stage_name == "evaluate":
             model_path = str((workflow.get("context") or {}).get("trained_model_path") or "").strip()
             stop_message_parts = ["停止当前单模型评估 single_model_evaluation_vpn"]
@@ -13768,9 +14541,28 @@ exit 0
         dataset_ref: Optional[str] = None
         try:
             if command == "start":
-                dataset_ref = self._extract_dataset_reference(message)
+                values = self._extract_named_param_values(message)
+                explicit_dataset_dir = str(
+                    values.get("dataset_dir") or ""
+                ).strip().rstrip("/")
+                request_container = self._training_container_for_request(message)
+                explicit_dataset_entry = (
+                    self._authorized_dataset_entry_for_path(
+                        request_container,
+                        explicit_dataset_dir,
+                    )
+                    if explicit_dataset_dir
+                    else None
+                )
+                dataset_ref = (
+                    str((explicit_dataset_entry or {}).get("datasetName") or "").strip()
+                    or self._extract_dataset_reference(message)
+                )
                 if not dataset_ref:
-                    raise ValueError("请在一键工作流口令中提供数据标识，例如 20260417")
+                    raise ValueError(
+                        "请在一键工作流口令中提供授权数据集路径或数据标识，例如 "
+                        "dataset_dir=/home/workspace/dataset_batch_train/20260417"
+                    )
                 workflow_context = self._workflow_training_context(message, dataset_ref)
                 owner_user_id, owner_aliases = _inference_owner_payload(self.user_id)
                 workflow_context["inference_owner_user_id"] = owner_user_id
@@ -13840,24 +14632,51 @@ exit 0
                         return await self.process_message(message, raw_content=raw_content)
                     # 处理选择型等待
                     del self.pending_parameters[agent_name]
-                    if agent_name == "dataprocessor" and self._is_close_choice_response(message):
+                    filter_choice = (
+                        classify_advanced_filter_choice(message)
+                        if agent_name == "dataprocessor"
+                        else "unknown"
+                    )
+                    if agent_name == "dataprocessor" and filter_choice == "decline":
                         return await self._direct_agent_response(
                             "dataprocessor",
-                            "已确认关闭当前数据处理流程，当前任务结束。",
+                            "已确认不执行高级筛选，本次数据预处理任务已完成。",
                             original_task,
                             f"用户选择：{message}",
                         )
 
                     if agent_name == "dataprocessor":
-                        full_message = (
-                            f"{original_task}\n用户选择：{message}\n"
-                            "[系统补充] 用户现在是在回答“是否继续执行高级筛选”。"
-                            "请先根据用户选择自行判断是继续还是结束："
-                            "如果用户表示否定、拒绝、不需要、不执行或取消，只回复确认不执行高级筛选，"
-                            "不要调用任何数据处理工具；如果用户表示肯定、需要或继续，"
-                            "只执行数据高级筛选，不要重新执行数据预处理；"
-                            "如果缺少高级筛选 input_folder，只追问高级筛选的数据路径。"
-                        )
+                        output_path = resolve_pending_dataset_output_path(task_info)
+                        if filter_choice == "accept" and output_path:
+                            manifest_entry = pending_output_manifest_entry(
+                                task_info,
+                                _current_actor_user_id(),
+                                _current_training_container(),
+                            )
+                            if manifest_entry:
+                                current_manifest = _current_dataset_access_manifest() or []
+                                current_manifest = [
+                                    item for item in current_manifest
+                                    if item.get("sourcePath") != manifest_entry["sourcePath"]
+                                ]
+                                current_manifest.append(manifest_entry)
+                                REQUEST_DATASET_ACCESS_MANIFEST.set(tuple(current_manifest))
+                                logger.info(
+                                    "Added freshly registered preprocessing output to request manifest: %s",
+                                    manifest_entry["sourcePath"],
+                                )
+                            full_message = build_advanced_filter_request(
+                                output_path,
+                                message,
+                            )
+                        else:
+                            full_message = (
+                                f"{original_task}\n用户选择：{message}\n"
+                                "[系统补充] 用户现在是在回答“是否继续执行高级筛选”。"
+                                "如果用户表示肯定、需要或继续，只执行数据高级筛选，"
+                                "不要重新执行数据预处理；如果缺少高级筛选 input_folder，"
+                                "只追问高级筛选的数据路径。"
+                            )
                     else:
                         full_message = f"{original_task}\n用户选择：{message}"
                     
@@ -14376,6 +15195,8 @@ async def process_user_message_structured(
     user_role: str = "",
     owner_user_id: str = "",
     owner_aliases: Any = None,
+    actor_user_id: str = "",
+    dataset_access_manifest: Any = None,
 ) -> Dict[str, Any]:
     """处理用户消息，并返回前端可直接消费的轻量协议结果。"""
     logger.info(f"用户{user_id}; 输入{message}")
@@ -14391,6 +15212,10 @@ async def process_user_message_structured(
     resolved_user_role = user_role.strip().lower()
     resolved_owner_user_id = str(owner_user_id or "").strip()
     resolved_owner_aliases = _owner_aliases_from_any(owner_aliases)
+    resolved_actor_user_id = str(actor_user_id or "").strip()
+    resolved_dataset_access_manifest = tuple(
+        dict(item) for item in (dataset_access_manifest or []) if isinstance(item, dict)
+    )
     logger.info(
         "用户%s; resolved containers training=%s evaluation=%s grpo=%s multinode=%s resource_group=%s training_pool=%s user_role=%s",
         user_id,
@@ -14427,6 +15252,9 @@ async def process_user_message_structured(
     user_role_token = REQUEST_USER_ROLE.set(resolved_user_role)
     owner_user_id_token = REQUEST_INFERENCE_OWNER_USER_ID.set(resolved_owner_user_id)
     owner_aliases_token = REQUEST_INFERENCE_OWNER_ALIASES.set(tuple(resolved_owner_aliases))
+    actor_user_id_token = REQUEST_ACTOR_USER_ID.set(resolved_actor_user_id)
+    dataset_manifest_token = REQUEST_DATASET_ACCESS_MANIFEST.set(resolved_dataset_access_manifest)
+    last_dataset_output_token = begin_dataset_output_capture()
     session.system.training_container = resolved_training_container
     session.system.evaluation_container = resolved_evaluation_container
     session.system.grpo_container = resolved_grpo_container
@@ -14434,6 +15262,9 @@ async def process_user_message_structured(
     try:
         response = await session.system.process_message(message, raw_content=raw_content)
     finally:
+        reset_dataset_output_capture(last_dataset_output_token)
+        REQUEST_DATASET_ACCESS_MANIFEST.reset(dataset_manifest_token)
+        REQUEST_ACTOR_USER_ID.reset(actor_user_id_token)
         REQUEST_INFERENCE_OWNER_ALIASES.reset(owner_aliases_token)
         REQUEST_INFERENCE_OWNER_USER_ID.reset(owner_user_id_token)
         REQUEST_USER_ROLE.reset(user_role_token)

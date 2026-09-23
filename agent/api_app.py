@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import asyncio
+import base64
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -62,7 +63,7 @@ from resource_api import (  # noqa: E402
 logger = logging.getLogger(__name__)
 RUNTIME_CONTEXT_MARKER = "__medflow_runtime_context__"
 RUNTIME_CONTEXT_RE = re.compile(
-    r"\b(training_container|evaluation_container|grpo_container|multinode_training_container|resource_group_id|training_pool_id|user_role|owner_user_id|owner_aliases|context_username)=([^\s]*)"
+    r"\b(training_container|evaluation_container|grpo_container|multinode_training_container|resource_group_id|training_pool_id|user_role|actor_user_id|dataset_access_manifest_b64|owner_user_id|owner_aliases|context_username)=([^\s]*)"
 )
 DEFAULT_AGENT_REQUEST_THREADS = 8
 
@@ -136,19 +137,19 @@ def _to_plain_dict(value: Any) -> Any:
 def _request_extra_raw(request: Any, key: str, kwargs: dict[str, Any]) -> Any:
     """Read custom AgentRequest fields across pydantic/framework variants."""
     value = getattr(request, key, None)
-    if value:
+    if value is not None:
         return value
 
     model_extra = getattr(request, "model_extra", None)
-    if isinstance(model_extra, dict) and model_extra.get(key):
+    if isinstance(model_extra, dict) and key in model_extra:
         return model_extra[key]
 
     dumped = _to_plain_dict(request)
-    if isinstance(dumped, dict) and dumped.get(key):
+    if isinstance(dumped, dict) and key in dumped:
         return dumped[key]
 
     original = kwargs.get("request")
-    if isinstance(original, dict) and original.get(key):
+    if isinstance(original, dict) and key in original:
         return original[key]
 
     return kwargs.get(key)
@@ -173,6 +174,22 @@ def _request_extra_list(request: Any, key: str, kwargs: dict[str, Any]) -> list[
             result.append(text)
             seen.add(text)
     return result
+
+
+def _decode_dataset_access_manifest(value: Any) -> list[dict[str, Any]]:
+    encoded = str(value or "").strip()
+    if not encoded:
+        return []
+    try:
+        padding = "=" * (-len(encoded) % 4)
+        decoded = base64.urlsafe_b64decode(f"{encoded}{padding}").decode("utf-8")
+        parsed = json.loads(decoded)
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        logger.warning("Ignoring invalid dataset access manifest fallback")
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [dict(item) for item in parsed if isinstance(item, dict)]
 
 
 def _runtime_context_from_input(request: Any) -> dict[str, str]:
@@ -355,6 +372,13 @@ async def _handle_agent_request(
     multinode_training_container = _request_extra_value(request, "multinode_training_container", kwargs)
     owner_user_id = _request_extra_value(request, "owner_user_id", kwargs)
     owner_aliases = _request_extra_list(request, "owner_aliases", kwargs)
+    actor_user_id = _request_extra_value(request, "actor_user_id", kwargs)
+    raw_dataset_manifest = _request_extra_raw(request, "dataset_access_manifest", kwargs)
+    dataset_access_manifest = (
+        [dict(item) for item in raw_dataset_manifest if isinstance(item, dict)]
+        if isinstance(raw_dataset_manifest, list)
+        else []
+    )
     context_username = _request_extra_value(request, "context_username", kwargs)
     training_container = training_container or runtime_context.get("training_container", "")
     evaluation_container = (
@@ -363,6 +387,11 @@ async def _handle_agent_request(
     resource_group_id = resource_group_id or runtime_context.get("resource_group_id", "")
     training_pool_id = training_pool_id or runtime_context.get("training_pool_id", "")
     user_role = user_role or runtime_context.get("user_role", "")
+    actor_user_id = actor_user_id or runtime_context.get("actor_user_id", "")
+    if not dataset_access_manifest:
+        dataset_access_manifest = _decode_dataset_access_manifest(
+            runtime_context.get("dataset_access_manifest_b64", ""),
+        )
     grpo_container = grpo_container or runtime_context.get("grpo_container", "")
     multinode_training_container = (
         multinode_training_container or runtime_context.get("multinode_training_container", "")
@@ -392,6 +421,18 @@ async def _handle_agent_request(
             "owner_user_id": owner_user_id,
             "owner_aliases": owner_aliases,
             "context_username": context_username,
+            "actor_user_id": actor_user_id,
+            "dataset_access_count": len(dataset_access_manifest),
+            "dataset_access_entries": [
+                {
+                    "datasetType": item.get("datasetType"),
+                    "datasetName": item.get("datasetName"),
+                    "sourcePath": item.get("sourcePath"),
+                    "containerName": item.get("containerName"),
+                    "storageState": item.get("storageState"),
+                }
+                for item in dataset_access_manifest
+            ],
         },
         flush=True,
     )
@@ -409,6 +450,8 @@ async def _handle_agent_request(
         user_role=user_role,
         owner_user_id=owner_user_id,
         owner_aliases=owner_aliases,
+        actor_user_id=actor_user_id,
+        dataset_access_manifest=dataset_access_manifest,
     )
 
     response_text = result.get("message", "")

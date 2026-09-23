@@ -26,12 +26,16 @@ import {
   Clock,
   ArrowRight,
   Trash2,
+  Share2,
 } from "lucide-react";
 import { DatasetInfo, ManagementCacheMeta } from "@shared/types";
+import { trpc } from "@/api/trpc";
+import { useAuth } from "@/context/AuthContext";
 import { useContainerMemory } from "@/hooks/useContainerMemory";
 import { useEnvironmentConfig } from "@/hooks/useEnvironmentConfig";
 import { GuideModal } from "@/components/GuideModal";
 import { ManagerButton } from "@/components/buttons/ASButton";
+import { translateAuthError } from "@/utils/authErrors";
 import ManagerSectionHeader from "../ManagerSectionHeader";
 
 const tagSelectClassName =
@@ -54,7 +58,7 @@ interface Props {
   errorMessage?: string;
   hasQueried: boolean;
   onQuery: (containerName: string) => void;
-  onRefresh?: (containerName: string) => void;
+  onRefresh?: (containerName: string) => void | Promise<void>;
   cacheMeta?: ManagementCacheMeta | null;
   onUpload?: () => void;
   onDownload?: (dataset: DatasetInfo) => void;
@@ -99,6 +103,22 @@ const DatasetManager = ({
   currentRunContainerName,
 }: Props) => {
   const { t } = useTranslation();
+  const { isAdmin, user } = useAuth();
+  const requestPublicationMutation =
+    trpc.requestResourcePublication.useMutation();
+  const publishResourceMutation = trpc.publishResource.useMutation();
+  const [publishingResourceId, setPublishingResourceId] = useState<
+    string | null
+  >(null);
+  const [publicationOverrides, setPublicationOverrides] = useState<
+    Record<
+      string,
+      {
+        visibility: "public" | "private";
+        publicationStatus: "pending" | "approved" | "rejected" | null;
+      }
+    >
+  >({});
   const normalizedCurrentRunNodeId = currentRunNodeId?.trim();
   const normalizedCurrentRunContainerName = currentRunContainerName?.trim();
   const hasCurrentRunNode =
@@ -295,6 +315,65 @@ const DatasetManager = ({
       return;
     }
     onQuery(containerName);
+  };
+
+  const handleShareDataset = async (dataset: DatasetInfo) => {
+    if (!dataset.resourceId) {
+      message.error(
+        t("dataset.sharing.missingResource") ||
+          "该数据集尚未登记，暂时无法申请共享",
+      );
+      return;
+    }
+
+    setPublishingResourceId(dataset.resourceId);
+    try {
+      if (isAdmin) {
+        await publishResourceMutation.mutateAsync({
+          resourceId: dataset.resourceId,
+        });
+        setPublicationOverrides((current) => ({
+          ...current,
+          [dataset.resourceId!]: {
+            visibility: "public",
+            publicationStatus: "approved",
+          },
+        }));
+        message.success(
+          t("dataset.sharing.publishSuccess") ||
+            "数据集已发布给用户组",
+        );
+      } else {
+        await requestPublicationMutation.mutateAsync({
+          resourceId: dataset.resourceId,
+        });
+        setPublicationOverrides((current) => ({
+          ...current,
+          [dataset.resourceId!]: {
+            visibility: "private",
+            publicationStatus: "pending",
+          },
+        }));
+        message.success(
+          t("dataset.sharing.requestSuccess") ||
+            "共享申请已提交，等待管理员审批",
+        );
+      }
+
+      const refresh = onRefresh || onQuery;
+      await refresh(dataset.containerName || containerName);
+      setPublicationOverrides((current) => {
+        const next = { ...current };
+        delete next[dataset.resourceId!];
+        return next;
+      });
+    } catch (error) {
+      message.error(
+        translateAuthError(error, t, "dataset.sharing.requestFailed"),
+      );
+    } finally {
+      setPublishingResourceId(null);
+    }
   };
 
   const handleModalOk = () => {
@@ -752,6 +831,36 @@ const DatasetManager = ({
             <div className="grid grid-cols-1 gap-2">
               {visibleDatasets.map((dataset, index) => {
                 const datasetFiles = getDatasetFiles(dataset);
+                const publicationOverride = dataset.resourceId
+                  ? publicationOverrides[dataset.resourceId]
+                  : undefined;
+                const effectiveVisibility =
+                  publicationOverride?.visibility || dataset.visibility;
+                const effectivePublicationStatus =
+                  publicationOverride?.publicationStatus ??
+                  dataset.publicationStatus;
+                const isPublicDataset = effectiveVisibility === "public";
+                const isDatasetOwner =
+                  Boolean(user?.id) && dataset.ownerUserId === user?.id;
+                const datasetFullPath =
+                  dataset.sourcePath ||
+                  [dataset.path, dataset.name].filter(Boolean).join("/");
+                const datasetLocationLabel =
+                  effectiveVisibility === "private"
+                    ? t("dataset.sharing.privateLocation", {
+                        type: (dataset.type || "").toUpperCase(),
+                      }) || `个人数据空间 / ${(dataset.type || "").toUpperCase()}`
+                    : effectiveVisibility === "public"
+                      ? t("dataset.sharing.publicLocation", {
+                          type: (dataset.type || "").toUpperCase(),
+                        }) || `用户组共享空间 / ${(dataset.type || "").toUpperCase()}`
+                      : datasetFullPath;
+                const canPublishDataset =
+                  Boolean(dataset.resourceId) &&
+                  effectiveVisibility === "private" &&
+                  dataset.storageState === "ready" &&
+                  effectivePublicationStatus !== "pending" &&
+                  (isAdmin || isDatasetOwner);
                 const panelKey = `dataset-${index}`;
                 const isExpanded = activePanels.includes(panelKey);
                 const isPreviewLoading = previewLoadingIds.includes(panelKey);
@@ -819,6 +928,23 @@ const DatasetManager = ({
                               {dataset.containerName}
                             </span>
                           )}
+                          {isPublicDataset ? (
+                            <span className="rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700 dark:border-emerald-500/25 dark:bg-emerald-500/10 dark:text-emerald-300">
+                              {t("dataset.sharing.public") || "用户组已共享"}
+                            </span>
+                          ) : effectivePublicationStatus === "pending" ? (
+                            <span className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-700 dark:border-amber-500/25 dark:bg-amber-500/10 dark:text-amber-300">
+                              {t("dataset.sharing.pending") || "等待管理员审批"}
+                            </span>
+                          ) : effectivePublicationStatus === "rejected" ? (
+                            <span className="rounded-full border border-rose-200 bg-rose-50 px-2 py-0.5 text-[11px] font-medium text-rose-700 dark:border-rose-500/25 dark:bg-rose-500/10 dark:text-rose-300">
+                              {t("dataset.sharing.rejected") || "共享申请未通过"}
+                            </span>
+                          ) : effectiveVisibility === "private" ? (
+                            <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] font-medium text-slate-600 dark:border-white/10 dark:bg-white/5 dark:text-slate-300">
+                              {t("dataset.sharing.private") || "仅自己可见"}
+                            </span>
+                          ) : null}
                         </div>
                         <div className="grid gap-1 text-xs text-muted-foreground">
                           <div className="flex items-center gap-1.5">
@@ -897,6 +1023,49 @@ const DatasetManager = ({
                         )}
                       </div>
                     </div>
+
+                    {effectiveVisibility === "private" &&
+                      (isAdmin || isDatasetOwner) && (
+                        <div className="mt-2 flex items-center justify-between gap-3 border-t border-border/20 pt-2">
+                          <span className="text-xs text-muted-foreground">
+                            {effectivePublicationStatus === "pending"
+                              ? t("dataset.sharing.pendingHint") ||
+                                "审批通过后，同组其他用户即可看到并使用"
+                              : t("dataset.sharing.privateHint") ||
+                                "当前只有你可以看到和使用"}
+                          </span>
+                          {effectivePublicationStatus === "pending" ? (
+                            <Button
+                              type="text"
+                              size="small"
+                              disabled
+                              className="shrink-0 rounded-lg"
+                            >
+                              {t("dataset.sharing.pendingAction") || "已申请"}
+                            </Button>
+                          ) : canPublishDataset ? (
+                            <Button
+                              type="text"
+                              size="small"
+                              icon={<Share2 className="h-4 w-4" />}
+                              loading={
+                                publishingResourceId === dataset.resourceId
+                              }
+                              onClick={() => void handleShareDataset(dataset)}
+                              className="shrink-0 rounded-lg text-primary"
+                            >
+                              {isAdmin
+                                ? t("dataset.sharing.publishAction") ||
+                                  "发布给用户组"
+                                : effectivePublicationStatus === "rejected"
+                                  ? t("dataset.sharing.retryAction") ||
+                                    "重新申请"
+                                  : t("dataset.sharing.requestAction") ||
+                                    "申请共享"}
+                            </Button>
+                          ) : null}
+                        </div>
+                      )}
 
                     {(canShowTrainAction ||
                       canShowPreprocessAction ||
@@ -1022,11 +1191,19 @@ const DatasetManager = ({
                     )}
 
                     {/* 底部显示路径和统计信息 */}
-                    {(dataset.path || dataset.name) && (
+                    {datasetFullPath && (
                       <div className="mt-2 border-t border-border/20 pt-2">
-                        <p className="mb-2 break-all font-mono text-xs text-muted-foreground">
-                          {dataset.path}/{dataset.name}
-                        </p>
+                        <Tooltip
+                          title={
+                            effectiveVisibility
+                              ? `${t("dataset.sharing.pathTooltip") || "实际存储路径"}：${datasetFullPath}`
+                              : undefined
+                          }
+                        >
+                          <p className="mb-2 truncate text-xs text-muted-foreground">
+                            {datasetLocationLabel}
+                          </p>
+                        </Tooltip>
                         {((dataset.size && dataset.size !== "0 B") ||
                           dataset.createdAt) && (
                           <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">

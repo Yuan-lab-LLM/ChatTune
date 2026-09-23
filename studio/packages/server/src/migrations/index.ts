@@ -29,6 +29,7 @@ import { AddTrainingReservationDiagnostics1880000000000 } from './1880000000000-
 import { AddTrainingReservationTaskType1890000000000 } from './1890000000000-AddTrainingReservationTaskType';
 import { AddUserGroupMultinodeContainer1900000000000 } from './1900000000000-AddUserGroupMultinodeContainer';
 import { BackfillUserGroupGrpoContainer1910000000000 } from './1910000000000-BackfillUserGroupGrpoContainer';
+import { AddDatasetStorageState1920000000000 } from './1920000000000-AddDatasetStorageState';
 
 /**
  * 所有迁移列表（按时间戳顺序）
@@ -53,6 +54,7 @@ export const migrations: (new () => MigrationInterface)[] = [
     AddTrainingReservationTaskType1890000000000,
     AddUserGroupMultinodeContainer1900000000000,
     BackfillUserGroupGrpoContainer1910000000000,
+    AddDatasetStorageState1920000000000,
 ];
 
 

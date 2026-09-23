@@ -25,6 +25,7 @@ import { AuthDao, SafeAuthUser } from "../dao/Auth";
 import { ChatSessionDao } from "../dao/ChatSession";
 import { UserRole } from "../models/Auth";
 import { ResourceAccessService } from "../services/resourceAccessService";
+import { managementCacheService } from "../services/managementCacheService";
 import {
   remoteResourceClient,
   resourceNodeRegistry,
@@ -1511,9 +1512,11 @@ export class SocketManager {
 
     // 查询 run 注册的节点，实现精准路由
     let targetBackendUrl: string | null = null;
+    let runtimeNodeId: string | null = null;
     try {
       const runNodeId = await RunDao.getRunNodeId(runId);
       if (runNodeId && runNodeId !== "unknown") {
+        runtimeNodeId = runNodeId;
         const node = resourceNodeRegistry.get(runNodeId);
         targetBackendUrl = node.baseUrl;
       }
@@ -1523,6 +1526,67 @@ export class SocketManager {
         error,
       );
     }
+
+    if (!runtimeNodeId && currentUser) {
+      const assignedNodeId = currentUser.role === UserRole.ADMIN
+        ? runtimeContext.resourceGroupId
+          ? await ResourceAccessService.getAssignedNodeIdForGroup(runtimeContext.resourceGroupId)
+          : null
+        : currentUser.assignedNodeId ||
+          await ResourceAccessService.getAssignedNodeId(currentUser.id);
+      if (assignedNodeId) {
+        runtimeNodeId = assignedNodeId;
+        try {
+          targetBackendUrl = resourceNodeRegistry.get(assignedNodeId).baseUrl;
+          console.warn(
+            `[RuntimeBridge] Run ${runId} has no registered node; using assigned node ${assignedNodeId}`,
+          );
+        } catch (error) {
+          console.warn(
+            `[RuntimeBridge] Assigned node ${assignedNodeId} is not available for run ${runId}:`,
+            error,
+          );
+        }
+      }
+    }
+
+    const datasetAccessManifest = currentUser && runtimeNodeId
+      ? (await Promise.all(
+          [...new Set([
+            runtimeContext.trainingContainer,
+            runtimeContext.multinodeTrainingContainer,
+          ].filter(Boolean))].map(async (containerName) => {
+            try {
+              // Intersect the catalog permission result with the same physical
+              // snapshot used by the dataset list. getDatasets also reconciles
+              // historical cache rows before the manifest is built.
+              const snapshot = await managementCacheService.getDatasets(
+                runtimeNodeId!,
+                containerName,
+              );
+              const availableSourcePaths = new Set(
+                snapshot.items
+                  .map((item) => item.sourcePath || (item.path && item.name
+                    ? `${item.path.replace(/\/+$/, "")}/${item.name}`
+                    : ""))
+                  .filter((sourcePath): sourcePath is string => Boolean(sourcePath)),
+              );
+              return ResourceAccessService.buildDatasetAccessManifest(
+                currentUser,
+                runtimeNodeId!,
+                containerName,
+                availableSourcePaths,
+              );
+            } catch (error) {
+              console.warn(
+                `[RuntimeBridge] Failed to reconcile dataset access for ${containerName}:`,
+                error,
+              );
+              return [];
+            }
+          }),
+        )).flat()
+      : [];
 
     const fetchHeaders: Record<string, string> = {
       "Content-Type": "application/json",
@@ -1546,6 +1610,7 @@ export class SocketManager {
       evaluationContainer: runtimeContext.evaluationContainer,
       grpoContainer: runtimeContext.grpoContainer,
       multinodeTrainingContainer: runtimeContext.multinodeTrainingContainer,
+      datasetAccessCount: datasetAccessManifest.length,
     });
     if (currentUser?.role === UserRole.ADMIN) {
       await SocketManager.auditAdminAction(
@@ -1569,6 +1634,10 @@ export class SocketManager {
         signal: controller.signal,
         body: JSON.stringify({
           user_id: userId,
+
+          actor_user_id: currentUser?.id || userId,
+
+          dataset_access_manifest: datasetAccessManifest,
 
           owner_user_id: ownerUserId,
 

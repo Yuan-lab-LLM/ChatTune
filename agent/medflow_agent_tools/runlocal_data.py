@@ -22,6 +22,12 @@ from typing import Dict, Any, List, Optional,Tuple
 from agentscope.tool import ToolResponse
 from agentscope.message import TextBlock
 from ._config_defaults import get_default_docker_container
+from .dataset_access import (
+    DatasetAccessError,
+    latest_dataset_by_file_mtime,
+    require_allowed_dataset_path,
+)
+from .dataset_naming import build_dataset_output_name
 
 logger = logging.getLogger(__name__)
 from agentscope.tool import ToolResponse
@@ -57,6 +63,33 @@ _BACKGROUND_TASK_REGISTRY = os.path.join(_RUNTIME_DIR, "background_task_registry
 
 _CLI_TRUE_VALUES = {"1", "true", "yes", "on", "y"}
 _CLI_FALSE_VALUES = {"0", "false", "no", "off", "n", ""}
+
+
+def _register_runtime_dataset(
+    actor_user_id: str,
+    container: str,
+    dataset_type: str,
+    dataset_name: str,
+    source_path: str,
+    storage_state: str,
+) -> Any:
+    from .runlocal_train import _runtime_training_resource_request
+
+    runtime_node_id = str(os.getenv("MEDFLOW_RESOURCE_NODE_ID") or "").strip()
+    if not runtime_node_id:
+        raise ValueError("Runtime 数据集登记需要配置 MEDFLOW_RESOURCE_NODE_ID")
+    return _runtime_training_resource_request(
+        "registerDatasetForRuntime",
+        {
+            "runtimeNodeId": runtime_node_id,
+            "actorUserId": actor_user_id,
+            "container": container,
+            "datasetType": dataset_type,
+            "datasetName": dataset_name,
+            "sourcePath": source_path,
+            "storageState": storage_state,
+        },
+    )
 
 
 def normalize_cli_param_value(
@@ -1347,6 +1380,10 @@ def run_script_by_name_data(
         `ToolResponse`: 包含脚本执行结果的ToolResponse对象
     """
     manager = ScriptManager()
+    dataset_access_manifest = kwargs.pop("dataset_access_manifest", None)
+    actor_user_id = str(kwargs.pop("actor_user_id", "") or "").strip()
+    actor_is_normal_user = bool(kwargs.pop("actor_is_normal_user", False))
+    private_output_registration = None
 
     if list_only or script_query.lower() in ["列表", "list", "ls", "all"]:
         return ToolResponse(content=[
@@ -1493,6 +1530,73 @@ def run_script_by_name_data(
     # 更新命令行参数
     for cli_param, value in cli_params_to_update.items():
         cli_args[cli_param] = value
+
+    def prepare_private_output(source_path: str) -> Dict[str, str]:
+        """Name a private product only after its real authorized input is known."""
+        normalized_source_path = str(source_path or "").rstrip("/")
+        source_entry = None
+        if isinstance(dataset_access_manifest, (list, tuple)):
+            source_entry = next(
+                (
+                    item
+                    for item in dataset_access_manifest
+                    if isinstance(item, dict)
+                    and str(item.get("sourcePath") or "").rstrip("/") == normalized_source_path
+                ),
+                None,
+            )
+        output_type = str(cli_args.get("data_type") or "").lower()
+        if output_type in {"text", "pretrain"}:
+            output_type = "pt"
+        if output_type not in {"raw", "sft", "dpo", "pt"}:
+            output_type = "sft"
+            manifest_type = str((source_entry or {}).get("datasetType") or "").lower()
+            if manifest_type in {"raw", "sft", "dpo", "pt"}:
+                output_type = manifest_type
+        source_name = str((source_entry or {}).get("datasetName") or "").strip()
+        if not source_name:
+            source_name = posixpath.basename(normalized_source_path) or "dataset"
+        output_name = build_dataset_output_name(
+            source_name,
+            output_type,
+            filtered=script_name == "score_based_filtering",
+        )
+        cli_args["output_folder"] = (
+            f"/home/workspace/medflow/users/{actor_user_id}/datasets/{output_type}/{output_name}"
+        )
+        return {
+            "dataset_type": output_type,
+            "dataset_name": output_name,
+            "source_path": cli_args["output_folder"],
+        }
+
+    # All ordinary-user processing products are born private. The caller cannot
+    # redirect them back into a shared dataset root.
+    if actor_is_normal_user and script_name in {
+        "data_preprocessing", "score_based_filtering"
+    } and not actor_user_id:
+        return _data_error_response(
+            script_name,
+            "普通用户请求缺少 actor_user_id，无法确定私有输出目录，已阻止执行。",
+            error_reason="actor_user_id_required",
+            recoverable=False,
+        )
+    if actor_is_normal_user and actor_user_id and script_name in {
+        "data_preprocessing", "score_based_filtering"
+    }:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", actor_user_id):
+            return _data_error_response(
+                script_name,
+                "当前用户标识无法用于私有数据目录，已阻止执行。",
+                error_reason="invalid_actor_user_id",
+                recoverable=False,
+            )
+        # Preprocessing may still point at the shared root here; its exact input
+        # is chosen below from the access manifest, so defer naming until then.
+        if script_name == "score_based_filtering":
+            private_output_registration = prepare_private_output(
+                str(cli_args.get("input_folder") or "")
+            )
 
     def missing_required_response(
         required_params: List[str],
@@ -1732,10 +1836,33 @@ def run_script_by_name_data(
             selected_input_folder = ""
             input_source_kind = "explicit" if user_provided_input_folder else "default"
             if source_input_folder == "/home/workspace/dataset":
-                selected_input_folder = resolve_latest_dataset_subdir(
-                    docker_kwargs["docker_container"],
-                    "/home/workspace/dataset",
-                ) or ""
+                if dataset_access_manifest is not None and user_provided_input_folder:
+                    return _data_error_response(
+                        script_name,
+                        "显式 input_folder 必须是授权清单中的具体数据集目录，不能指定共享根目录。",
+                        error_reason="dataset_access_denied",
+                        recoverable=True,
+                    )
+                try:
+                    selected_input_folder = (
+                        latest_dataset_by_file_mtime(
+                            dataset_access_manifest,
+                            docker_kwargs["docker_container"],
+                            {"raw"},
+                        )
+                        if dataset_access_manifest is not None
+                        else resolve_latest_dataset_subdir(
+                            docker_kwargs["docker_container"],
+                            "/home/workspace/dataset",
+                        ) or ""
+                    )
+                except DatasetAccessError as exc:
+                    return _data_error_response(
+                        script_name,
+                        str(exc),
+                        error_reason="dataset_access_denied",
+                        recoverable=True,
+                    )
                 if not selected_input_folder:
                     return _data_error_response(
                         script_name,
@@ -1751,11 +1878,75 @@ def run_script_by_name_data(
                 args["input_folder"] = selected_input_folder
                 input_source_kind = "explicit_latest" if user_provided_input_folder else "default_latest"
 
+            if dataset_access_manifest is not None:
+                try:
+                    require_allowed_dataset_path(
+                        _resolve_container_path(str(cli_args.get("input_folder") or ""), relative_path_base),
+                        dataset_access_manifest,
+                        docker_kwargs["docker_container"],
+                    )
+                except DatasetAccessError as exc:
+                    return _data_error_response(
+                        script_name,
+                        str(exc),
+                        error_reason="dataset_access_denied",
+                        recoverable=False,
+                    )
+
+            if actor_is_normal_user and actor_user_id:
+                private_output_registration = prepare_private_output(
+                    _resolve_container_path(
+                        str(cli_args.get("input_folder") or ""),
+                        relative_path_base,
+                    )
+                )
+                args["output_folder"] = private_output_registration["source_path"]
+                run_kwargs["script_args"] = args
+
             preprocessing_diagnostics = {
                 "inputFolder": _resolve_container_path(str(cli_args.get("input_folder") or ""), relative_path_base),
                 "selectedInputFolder": selected_input_folder,
                 "sourceInputFolder": input_source_kind,
+                **(
+                    {"outputFolder": private_output_registration["source_path"]}
+                    if private_output_registration
+                    else {}
+                ),
             }
+
+        if script_name == "score_based_filtering" and dataset_access_manifest is not None:
+            relative_path_base = script_info.get("container_relative_path_base") or docker_kwargs.get("docker_working_dir")
+            try:
+                require_allowed_dataset_path(
+                    _resolve_container_path(str(cli_args.get("input_folder") or ""), relative_path_base),
+                    dataset_access_manifest,
+                    docker_kwargs["docker_container"],
+                )
+            except DatasetAccessError as exc:
+                return _data_error_response(
+                    script_name,
+                    str(exc),
+                    error_reason="dataset_access_denied",
+                    recoverable=False,
+                )
+
+        if actor_is_normal_user and actor_user_id and script_name in {
+            "data_preprocessing", "score_based_filtering"
+        }:
+            expected_output = str((private_output_registration or {}).get("source_path") or "")
+            private_root = f"/home/workspace/medflow/users/{actor_user_id}/datasets/"
+            if (
+                not expected_output.startswith(private_root)
+                or str(cli_args.get("output_folder") or "").rstrip("/") != expected_output
+            ):
+                return _data_error_response(
+                    script_name,
+                    "普通用户的数据处理产物未解析到本人私有目录，已阻止执行。",
+                    error_reason="private_output_path_required",
+                    recoverable=False,
+                )
+            args["output_folder"] = expected_output
+            run_kwargs["script_args"] = args
 
         dir_validation_error = validate_docker_dir_params(
             script_name=script_name,
@@ -1864,10 +2055,81 @@ def run_script_by_name_data(
                     "threshold": float(cli_args.get("threshold") or 90),
                     "outputDatasetName": filter_output_dataset_name,
                 }
-            return run_docker_in_background(**run_kwargs)
+            response = run_docker_in_background(**run_kwargs)
+            if private_output_registration and (response.metadata or {}).get("success", False):
+                try:
+                    registered = _register_runtime_dataset(
+                        actor_user_id,
+                        str(docker_kwargs["docker_container"]),
+                        **private_output_registration,
+                        storage_state="creating",
+                    )
+                    response.metadata = {
+                        **(response.metadata or {}),
+                        "registered_dataset": {
+                            **private_output_registration,
+                            "container": str(docker_kwargs["docker_container"]),
+                            "storage_state": "creating",
+                            "resource_id": registered.get("id") if isinstance(registered, dict) else None,
+                        },
+                    }
+                except Exception as exc:
+                    return _data_error_response(
+                        script_name,
+                        f"任务已启动，但私有数据集登记失败：{exc}",
+                        error_reason="dataset_registration_failed",
+                        recoverable=True,
+                    )
+            return response
         else:
             # 普通Docker执行
-            return run_local_script(**run_kwargs)
+            response = run_local_script(**run_kwargs)
+            if private_output_registration and (response.metadata or {}).get("success", True):
+                expected_output = str(private_output_registration.get("source_path") or "")
+                output_check = subprocess.run(
+                    [
+                        "docker",
+                        "exec",
+                        str(docker_kwargs["docker_container"]),
+                        "test",
+                        "-d",
+                        expected_output,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                if output_check.returncode != 0:
+                    return _data_error_response(
+                        script_name,
+                        f"数据处理脚本未在受控私有目录生成产物：{expected_output}。已禁止登记和后续使用。",
+                        error_reason="private_output_missing",
+                        recoverable=True,
+                    )
+                try:
+                    registered = _register_runtime_dataset(
+                        actor_user_id,
+                        str(docker_kwargs["docker_container"]),
+                        **private_output_registration,
+                        storage_state="ready",
+                    )
+                    response.metadata = {
+                        **(response.metadata or {}),
+                        "registered_dataset": {
+                            **private_output_registration,
+                            "container": str(docker_kwargs["docker_container"]),
+                            "storage_state": "ready",
+                            "resource_id": registered.get("id") if isinstance(registered, dict) else None,
+                        },
+                    }
+                except Exception as exc:
+                    return _data_error_response(
+                        script_name,
+                        f"数据处理完成，但私有数据集登记失败：{exc}",
+                        error_reason="dataset_registration_failed",
+                        recoverable=True,
+                    )
+            return response
 
     # 根据是否后台运行选择不同的执行方式
     if background:

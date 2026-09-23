@@ -26,6 +26,8 @@ type BridgeChatRequest = {
   resource_group_id?: string;
   training_pool_id?: string;
   user_role?: string;
+  actor_user_id?: string;
+  dataset_access_manifest?: Array<Record<string, unknown>>;
   ownerUserId?: string;
   owner_user_id?: string;
   ownerAliases?: string[];
@@ -140,6 +142,16 @@ function toRuntimeRequest(body: BridgeChatRequest) {
   const contextUsername = String(
     body.context_username || body.contextUsername || "",
   ).trim();
+  const actorUserId = String(body.actor_user_id || "").trim();
+  const datasetAccessManifest = Array.isArray(body.dataset_access_manifest)
+    ? body.dataset_access_manifest
+    : [];
+  // AgentScope's AgentRequest schema may discard custom top-level fields. Keep
+  // an encoded copy in the trusted system context as a transport fallback.
+  const datasetAccessManifestBase64 = Buffer.from(
+    JSON.stringify(datasetAccessManifest),
+    "utf8",
+  ).toString("base64url");
   const input =
     body.input && body.input.length > 0
       ? body.input
@@ -156,14 +168,14 @@ function toRuntimeRequest(body: BridgeChatRequest) {
           },
         ];
   const runtimeContextMessage: RuntimeMessage | null =
-    body.training_container || body.evaluation_container || body.grpo_container || body.multinode_training_container || body.resource_group_id || body.training_pool_id || body.user_role || ownerUserId || ownerAliasesText || contextUsername
+    body.training_container || body.evaluation_container || body.grpo_container || body.multinode_training_container || body.resource_group_id || body.training_pool_id || body.user_role || actorUserId || datasetAccessManifest.length > 0 || ownerUserId || ownerAliasesText || contextUsername
       ? {
           role: "system",
           type: "message",
           content: [
             {
               type: "text",
-              text: `${RUNTIME_CONTEXT_MARKER} training_container=${body.training_container || ""} evaluation_container=${body.evaluation_container || ""} grpo_container=${body.grpo_container || ""} multinode_training_container=${body.multinode_training_container || ""} resource_group_id=${body.resource_group_id || ""} training_pool_id=${body.training_pool_id || ""} user_role=${body.user_role || ""} owner_user_id=${ownerUserId} owner_aliases=${ownerAliasesText} context_username=${contextUsername}`,
+              text: `${RUNTIME_CONTEXT_MARKER} training_container=${body.training_container || ""} evaluation_container=${body.evaluation_container || ""} grpo_container=${body.grpo_container || ""} multinode_training_container=${body.multinode_training_container || ""} resource_group_id=${body.resource_group_id || ""} training_pool_id=${body.training_pool_id || ""} user_role=${body.user_role || ""} actor_user_id=${actorUserId} dataset_access_manifest_b64=${datasetAccessManifestBase64} owner_user_id=${ownerUserId} owner_aliases=${ownerAliasesText} context_username=${contextUsername}`,
             },
           ],
         }
@@ -183,6 +195,8 @@ function toRuntimeRequest(body: BridgeChatRequest) {
     resource_group_id: body.resource_group_id,
     training_pool_id: body.training_pool_id,
     user_role: body.user_role,
+    actor_user_id: actorUserId,
+    dataset_access_manifest: datasetAccessManifest,
     owner_user_id: ownerUserId,
     owner_aliases: ownerAliases,
     context_username: contextUsername,

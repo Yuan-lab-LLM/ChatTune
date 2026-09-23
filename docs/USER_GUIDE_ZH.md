@@ -79,6 +79,14 @@
 
 数据预处理默认直接使用最新日期的数据进行处理，若想使用较旧的数据集，可在左侧数据管理页签下选择想要的数据，并点击 `Preprocess with this` 按钮。
 
+### 个人数据与组内共享
+
+- `/home/workspace/dataset`、`/home/workspace/dataset_batch_train`、`/home/workspace/dataset_daily_train` 和 `/home/workspace/dataset_pretrain` 是用户组共享数据目录。数据卡片标记为“用户组已共享”时，同组用户可以查看和使用。
+- 管理员通过 Studio 上传的数据会直接进入对应共享目录；普通用户不能直接向共享目录发布数据。
+- 普通用户上传的数据和数据处理产物会保存在 `/home/workspace/medflow/users/<userId>/datasets/<type>/<datasetName>`，默认标记为“仅自己可见”；创建者可以立即用于后续处理或训练。
+- 如需让同组其他用户使用，在数据卡片上点击“申请共享”。审批期间卡片显示“等待管理员审批”；管理员在“用户管理 → 发布审批”中批准后，系统会将数据移入对应共享目录，其他组员刷新数据列表即可看到。
+- 审批前，其他用户即使知道私有路径，也不能通过显式路径或“自动选最新”绕过权限使用。
+
 ## 单机训练
 
 | 用途 | 自然语言示例 |

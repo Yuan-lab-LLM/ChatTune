@@ -26,6 +26,7 @@ from pydantic import BaseModel
 
 from resource_catalog import load_resource_catalog_config, resource_path_maps
 from utils.benchmark_status import (
+    latest_logged_benchmark_job_id,
     query_inference_benchmark_status,
     recover_benchmark_job_id,
     recover_benchmark_resource_context,
@@ -152,6 +153,7 @@ class ContainerRequest(BaseModel):
 class DatasetRequest(ContainerRequest):
     datasetType: str
     datasetName: str
+    datasetPath: str | None = None
 
 
 class DatasetFilterStatusRequest(ContainerRequest):
@@ -169,6 +171,11 @@ class ModelRequest(ContainerRequest):
 class UploadDatasetRequest(DatasetRequest):
     filename: str
     fileBase64: str
+    ownerUserId: str | None = None
+
+
+class DatasetMoveRequest(DatasetRequest):
+    ownerUserId: str
 
 
 class MedicalTestRequest(ContainerRequest):
@@ -248,6 +255,7 @@ class InferenceReservationStopServiceRequest(BaseModel):
     reservationId: str
     container: str | None = None
     resourceContext: dict[str, Any] | None = None
+    force: bool = False
 
 
 class EvaluationResultRequest(ContainerRequest):
@@ -395,9 +403,21 @@ def _maybe_refresh_workflow_benchmark_status(
     context: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     workflow_id = str(workflow.get("workflow_id") or "")
+    stage = stages.get("benchmark")
+    stage = stage if isinstance(stage, dict) else {}
+    recover_failed_start = False
     if (
-        workflow.get("status") != "running"
-        or workflow.get("current_stage") != "benchmark"
+        workflow.get("status") == "failed"
+        and workflow.get("current_stage") == "benchmark"
+        and stage.get("status") == "failed"
+        and str(workflow.get("error") or "").lower()
+        == f"{_workflow_benchmark_name(context)}基准评测失败".lower()
+    ):
+        latest_job_id = latest_logged_benchmark_job_id(stage)
+        recover_failed_start = bool(latest_job_id)
+    if (
+        workflow.get("current_stage") != "benchmark"
+        or (workflow.get("status") != "running" and not recover_failed_start)
     ):
         print(
             "[resource_api] workflow benchmark reconcile skipped: "
@@ -406,8 +426,7 @@ def _maybe_refresh_workflow_benchmark_status(
             flush=True,
         )
         return stages, workflow
-    stage = stages.get("benchmark")
-    if not isinstance(stage, dict) or stage.get("status") not in {"running", "timeout"}:
+    if stage.get("status") not in {"running", "timeout"} and not recover_failed_start:
         print(
             "[resource_api] workflow benchmark reconcile skipped: "
             f"workflow_id={workflow_id or '<unknown>'} benchmark_stage_status="
@@ -429,6 +448,8 @@ def _maybe_refresh_workflow_benchmark_status(
             f"workflow_id={workflow_id} error={exc}",
             flush=True,
         )
+        if recover_failed_start:
+            return stages, workflow
         stage["status"] = "timeout"
         stage["message"] = "本次状态查询超时，任务可能仍在运行，将继续自动刷新"
         stage["last_poll_error"] = str(exc)
@@ -479,11 +500,11 @@ def _maybe_refresh_workflow_benchmark_status(
 
     workflow["updated_at"] = datetime.now(timezone.utc).timestamp()
     with sqlite3.connect(db_path, timeout=30) as connection:
-        connection.execute(
+        updated = connection.execute(
             """
             UPDATE workflows
             SET status=?, stages_json=?, error=?, updated_at=?
-            WHERE workflow_id=?
+            WHERE workflow_id=? AND status=?
             """,
             (
                 workflow["status"],
@@ -491,8 +512,19 @@ def _maybe_refresh_workflow_benchmark_status(
                 workflow.get("error"),
                 workflow["updated_at"],
                 workflow["workflow_id"],
+                "failed" if recover_failed_start else "running",
             ),
         )
+        if updated.rowcount != 1:
+            current = connection.execute(
+                "SELECT status, stages_json, error, updated_at FROM workflows WHERE workflow_id=?",
+                (workflow_id,),
+            ).fetchone()
+            if current:
+                stages.clear()
+                stages.update(json.loads(current[1] or "{}"))
+                workflow.update(status=current[0], error=current[2], updated_at=current[3])
+            return stages, workflow
     if workflow["status"] == "finished":
         # resource_api writes terminal benchmark state directly to SQLite.
         # Enqueue a one-shot event so the Agent session can push the final
@@ -719,10 +751,57 @@ def _container(value: str | None) -> str:
     )
 
 
-def _dataset_path(dataset_type: str, dataset_name: str) -> str:
+PRIVATE_DATASET_ROOT = "/home/workspace/medflow/users"
+
+
+def _dataset_path(
+    dataset_type: str,
+    dataset_name: str,
+    owner_user_id: str | None = None,
+) -> str:
     if dataset_type not in DATASET_PATHS:
         raise HTTPException(400, "Invalid dataset type")
-    return f"{DATASET_PATHS[dataset_type]}/{_safe_name(dataset_name, 'dataset name')}"
+    name = _safe_name(dataset_name, "dataset name")
+    if owner_user_id:
+        owner = _safe_name(owner_user_id, "owner user id")
+        return f"{PRIVATE_DATASET_ROOT}/{owner}/datasets/{dataset_type}/{name}"
+    return f"{DATASET_PATHS[dataset_type]}/{name}"
+
+
+def _validated_dataset_path(request: DatasetRequest) -> str:
+    """Accept only the exact shared or per-user private path for this dataset."""
+    shared = _dataset_path(request.datasetType, request.datasetName)
+    if not request.datasetPath:
+        return shared
+    supplied = Path(request.datasetPath).as_posix().rstrip("/")
+    if supplied == shared:
+        return supplied
+    prefix = f"{PRIVATE_DATASET_ROOT}/"
+    suffix = f"/datasets/{request.datasetType}/{_safe_name(request.datasetName, 'dataset name')}"
+    if supplied.startswith(prefix) and supplied.endswith(suffix):
+        owner = supplied[len(prefix) : -len(suffix)]
+        if owner and "/" not in owner and supplied == _dataset_path(
+            request.datasetType, request.datasetName, owner
+        ):
+            return supplied
+    raise HTTPException(400, "Invalid dataset path")
+
+
+def _assert_dataset_realpath(container: str, dataset_path: str) -> None:
+    """Reject symlinks which resolve outside the approved physical roots."""
+    output = _docker(
+        container,
+        [
+            "sh",
+            "-c",
+            'test -d "$1" || exit 44; realpath -e "$1"',
+            "dataset-realpath",
+            dataset_path,
+        ],
+    ).stdout.strip()
+    allowed_roots = [*DATASET_PATHS.values(), PRIVATE_DATASET_ROOT]
+    if not any(output == root or output.startswith(f"{root}/") for root in allowed_roots):
+        raise HTTPException(403, "Dataset path escapes its storage root")
 
 
 def _evaluation_result_path(folder_path: str, filename: str) -> tuple[str, str]:
@@ -748,7 +827,7 @@ def _filter_status_folder(request: DatasetFilterStatusRequest) -> str:
     if not any(
         normalized == prefix.rstrip("/")
         or normalized.startswith(f"{prefix.rstrip('/')}/")
-        for prefix in DATASET_PATHS.values()
+        for prefix in [*DATASET_PATHS.values(), PRIVATE_DATASET_ROOT]
     ):
         raise HTTPException(400, "Filter status folder must be under a dataset root")
     return normalized
@@ -947,6 +1026,48 @@ def _datasets(container: str) -> dict[str, list[dict[str, Any]]]:
             entry["filePreviews"] = []
             visible_entries.append(entry)
         result[kind] = visible_entries
+    private_script = (
+        'root="$1"; [ -d "$root" ] || exit 0; '
+        'for dir in "$root"/*/datasets/*/*; do '
+        '[ -d "$dir" ] || continue; '
+        'rel=${dir#"$root"/}; owner=${rel%%/*}; rest=${rel#*/datasets/}; '
+        'kind=${rest%%/*}; name=${rest#*/}; '
+        'mtime=$(date -r "$dir" -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo ""); '
+        'size=$(du -sh "$dir" 2>/dev/null | awk "{print \\$1}"); '
+        'printf "%s\\t%s\\t%s\\t%s\\t%s\\n" "$owner" "$kind" "$name" "$mtime" "$size"; '
+        'done'
+    )
+    private_output = _docker(
+        container,
+        ["sh", "-c", private_script, "private-dataset-list", PRIVATE_DATASET_ROOT],
+    ).stdout
+    for line in private_output.splitlines():
+        owner, kind, name, created_at, size = (line.split("\t") + [""] * 5)[:5]
+        if kind not in DATASET_PATHS or not SAFE_NAME.fullmatch(owner) or not SAFE_NAME.fullmatch(name):
+            continue
+        dataset_path = _dataset_path(kind, name, owner)
+        files = _docker(
+            container,
+            [
+                "sh", "-c",
+                'find "$1" -maxdepth 1 -type f -printf "%f\\n" 2>/dev/null',
+                "private-files", dataset_path,
+            ],
+        ).stdout.splitlines()
+        data_files = [filename for filename in files if _is_dataset_data_file(filename, kind)]
+        if not data_files:
+            continue
+        result[kind].append({
+            "name": name,
+            "type": kind,
+            "path": str(Path(dataset_path).parent).replace("\\", "/"),
+            "sourcePath": dataset_path,
+            "ownerUserId": owner,
+            "createdAt": created_at,
+            "size": size,
+            "files": data_files,
+            "filePreviews": [],
+        })
     return result
 
 
@@ -2260,6 +2381,7 @@ def _stop_inference_service(request: InferenceReservationStopServiceRequest) -> 
         "user_id": "resource-reservation-admin",
         "user_role": "admin",
         "thread_id": f"reservation:{request.reservationId}:inference-stop",
+        "force": bool(request.force),
     }
     if isinstance(request.resourceContext, dict) and request.resourceContext:
         payload["resource_context"] = request.resourceContext
@@ -2584,7 +2706,8 @@ def environment_check(container: str | None = None):
 @router.post("/datasets/previews", dependencies=[Depends(_authorize)])
 def dataset_previews(request: DatasetRequest):
     target = _container(request.container)
-    dataset_path = _dataset_path(request.datasetType, request.datasetName)
+    dataset_path = _validated_dataset_path(request)
+    _assert_dataset_realpath(target, dataset_path)
     script = r"""
 import json
 import os
@@ -2683,16 +2806,17 @@ print(json.dumps(result, ensure_ascii=False))
 def download_dataset(request: DatasetRequest):
     target = _container(request.container)
     dataset_name = _safe_name(request.datasetName, "dataset name")
-    dataset_path = _dataset_path(request.datasetType, dataset_name)
+    dataset_path = _validated_dataset_path(request)
     exists = _docker(
         target,
         ["sh", "-c", 'test -d "$1" && echo yes || echo no', "exists", dataset_path],
     ).stdout.strip()
     if exists != "yes":
         raise HTTPException(404, f'Dataset "{dataset_name}" not found')
+    _assert_dataset_realpath(target, dataset_path)
     payload = _docker_bytes(
         target,
-        ["tar", "-C", DATASET_PATHS[request.datasetType], "-czf", "-", dataset_name],
+        ["tar", "-C", str(Path(dataset_path).parent).replace("\\", "/"), "-czf", "-", dataset_name],
         timeout=180,
     )
     return _response(_file_base64_response(f"{dataset_name}.tar.gz", payload))
@@ -2704,11 +2828,52 @@ def delete_dataset(request: DatasetRequest):
     if kind not in DATASET_PATHS:
         raise HTTPException(400, "Invalid dataset type")
     name = _safe_name(request.datasetName, "dataset name")
-    _docker(
-        _container(request.container),
-        ["rm", "-rf", "--", f"{DATASET_PATHS[kind]}/{name}"],
-    )
+    target = _container(request.container)
+    dataset_path = _validated_dataset_path(request)
+    _assert_dataset_realpath(target, dataset_path)
+    _docker(target, ["rm", "-rf", "--", dataset_path])
     return _response({"success": True})
+
+
+def _move_dataset(request: DatasetMoveRequest, publish: bool) -> dict[str, Any]:
+    target = _container(request.container)
+    private_path = _dataset_path(request.datasetType, request.datasetName, request.ownerUserId)
+    shared_path = _dataset_path(request.datasetType, request.datasetName)
+    expected_source = private_path if publish else shared_path
+    destination = shared_path if publish else private_path
+    if request.datasetPath and Path(request.datasetPath).as_posix().rstrip("/") != expected_source:
+        raise HTTPException(409, "Dataset source path changed")
+    _assert_dataset_realpath(target, expected_source)
+    script = (
+        'src="$1"; dst="$2"; parent=$(dirname "$dst"); '
+        '[ -d "$src" ] || { echo source_missing; exit 44; }; '
+        '[ ! -e "$dst" ] || { echo destination_exists; exit 45; }; '
+        'mkdir -p "$parent"; mv -- "$src" "$dst"'
+    )
+    try:
+        _docker(
+            target,
+            ["sh", "-c", script, "dataset-move", expected_source, destination],
+            timeout=180,
+        )
+    except HTTPException as exc:
+        detail = str(exc.detail)
+        if "destination_exists" in detail:
+            raise HTTPException(409, "Dataset with the same type and name already exists") from exc
+        if "source_missing" in detail:
+            raise HTTPException(404, "Dataset source does not exist") from exc
+        raise
+    return _response({"success": True, "sourcePath": expected_source, "targetPath": destination})
+
+
+@router.post("/datasets/publish", dependencies=[Depends(_authorize)])
+def publish_dataset(request: DatasetMoveRequest):
+    return _move_dataset(request, True)
+
+
+@router.post("/datasets/quarantine", dependencies=[Depends(_authorize)])
+def quarantine_dataset(request: DatasetMoveRequest):
+    return _move_dataset(request, False)
 
 
 @router.delete("/models", dependencies=[Depends(_authorize)])
@@ -2834,17 +2999,28 @@ def upload_dataset(request: UploadDatasetRequest):
             extract_dir,
             request.datasetType,
         )
-        _docker(target, ["mkdir", "-p", f"{DATASET_PATHS[request.datasetType]}/{name}"])
+        destination = _dataset_path(request.datasetType, name, request.ownerUserId)
+        exists = _docker(
+            target,
+            ["sh", "-c", 'test -e "$1" && echo yes || echo no', "upload-exists", destination],
+        ).stdout.strip()
+        if exists == "yes":
+            raise HTTPException(409, f'Dataset "{name}" already exists')
+        _docker(target, ["mkdir", "-p", destination])
         _run(
             [
                 "docker",
                 "cp",
                 f"{content_root}/.",
-                f"{target}:{DATASET_PATHS[request.datasetType]}/{name}",
+                f"{target}:{destination}",
             ],
             timeout=60,
         )
-    return _response({"success": True})
+    return _response({
+        "success": True,
+        "sourcePath": destination,
+        "ownerUserId": request.ownerUserId,
+    })
 
 
 @router.post("/medical-tests/upload", dependencies=[Depends(_authorize)])

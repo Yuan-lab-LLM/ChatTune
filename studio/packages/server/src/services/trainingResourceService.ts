@@ -1183,7 +1183,7 @@ export class TrainingResourceService {
             'inference-reservations/stop-service',
             {
                 method: 'POST',
-                body: JSON.stringify({ reservationId: reservation.id, resourceContext }),
+                body: JSON.stringify({ reservationId: reservation.id, resourceContext, force: true }),
             },
             undefined,
             Math.max(1000, Number(process.env.MEDFLOW_RESOURCE_STOP_PROCESS_TIMEOUT_MS || 60000)),

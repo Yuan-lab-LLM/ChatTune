@@ -43,6 +43,7 @@ import {
 } from "../services/resourceNodeService";
 import { AuthDao, SafeAuthUser } from "../dao/Auth";
 import { UserRole } from "../models/Auth";
+import { DatasetStorageState, ResourceVisibility } from "../models/ResourceAccess";
 import { ChatSessionDao } from "../dao/ChatSession";
 import { ResourceAccessService } from "../services/resourceAccessService";
 import { ResourceCatalogConfigService } from "../services/resourceCatalogConfigService";
@@ -675,7 +676,13 @@ const sanitizeResourceItemsForUser = <T extends object>(
         nodeName: item.nodeName,
         containerName: item.containerName,
         canDelete: item.canDelete === true,
-        available: true,
+        resourceId: item.resourceId,
+        ownerUserId: item.ownerUserId,
+        visibility: item.visibility,
+        publicationStatus: item.publicationStatus,
+        storageState: item.storageState,
+        sourcePath: item.sourcePath,
+        available: item.storageState === "ready",
       };
     }
     if (bizType === "model") {
@@ -1778,6 +1785,81 @@ export const appRouter = t.router({
       };
     }),
 
+  registerDatasetForRuntime: runtimeNodeProcedure
+    .input(z.object({
+      runtimeNodeId: z.string().min(1),
+      actorUserId: z.string().min(1),
+      container: z.string().min(1),
+      datasetType: z.enum(["raw", "sft", "dpo", "pt"]),
+      datasetName: z.string().regex(/^[A-Za-z0-9_.-]+$/),
+      sourcePath: z.string().min(1),
+      storageState: z.enum(["creating", "ready", "moving", "error"]),
+    }))
+    .mutation(async ({ ctx, input }) => {
+      assertRuntimeNodeAuthorized(ctx, input.runtimeNodeId);
+      const actor = await AuthDao.getUserById(input.actorUserId);
+      if (!actor || actor.role !== UserRole.USER || actor.assignedNodeId !== input.runtimeNodeId ||
+          actor.group?.defaultContainerName !== input.container) {
+        throw new TRPCError({ code: "FORBIDDEN", message: "Runtime dataset owner context is invalid" });
+      }
+      const expectedPath = `/home/workspace/medflow/users/${actor.id}/datasets/${input.datasetType}/${input.datasetName}`;
+      if (input.sourcePath !== expectedPath) {
+        throw new TRPCError({ code: "BAD_REQUEST", message: "Runtime dataset path is not the actor private path" });
+      }
+      const resource = await ResourceAccessService.recordResourceWrite(
+        actor,
+        "dataset",
+        input.runtimeNodeId,
+        input.container,
+        `${input.datasetType}:${input.datasetName}`,
+        {
+          sourcePath: input.sourcePath,
+          storageState: input.storageState as DatasetStorageState,
+        },
+      );
+      return { success: true, message: "Runtime dataset registered", data: resource };
+    }),
+
+  resolveDatasetForRuntime: runtimeNodeProcedure
+    .input(z.object({
+      runtimeNodeId: z.string().min(1),
+      actorUserId: z.string().min(1),
+      container: z.string().min(1),
+      resourceId: z.string().min(1),
+    }))
+    .mutation(async ({ ctx, input }) => {
+      assertRuntimeNodeAuthorized(ctx, input.runtimeNodeId);
+      const actor = await AuthDao.getUserById(input.actorUserId);
+      if (!actor) {
+        throw new TRPCError({ code: "FORBIDDEN", message: "Runtime dataset actor is invalid" });
+      }
+      const resource = await ResourceAccessService.resolveDatasetResource(
+        actor,
+        input.runtimeNodeId,
+        input.container,
+        { resourceId: input.resourceId },
+      );
+      if (actor.role === UserRole.ADMIN && resource.visibility !== ResourceVisibility.PUBLIC) {
+        throw new TRPCError({ code: "FORBIDDEN", message: "Administrators may execute only published datasets" });
+      }
+      const [datasetType, ...nameParts] = resource.itemKey.split(":");
+      return {
+        success: true,
+        message: "Runtime dataset resolved",
+        data: {
+          resourceId: resource.id,
+          datasetType,
+          datasetName: nameParts.join(":"),
+          sourcePath: resource.sourcePath,
+          ownerUserId: resource.ownerUserId || null,
+          visibility: resource.visibility,
+          storageState: resource.storageState,
+          nodeId: resource.nodeId,
+          containerName: resource.containerName,
+        },
+      };
+    }),
+
   createResourceGroup: adminProcedure
     .input(z.object({
       name: z.string().trim().min(1).max(64),
@@ -2782,6 +2864,31 @@ export const appRouter = t.router({
           30_000,
         );
         const data = response.data;
+        const user = ctx.user as SafeAuthUser;
+        const statusValue = String(
+          (data.data as Record<string, unknown> | undefined)?.status || data.status || "",
+        ).toLowerCase();
+        const progressValue = Number(
+          (data.data as Record<string, unknown> | undefined)?.progress ?? data.progress ?? 0,
+        );
+        const outputMatch = input.outputFolder?.match(
+          /^\/home\/workspace\/medflow\/users\/([^/]+)\/datasets\/(raw|sft|dpo|pt)\/([A-Za-z0-9_.-]+)\/?$/,
+        );
+        const completed = ["finished", "completed", "done", "success"].includes(statusValue) || progressValue >= 100;
+        const failed = ["failed", "error", "cancelled", "canceled"].includes(statusValue);
+        if (user.role === UserRole.USER && outputMatch?.[1] === user.id && (completed || failed)) {
+          await ResourceAccessService.recordResourceWrite(
+            user,
+            "dataset",
+            targetNodeId,
+            resolvedContainer,
+            `${outputMatch[2]}:${outputMatch[3]}`,
+            {
+              sourcePath: input.outputFolder,
+              storageState: completed ? DatasetStorageState.READY : DatasetStorageState.ERROR,
+            },
+          );
+        }
 
         return {
           success: true,
@@ -2974,6 +3081,7 @@ export const appRouter = t.router({
           ),
         datasetType: z.enum(["raw", "sft", "dpo", "pt"]),
         datasetName: z.string(),
+        resourceId: z.string().trim().optional(),
         nodeId: resourceNodeIdSchema,
       }),
     )
@@ -2988,11 +3096,11 @@ export const appRouter = t.router({
         user,
         input.nodeId,
       );
-      await ResourceAccessService.assertResourceAccess(
+      const resource = await ResourceAccessService.resolveDatasetResource(
         user,
-        "dataset",
+        targetNodeId,
         container,
-        `${input.datasetType}:${input.datasetName}`,
+        input,
       );
       try {
         const response = await remoteResourceClient.request<{
@@ -3006,6 +3114,7 @@ export const appRouter = t.router({
               container,
               datasetType: input.datasetType,
               datasetName: input.datasetName,
+              datasetPath: resource.sourcePath,
             }),
           },
         );
@@ -3372,10 +3481,15 @@ export const appRouter = t.router({
           true,
         );
         const response = await remoteResourceClient.request<{
-          data: { success: boolean; message?: string; warning?: string };
+          data: { success: boolean; message?: string; warning?: string; sourcePath?: string };
         }>(targetNodeId, "datasets/upload", {
           method: "POST",
-          body: JSON.stringify({ ...input, nodeId: targetNodeId, container }),
+          body: JSON.stringify({
+            ...input,
+            nodeId: targetNodeId,
+            container,
+            ownerUserId: user.role === UserRole.USER ? user.id : undefined,
+          }),
         });
         const result = response.data;
         if (result.success) {
@@ -3385,6 +3499,10 @@ export const appRouter = t.router({
             targetNodeId,
             container,
             `${input.datasetType}:${input.datasetName}`,
+            {
+              sourcePath: result.sourcePath,
+              storageState: DatasetStorageState.READY,
+            },
           );
           try {
             await managementCacheService.refreshDatasets(
@@ -3428,6 +3546,7 @@ export const appRouter = t.router({
         container: z.string(),
         datasetType: z.enum(["raw", "sft", "dpo", "pt"]),
         datasetName: z.string(),
+        resourceId: z.string().trim().optional(),
       }),
     )
     .mutation(async ({ ctx, input }) => {
@@ -3441,11 +3560,11 @@ export const appRouter = t.router({
         user,
         input.nodeId,
       );
-      await ResourceAccessService.assertResourceAccess(
+      const resource = await ResourceAccessService.resolveDatasetResource(
         user,
-        "dataset",
+        targetNodeId,
         container,
-        `${input.datasetType}:${input.datasetName}`,
+        input,
       );
       try {
         const response = await remoteResourceClient.request<{
@@ -3459,6 +3578,7 @@ export const appRouter = t.router({
               container,
               datasetType: input.datasetType,
               datasetName: input.datasetName,
+              datasetPath: resource.sourcePath,
             }),
           },
         );
@@ -3500,6 +3620,7 @@ export const appRouter = t.router({
           ),
         datasetType: z.enum(["raw", "sft", "dpo", "pt"]),
         datasetName: z.string(),
+        resourceId: z.string().trim().optional(),
       }),
     )
     .mutation(async ({ ctx, input }) => {
@@ -3515,27 +3636,28 @@ export const appRouter = t.router({
         if (targetNodeId === "all") {
           throw new Error("请选择具体节点后再删除数据集");
         }
-        await ResourceAccessService.assertResourceWriteAccess(
+        const resource = await ResourceAccessService.resolveDatasetResource(
           user,
-          "dataset",
+          targetNodeId,
           container,
-          `${input.datasetType}:${input.datasetName}`,
+          input,
+          true,
+          false,
         );
         const response = await remoteResourceClient.request<{
           data: { success: boolean; message?: string };
         }>(targetNodeId, "datasets", {
           method: "DELETE",
-          body: JSON.stringify({ ...input, nodeId: targetNodeId, container }),
+          body: JSON.stringify({
+            ...input,
+            nodeId: targetNodeId,
+            container,
+            datasetPath: resource.sourcePath,
+          }),
         });
         const result = response.data;
         if (result.success) {
-          await ResourceAccessService.removeResourceRecord(
-            "dataset",
-            targetNodeId,
-            container,
-            `${input.datasetType}:${input.datasetName}`,
-            user.id,
-          );
+          await ResourceAccessService.removeResourceRecordById(resource.id, user.id);
         }
 
         return {

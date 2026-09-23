@@ -189,6 +189,7 @@ class InferenceRequest(BaseModel):
     thread_id: Optional[str] = None
     include_trace: bool = False
     resource_context: Optional[dict[str, Any]] = None
+    force: bool = False
 
 class ToolInvokeRequest(BaseModel):
     tool: str
@@ -972,6 +973,18 @@ def pretty_print_cli_message(message: AnyMessage) -> None:
 def controller_response_data(data: Optional[dict]) -> dict:
     return compact_response_data(data)
 
+
+def response_data_for_api(state: Optional[dict]) -> dict:
+    """Keep structured tool data when a graph state uses a legacy envelope."""
+    if not isinstance(state, dict):
+        return {}
+    response_data = state.get("response_data")
+    if isinstance(response_data, dict) and response_data:
+        return controller_response_data(response_data)
+    # Older graph/tool integrations may put structured fields directly on the
+    # state. compact_response_data only keeps the documented response fields.
+    return controller_response_data(state)
+
 def build_tool_api_response(
     status: str,
     result: str,
@@ -1614,9 +1627,18 @@ def run_service_agent(
             final_answer = content
             break
 
+    response_data = response_data_for_api(result)
+    if not response_data and normalized_command_key(command) in {
+        "启动推理服务",
+        "重启推理服务",
+    }:
+        print(
+            "[inference-data] structured service_start data missing at API boundary",
+            flush=True,
+        )
     response = {
         "result": final_answer,
-        "data": controller_response_data(result.get("response_data")),
+        "data": response_data,
     }
     if include_trace:
         response["usage"] = build_usage(turn_messages)
@@ -1834,7 +1856,7 @@ def run_inference_agent(req: InferenceRequest):
         thread_token = set_current_request_thread_id(thread_id)
         resource_token = set_current_request_resource_context(req.resource_context)
         try:
-            stop_result = service_stop_by_reservation_result()
+            stop_result = service_stop_by_reservation_result(force=req.force)
         finally:
             reset_current_request_resource_context(resource_token)
             reset_current_request_thread_id(thread_token)

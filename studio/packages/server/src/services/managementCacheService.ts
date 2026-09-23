@@ -16,9 +16,12 @@ import {
   resourceNodeRegistry,
 } from "./resourceNodeService";
 import {
+  DatasetStorageState,
+  ResourceAuditEventTable,
   ResourceCatalogTable,
   ResourceShareScopeTable,
   ResourceVisibility,
+  UserGroupMemberTable,
 } from "../models/ResourceAccess";
 
 type CachePayloadMap = {
@@ -43,7 +46,14 @@ export class ManagementCacheService {
     nodeId: string,
     containerName: string,
   ): Promise<ManagementCacheResponse<DatasetInfo>> {
-    return this.getSnapshotOrBootstrap("dataset", nodeId, containerName);
+    const snapshot = await this.getSnapshotOrBootstrap("dataset", nodeId, containerName);
+    // Older cache snapshots may predate the resource catalog. Reconcile them on
+    // every read so a dataset returned to the UI is immediately eligible for
+    // the exact same catalog-based permission checks used by Runtime.
+    if (snapshot.items.length > 0) {
+      await this.persistItems("dataset", nodeId, containerName, snapshot.items);
+    }
+    return snapshot;
   }
 
   async refreshDatasets(
@@ -374,7 +384,13 @@ export class ManagementCacheService {
     const records = items.map((item) => {
       const itemKey = this.getItemKey(bizType, item);
       return ManagementCacheTable.create({
-        id: createId(bizType, nodeId, containerName, itemKey),
+        id: createId(
+          bizType,
+          nodeId,
+          containerName,
+          itemKey,
+          this.getSourcePath(bizType, item) || "no-path",
+        ),
         bizType,
         nodeId,
         containerName,
@@ -387,18 +403,20 @@ export class ManagementCacheService {
     if (records.length > 0) {
       await ManagementCacheTable.save(records);
       for (const record of records) {
-        const existing = await ResourceCatalogTable.findOne({
-          where: {
-            bizType,
-            nodeId,
-            containerName,
-            itemKey: record.itemKey,
-          },
-        });
+        const existing = record.sourcePath
+          ? await ResourceCatalogTable.findOne({
+              where: { bizType, nodeId, containerName, sourcePath: record.sourcePath },
+            })
+          : await ResourceCatalogTable.findOne({
+              where: { bizType, nodeId, containerName, itemKey: record.itemKey },
+            });
         if (!existing) {
           const privateOwnerMatch = record.sourcePath?.match(
             /\/medflow\/users\/([^/]+)\//,
           );
+          const privateMembership = privateOwnerMatch
+            ? await UserGroupMemberTable.findOne({ where: { userId: privateOwnerMatch[1] } })
+            : null;
           const created = await ResourceCatalogTable.create({
             id: record.id,
             bizType,
@@ -409,10 +427,26 @@ export class ManagementCacheService {
               ? ResourceVisibility.PRIVATE
               : ResourceVisibility.PUBLIC,
             ownerUserId: privateOwnerMatch?.[1] || null,
-            groupId: null,
+            groupId: privateMembership?.groupId || null,
+            storageState: DatasetStorageState.READY,
             sourcePath: record.sourcePath,
             payload: record.payload,
           }).save();
+          if (bizType === "dataset" && !privateOwnerMatch) {
+            await ResourceAuditEventTable.create({
+              id: createId("audit", record.id, String(Date.now())),
+              eventType: "historical_shared_dataset_discovered",
+              resourceId: created.id,
+              actorUserId: null,
+              details: {
+                nodeId,
+                containerName,
+                itemKey: record.itemKey,
+                sourcePath: record.sourcePath || null,
+                warning: "No prior catalog ownership record; kept as shared dataset",
+              },
+            }).save();
+          }
           if (created.sourcePath) {
             const sharedReplicas = await ResourceCatalogTable.createQueryBuilder("resource")
               .where("resource.bizType = :bizType", { bizType })
@@ -473,6 +507,8 @@ export class ManagementCacheService {
           name: dataset.name,
           type: dataset.type || type,
           path: dataset.path,
+          sourcePath: dataset.sourcePath,
+          ownerUserId: dataset.ownerUserId,
           description: dataset.description,
           files: dataset.files,
           filePreviews: dataset.filePreviews,
@@ -537,7 +573,8 @@ export class ManagementCacheService {
   ): string | undefined {
     switch (bizType) {
       case "dataset":
-        return `${(item as DatasetInfo).path || ""}/${(item as DatasetInfo).name}`;
+        return (item as DatasetInfo).sourcePath ||
+          `${(item as DatasetInfo).path || ""}/${(item as DatasetInfo).name}`;
       case "model":
         return `${(item as ModelInfo).path || ""}/${(item as ModelInfo).name}`;
       case "evaluationResult":

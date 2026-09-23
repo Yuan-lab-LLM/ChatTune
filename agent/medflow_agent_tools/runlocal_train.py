@@ -28,6 +28,11 @@ from agentscope.tool import ToolResponse
 
 logger = logging.getLogger(__name__)
 from ._config_defaults import get_default_docker_container
+from .dataset_access import (
+    DatasetAccessError,
+    latest_dataset_by_name,
+    require_allowed_dataset_path,
+)
 from agentscope.message import TextBlock
 from ._train_monitor_helpers import (
     build_background_shell_command,
@@ -2438,11 +2443,22 @@ def _list_dataset_candidates_in_container(container: str, dataset_dir: str) -> L
     except Exception:
         return []
 
-def _choose_dataset_name(candidates: List[str]) -> Optional[str]:
-    if not candidates:
+def _choose_dataset_name(
+    candidates: List[str],
+    requested: Optional[str] = None,
+) -> Optional[str]:
+    normalized_candidates = [
+        str(candidate).strip()
+        for candidate in candidates
+        if str(candidate).strip()
+    ]
+    requested_name = str(requested or "").strip()
+    if requested_name and requested_name in normalized_candidates:
+        return requested_name
+    if not normalized_candidates:
         return None
-    if len(candidates) == 1:
-        return candidates[0]
+    if len(normalized_candidates) == 1:
+        return normalized_candidates[0]
 
     def score(name: str) -> int:
         lower = name.lower()
@@ -2461,7 +2477,7 @@ def _choose_dataset_name(candidates: List[str]) -> Optional[str]:
             value -= 100
         return value
 
-    ranked = sorted(((score(name), name) for name in candidates), reverse=True)
+    ranked = sorted(((score(name), name) for name in normalized_candidates), reverse=True)
     top_score, top_name = ranked[0]
     second_score = ranked[1][0] if len(ranked) > 1 else -10**9
     if top_score >= 50 and top_score > second_score:
@@ -2470,22 +2486,23 @@ def _choose_dataset_name(candidates: List[str]) -> Optional[str]:
 
 
 def _normalize_dpo_cli_args(script_name: str, cli_args: Dict[str, str], container: str) -> None:
-    """把 dpo_train_launcher 中误作为 dataset_name 的日期改成 dataset_dir 子目录。"""
+    """Resolve DPO dataset_name from dataset_info.json, never from the outer directory."""
     if script_name not in {"dpo_train_launcher", MULTINODE_DPO_SCRIPT}:
         return
     dataset_dir_key = "dataset-dir" if "dataset-dir" in cli_args else "dataset_dir"
     dataset_name_key = "dataset-name" if "dataset-name" in cli_args else ("dataset" if "dataset" in cli_args else "dataset_name")
     dataset_dir = str(cli_args.get(dataset_dir_key, "")).strip().rstrip("/")
     dataset_name = str(cli_args.get(dataset_name_key, "")).strip()
-    if not dataset_dir or not re.fullmatch(r"20\d{6}", dataset_name):
+    if not dataset_dir:
         return
 
-    if not dataset_dir.endswith(f"/{dataset_name}"):
+    if re.fullmatch(r"20\d{6}", dataset_name) and not dataset_dir.endswith(f"/{dataset_name}"):
         dataset_dir = f"{dataset_dir}/{dataset_name}"
         cli_args[dataset_dir_key] = dataset_dir
 
     inferred_dataset_name = _choose_dataset_name(
         _list_dataset_candidates_in_container(container, dataset_dir),
+        requested=dataset_name,
     )
     if inferred_dataset_name:
         cli_args[dataset_name_key] = inferred_dataset_name
@@ -3321,6 +3338,8 @@ def run_script_by_name_train(
     Returns:
         `ToolResponse`: 包含脚本执行结果的ToolResponse对象
     """
+    dataset_access_manifest = kwargs.pop("dataset_access_manifest", None)
+    kwargs.pop("actor_user_id", None)
     manager = ScriptManager()
     
     if list_only or script_query.lower() in ["列表", "list", "ls", "all"]:
@@ -3628,6 +3647,80 @@ def run_script_by_name_train(
         )
     _normalize_dpo_cli_args(script_name, cli_args, normalize_container)
     _normalize_multinode_cli_args(script_name, cli_args)
+
+    if dataset_access_manifest is not None:
+        try:
+            dataset_path = ""
+            dataset_types: set[str] = set()
+            target_param = ""
+            target_kind = ""
+            if script_name in BATCH_TRAIN_SCRIPT_NAMES:
+                dataset_types = {"pt"} if script_name in PRETRAIN_SCRIPT_NAMES else {"sft"}
+                dataset_path = str(
+                    params_to_update.get("DATASET_DIR")
+                    or (env_vars or {}).get("DATASET_DIR")
+                    or ""
+                ).strip().rstrip("/")
+                target_param, target_kind = "DATASET_DIR", "env"
+            elif script_name in {MULTINODE_SFT_SCRIPT, MULTINODE_SFT_FULL_SCRIPT}:
+                dataset_types = {"sft"}
+                dataset_path = str(_cli_arg_value(cli_args, "dataset-dir", "dataset_dir") or "").strip().rstrip("/")
+                target_param, target_kind = "dataset-dir", "cli"
+            elif script_name in {"dpo_train_launcher", MULTINODE_DPO_SCRIPT}:
+                dataset_types = {"dpo"}
+                dataset_path = str(_cli_arg_value(cli_args, "dataset_dir", "dataset-dir") or "").strip().rstrip("/")
+                target_param = "dataset-dir" if script_name == MULTINODE_DPO_SCRIPT else "dataset_dir"
+                target_kind = "cli"
+
+            if target_param:
+                shared_roots = {
+                    "/home/workspace/dataset_batch_train",
+                    "/home/workspace/dataset_daily_train",
+                    "/home/workspace/dataset_pretrain",
+                }
+                explicitly_supplied = (
+                    target_param in params_to_update or target_param in (env_vars or {})
+                    if target_kind == "env"
+                    else target_param in cli_params_to_update or target_param.replace("-", "_") in cli_params_to_update
+                )
+                if dataset_path in shared_roots and explicitly_supplied:
+                    raise DatasetAccessError(
+                        "显式数据集路径必须指向授权清单中的具体目录，不能指定共享数据根目录"
+                    )
+                if not dataset_path or dataset_path in shared_roots:
+                    dataset_path = latest_dataset_by_name(
+                        dataset_access_manifest,
+                        normalize_container,
+                        dataset_types,
+                    )
+                require_allowed_dataset_path(
+                    dataset_path,
+                    dataset_access_manifest,
+                    normalize_container,
+                    dataset_types,
+                )
+                if target_kind == "env":
+                    params_to_update[target_param] = dataset_path
+                else:
+                    cli_args[target_param] = dataset_path
+                if script_name in {"dpo_train_launcher", MULTINODE_DPO_SCRIPT}:
+                    name_param = "dataset-name" if script_name == MULTINODE_DPO_SCRIPT else "dataset_name"
+                    requested_name = str(
+                        _cli_arg_value(cli_args, name_param, name_param.replace("-", "_")) or ""
+                    ).strip()
+                    inferred_name = _choose_dataset_name(
+                        _list_dataset_candidates_in_container(normalize_container, dataset_path),
+                        requested=requested_name,
+                    )
+                    if inferred_name:
+                        cli_args[name_param] = inferred_name
+        except DatasetAccessError as exc:
+            return _train_error_response(
+                script_name,
+                str(exc),
+                error_reason="dataset_access_denied",
+                recoverable=False,
+            )
 
     resolution_env = {**(env_vars or {}), **params_to_update}
     descriptor_issue = _descriptor_required_param_issue(

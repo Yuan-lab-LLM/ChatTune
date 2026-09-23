@@ -17,7 +17,7 @@
 | 资源 | 链接 | 备注 |
 | --- | --- | --- |
 | 训练镜像 | https://pan.quark.cn/s/040388acdd9a | 提取码：m9YH |
-| 评测/推理镜像 | https://pan.quark.cn/s/7ef603e26e50 | 提取码：SH8t |
+| 评测/推理镜像 | https://pan.quark.cn/s/e4fe2f83f9c7 | 提取码：QLw7 |
 | GRPO/verl 镜像 | https://pan.quark.cn/s/c6ad41207360 | 提取码：vJJx |
 | 基础模型资源 | https://modelscope.cn/models/MedFlow/Qingnang-32B-0630/ | Qingnang-32B-0630 基础模型 |
 | 评测 Benchmark 数据 | https://pan.quark.cn/s/5ba6589d7933 | 提取码：b8Pp |
@@ -68,6 +68,7 @@
 │   ├── batch_train                 # 存放批量训练完成的权重文件
 │   ├── pretrain                    # 存放 PT 预训练完成的权重文件
 │   └── dpo_train                   # 存放增强训练完成的权重文件
+├── dataset                         # RAW/原始数据集
 ├── dataset_daily_train             # 准备训练的DPO/增强训练数据集
 ├── dataset_batch_train             # 准备训练的SFT/批量训练数据集
 ├── dataset_pretrain                # 准备训练的 PT/text 预训练数据集
@@ -81,6 +82,27 @@
 ### 训练数据格式
 
 通用训练容器使用 LLaMA-Factory 训练流程。SFT/批量训练数据放在 `dataset_batch_train` 下，可使用 Alpaca 或 ShareGPT 格式。PT/text 预训练数据放在 `dataset_pretrain` 下。DPO/增强训练数据放在 `dataset_daily_train` 下，使用偏好数据格式，必须包含被选择回答和被拒绝回答。
+
+### 数据集可见性与发布
+
+下列容器目录是数据集的用户组共享根目录：
+
+| 数据类型 | 共享根目录 |
+| --- | --- |
+| RAW/原始数据 | `/home/workspace/dataset` |
+| SFT/批量训练数据 | `/home/workspace/dataset_batch_train` |
+| DPO/增强训练数据 | `/home/workspace/dataset_daily_train` |
+| PT/text 预训练数据 | `/home/workspace/dataset_pretrain` |
+
+放入这些根目录并被资源节点扫描到的数据集，会按当前容器所属用户组的共享数据登记和处理，同组用户可以查看和执行。管理员通过 Studio 上传的数据会直接进入对应共享根目录并发布。
+
+普通用户手工上传的数据集，以及数据预处理、高级筛选等任务产物，默认写入该用户的私有目录：
+
+```text
+/home/workspace/medflow/users/<userId>/datasets/<type>/<datasetName>
+```
+
+私有数据集只对创建者可见、可预览且可执行。如需组内共享，创建者应在数据卡片上点击“申请共享”；管理员在“用户管理 → 发布审批”中批准后，系统将数据集移入对应共享根目录，并向该用户组发布。审批前，其他组员无法通过列表、显式路径或“自动选最新”使用它；审批被拒绝时，数据仍保留在创建者的私有空间。
 
 ### 资源目录配置
 

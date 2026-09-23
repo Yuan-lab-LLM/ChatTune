@@ -518,6 +518,9 @@ def run_script_by_name_data_collect(
     Returns:
         `ToolResponse`: 包含脚本执行结果的ToolResponse对象
     """
+    kwargs.pop("dataset_access_manifest", None)
+    kwargs.pop("actor_user_id", None)
+    kwargs.pop("actor_is_normal_user", None)
     manager = ScriptManager()
     
     if list_only or script_query.lower() in ["列表", "list", "ls", "all"]:

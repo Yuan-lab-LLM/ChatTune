@@ -177,9 +177,15 @@ export const QuickStartWizard = forwardRef<QuickStartWizardRef, QuickStartWizard
         if (cachedDatasets && datasets.length === 0) {
           try {
             const parsed = JSON.parse(cachedDatasets);
-            const preferredDataset = parsed.find((d: DatasetInfo) => isRawDataset(d) && d.name === requiredDatasetId)
-              || parsed.find((d: DatasetInfo) => isRawDataset(d) && !/medical|病历/i.test(`${d.name} ${d.path || ''}`))
-              || parsed.find((d: DatasetInfo) => isRawDataset(d));
+            const availableDatasets = Array.isArray(parsed)
+              ? parsed.filter((d: DatasetInfo) =>
+                  Boolean(d.resourceId) &&
+                  d.storageState === 'ready' &&
+                  Boolean(d.sourcePath))
+              : [];
+            const preferredDataset = availableDatasets.find((d: DatasetInfo) => isRawDataset(d) && d.name === requiredDatasetId)
+              || availableDatasets.find((d: DatasetInfo) => isRawDataset(d) && !/medical|病历/i.test(`${d.name} ${d.path || ''}`))
+              || availableDatasets.find((d: DatasetInfo) => isRawDataset(d));
             if (preferredDataset) {
               // 有可用 raw 数据时，优先选择通用对话数据。
               onSelectDataset(preferredDataset);

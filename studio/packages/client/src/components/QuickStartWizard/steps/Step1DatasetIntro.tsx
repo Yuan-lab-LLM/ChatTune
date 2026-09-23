@@ -33,7 +33,12 @@ export function Step1DatasetIntro({
     if (!cached) return;
     try {
       const parsed = JSON.parse(cached);
-      if (Array.isArray(parsed)) setCachedData(parsed);
+      if (Array.isArray(parsed)) {
+        setCachedData(parsed.filter((item: DatasetInfo) =>
+          Boolean(item.resourceId) &&
+          item.storageState === 'ready' &&
+          Boolean(item.sourcePath)));
+      }
     } catch (error) {
       console.error('Failed to parse cached datasets:', error);
     }

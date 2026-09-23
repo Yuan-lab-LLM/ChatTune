@@ -2837,6 +2837,13 @@ const resolveTrainableDatasetDir = (
   dataset: DatasetInfo,
   config: { datasetDir: string },
 ): string => {
+  const sourcePath = dataset.sourcePath
+    ?.trim()
+    .replace(/\\+/g, "/")
+    .replace(/\/+$/, "");
+  if (sourcePath) {
+    return sourcePath;
+  }
   const normalizedBaseDir = config.datasetDir.replace(/\/+$/, "");
   const rawPath = dataset.path?.trim().replace(/\/+$/, "");
 
@@ -2890,6 +2897,13 @@ const buildDatasetTrainingCommand = (
 };
 
 const resolveRawDatasetPath = (dataset: DatasetInfo): string => {
+  const sourcePath = dataset.sourcePath
+    ?.trim()
+    .replace(/\\+/g, "/")
+    .replace(/\/+$/, "");
+  if (sourcePath) {
+    return sourcePath;
+  }
   const rawPath = dataset.path?.trim().replace(/\\+/g, "/").replace(/\/+$/, "");
 
   if (!rawPath) {
@@ -4758,7 +4772,13 @@ const RunContentPage = ({
       const cached = localStorage.getItem("cached_datasets");
       if (!cached) return null;
       try {
-        return JSON.parse(cached);
+        const parsed = JSON.parse(cached);
+        return Array.isArray(parsed)
+          ? parsed.filter((item: DatasetInfo) =>
+              Boolean(item.resourceId) &&
+              item.storageState === "ready" &&
+              Boolean(item.sourcePath))
+          : null;
       } catch {
         return null;
       }
@@ -9860,11 +9880,18 @@ const RunPage = () => {
   const withDatasetRuntimeContext = useCallback(
     (items: DatasetInfo[], containerName: string): DatasetInfo[] => {
       const fallbackNodeId = resourceNodeId !== "all" ? resourceNodeId : undefined;
-      return items.map((item) => ({
-        ...item,
-        nodeId: item.nodeId || fallbackNodeId,
-        containerName: item.containerName || containerName,
-      }));
+      return items
+        .filter(
+          (item) =>
+            Boolean(item.resourceId) &&
+            item.storageState === "ready" &&
+            Boolean(item.sourcePath),
+        )
+        .map((item) => ({
+          ...item,
+          nodeId: item.nodeId || fallbackNodeId,
+          containerName: item.containerName || containerName,
+        }));
     },
     [resourceNodeId],
   );
@@ -10395,6 +10422,7 @@ const RunPage = () => {
         container: dataset.containerName || defaultContainerName,
         datasetType: dataset.type as DatasetType,
         datasetName: dataset.name,
+        resourceId: dataset.resourceId,
       });
 
       if (!response.success || !response.data) {
@@ -10845,6 +10873,7 @@ const RunPage = () => {
           container: containerName,
           datasetType: dataset.type as DatasetType,
           datasetName: dataset.name,
+          resourceId: dataset.resourceId,
         });
 
         if (response.success && response.data) {
@@ -10953,6 +10982,7 @@ const RunPage = () => {
           container: dataset.containerName || defaultContainerName,
           datasetType: dataset.type as DatasetType,
           datasetName: dataset.name,
+          resourceId: dataset.resourceId,
         });
 
         if (!response.success) {

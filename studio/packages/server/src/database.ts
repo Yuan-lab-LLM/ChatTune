@@ -102,6 +102,7 @@ export const initializeDatabase = async (
         console.debug('Refresh the database ...');
         await AuthDao.ensureDefaultAdmin();
         await ResourceAccessService.ensureDefaultGroup();
+        await ResourceAccessService.reconcilePrivateDatasetStorage();
         await RunDao.updateRunStatusAtBeginning();
         await InputRequestDao.updateInputRequests();
         console.debug('Done');

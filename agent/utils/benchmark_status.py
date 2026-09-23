@@ -13,7 +13,7 @@ JOB_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 REPORT_PATTERN = re.compile(r"benchmark_report\((?:job_id=)?[\"']?([A-Za-z0-9_-]+)[\"']?\)")
 START_PATTERNS = (
     re.compile(r"(?:\*\*)?Job\s*ID(?:\*\*)?\s*[:：]\s*`?([A-Za-z0-9_-]+)", re.I),
-    re.compile(r"任务\s*ID(?:为|是)?\s*[:：]?\s*`?([A-Za-z0-9_-]+)", re.I),
+    re.compile(r"任务\s*ID(?:\s*\(\s*job_id\s*\))?(?:\*\*)?(?:为|是)?\s*[:：]?\s*`?([A-Za-z0-9_-]+)", re.I),
 )
 
 
@@ -45,18 +45,15 @@ def extract_benchmark_job_id(payload: Any) -> str:
     return ""
 
 
-def recover_benchmark_job_id(stage: dict[str, Any]) -> str:
+def _latest_benchmark_start_payload(stage: dict[str, Any]) -> dict[str, Any] | None:
     result = stage.get("result") if isinstance(stage.get("result"), dict) else {}
-    job_id = extract_benchmark_job_id(result)
-    if job_id:
-        return job_id
     log_path = stage.get("log_path") or result.get("log_path")
     if not log_path:
-        return ""
+        return None
     try:
         lines = Path(log_path).read_text(encoding="utf-8").splitlines()
     except OSError:
-        return ""
+        return None
     for line in reversed(lines):
         try:
             entry = json.loads(line)
@@ -64,35 +61,40 @@ def recover_benchmark_job_id(stage: dict[str, Any]) -> str:
             continue
         if not isinstance(entry, dict) or not str(entry.get("title") or "").startswith("运行推理基准测试"):
             continue
-        job_id = extract_benchmark_job_id(entry.get("payload"))
-        if job_id:
-            return job_id
-    return ""
+        payload = entry.get("payload")
+        return payload if isinstance(payload, dict) else {}
+    return None
+
+
+def latest_logged_benchmark_job_id(stage: dict[str, Any]) -> str:
+    payload = _latest_benchmark_start_payload(stage)
+    return extract_benchmark_job_id(payload)
+
+
+def recover_benchmark_job_id(stage: dict[str, Any]) -> str:
+    result = stage.get("result") if isinstance(stage.get("result"), dict) else {}
+    result_job_id = extract_benchmark_job_id(result)
+    if result_job_id and stage.get("status") != "failed":
+        return result_job_id
+    # A failed stage may contain the status of an older stopped job. Prefer
+    # the newest start receipt; never fall through to an older log entry.
+    payload = _latest_benchmark_start_payload(stage)
+    if payload is not None:
+        return extract_benchmark_job_id(payload)
+    return result_job_id
 
 
 def recover_benchmark_resource_context(stage: dict[str, Any]) -> dict[str, Any]:
     result = stage.get("result") if isinstance(stage.get("result"), dict) else {}
     context = result.get("resource_context")
+    if stage.get("status") != "failed" and isinstance(context, dict) and context.get("runtime_node_id"):
+        return context
+    payload = _latest_benchmark_start_payload(stage)
+    if payload is not None:
+        context = payload.get("resource_context")
+        return context if isinstance(context, dict) and context.get("runtime_node_id") else {}
     if isinstance(context, dict) and context.get("runtime_node_id"):
         return context
-    log_path = stage.get("log_path") or result.get("log_path")
-    if not log_path:
-        return {}
-    try:
-        lines = Path(log_path).read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return {}
-    for line in reversed(lines):
-        try:
-            entry = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(entry, dict) or not str(entry.get("title") or "").startswith("运行推理基准测试"):
-            continue
-        payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
-        context = payload.get("resource_context")
-        if isinstance(context, dict) and context.get("runtime_node_id"):
-            return context
     return {}
 
 

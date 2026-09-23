@@ -82,6 +82,14 @@ When DPO source data has no `rejected` response and one must be generated, confi
 
 Data preprocessing uses the latest dated data by default. To use an older dataset, select it in the left data-management tab and click `Preprocess with this`.
 
+### Personal data and group sharing
+
+- `/home/workspace/dataset`, `/home/workspace/dataset_batch_train`, `/home/workspace/dataset_daily_train`, and `/home/workspace/dataset_pretrain` are user-group shared dataset roots. A card labeled **Shared with group** can be listed and used by members of that group.
+- Administrator uploads through Studio go directly to the corresponding shared root. Ordinary users cannot publish data directly into a shared root.
+- Uploads from an ordinary user and outputs of data-processing jobs are saved under `/home/workspace/medflow/users/<userId>/datasets/<type>/<datasetName>` and are labeled **Only visible to me** by default. The creator may immediately use them for subsequent processing or training.
+- To let other group members use a private dataset, click **Request sharing** on its card. The card shows **Awaiting administrator approval** until an administrator approves it under **User Management → Publication Review**. Approval moves the data into the corresponding shared root; other members can then refresh the dataset list to see it.
+- Before approval, another user cannot bypass authorization with an explicit private path or automatic latest-dataset selection, even if that user knows the path.
+
 ## Single-machine Training
 
 | Purpose | Natural-language example |

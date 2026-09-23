@@ -20,6 +20,13 @@ export enum PublicationStatus {
     REJECTED = 'rejected',
 }
 
+export enum DatasetStorageState {
+    CREATING = 'creating',
+    READY = 'ready',
+    MOVING = 'moving',
+    ERROR = 'error',
+}
+
 @Entity('user_group')
 export class UserGroupTable extends BaseEntity {
     @PrimaryColumn()
@@ -108,7 +115,7 @@ export class GroupNodeAssignmentTable extends BaseEntity {
 }
 
 @Entity('resource_catalog')
-@Index('IDX_resource_catalog_lookup', ['bizType', 'nodeId', 'containerName', 'itemKey'], { unique: true })
+@Index('IDX_resource_catalog_lookup', ['bizType', 'nodeId', 'containerName', 'itemKey'])
 export class ResourceCatalogTable extends BaseEntity {
     @PrimaryColumn()
     id: string;
@@ -133,6 +140,9 @@ export class ResourceCatalogTable extends BaseEntity {
 
     @Column({ type: 'varchar', enum: ResourceVisibility, default: ResourceVisibility.PUBLIC })
     visibility: ResourceVisibility;
+
+    @Column({ type: 'varchar', enum: DatasetStorageState, default: DatasetStorageState.READY })
+    storageState: DatasetStorageState;
 
     @Column({ type: 'text', nullable: true })
     sourcePath?: string | null;

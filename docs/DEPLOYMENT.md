@@ -17,7 +17,7 @@ This guide only covers container, image, and workspace mount preparation for the
 | Resource | Link | Notes |
 | --- | --- | --- |
 | Training image | https://pan.quark.cn/s/040388acdd9a | Extraction code: m9YH |
-| Evaluation/inference image | https://pan.quark.cn/s/7ef603e26e50 | Extraction code: SH8t |
+| Evaluation/inference image | https://pan.quark.cn/s/e4fe2f83f9c7 | Extraction code: QLw7 |
 | GRPO/verl image | https://pan.quark.cn/s/c6ad41207360 | Extraction code: vJJx |
 | Base model resource | https://modelscope.cn/models/MedFlow/Qingnang-32B-0630/ | Qingnang-32B-0630 base model |
 | Evaluation benchmark data | https://pan.quark.cn/s/5ba6589d7933 | Extraction code: b8Pp |
@@ -71,6 +71,7 @@ When creating the container, the host directory mounted through `HOST_WORKSPACE`
 │   ├── batch_train                 # batch-training output weights
 │   ├── pretrain                    # PT pretraining output weights
 │   └── dpo_train                   # enhanced-training output weights
+├── dataset                         # RAW/source datasets
 ├── dataset_daily_train             # DPO/enhanced-training datasets prepared for training
 ├── dataset_batch_train             # SFT/batch-training datasets prepared for training
 ├── dataset_pretrain                # PT/text pretraining datasets prepared for training
@@ -84,6 +85,27 @@ When creating the container, the host directory mounted through `HOST_WORKSPACE`
 ### Training Data Format
 
 The general training container uses the LLaMA-Factory training workflow. Put SFT/batch-training data under `dataset_batch_train`; Alpaca or ShareGPT format can be used. Put PT/text pretraining data under `dataset_pretrain`. Put DPO/enhanced-training data under `dataset_daily_train`; it uses preference data format and must include chosen and rejected responses.
+
+### Dataset visibility and publication
+
+The following container directories are the user-group shared dataset roots:
+
+| Dataset type | Shared root |
+| --- | --- |
+| RAW/source data | `/home/workspace/dataset` |
+| SFT/batch-training data | `/home/workspace/dataset_batch_train` |
+| DPO/enhanced-training data | `/home/workspace/dataset_daily_train` |
+| PT/text pretraining data | `/home/workspace/dataset_pretrain` |
+
+Datasets placed under these roots and discovered by the resource node are registered and treated as shared data for the user group assigned to that container. Members of that group can list and execute them; publication does not grant access across user groups. Administrator uploads through Studio go directly to the corresponding shared root and are published immediately. Ordinary users should not bypass Studio and write to shared roots.
+
+Datasets uploaded by an ordinary user and outputs produced by preprocessing or advanced filtering are written to that user's private directory by default:
+
+```text
+/home/workspace/medflow/users/<userId>/datasets/<type>/<datasetName>
+```
+
+A private dataset is visible, previewable, and executable only by its creator. To share it, the creator clicks **Request sharing** on the dataset card. An administrator approves it under **User Management → Publication Review**; the system then moves the dataset to its corresponding shared root and publishes it to that user group. Before approval, other group members cannot use it through the list, an explicit path, or automatic latest-dataset selection. Rejection leaves the dataset in the creator's private space.
 
 ### Resource catalog configuration
 

@@ -4025,6 +4025,11 @@ def start_service(
         "instance_id": instance_id,
         "run_id": run_id,
         "status": "starting",
+        "model": str(instance_meta.get("model") or ""),
+        "model_path": str(instance_meta.get("model_path") or ""),
+        "gpus": str(instance_meta.get("actual_gpus") or ""),
+        "gpu_allocation": instance_meta.get("gpu_allocation") or {},
+        "ports": dict(instance_meta.get("ports") or {}),
         "reservation_id": str(
             (instance_meta.get("resource") or {}).get("reservation_id")
             or resource_context.get("reservation_id")
@@ -4044,7 +4049,46 @@ def service_instance_reservation_id(meta: dict) -> str:
     return str(resource.get("reservation_id") or "").strip()
 
 
-def service_stop_by_reservation_result(reservation_id: str = "") -> dict:
+def stop_running_benchmarks_for_service_instance(instance_id: str) -> list[dict]:
+    """Stop benchmark jobs bound to an instance during an explicit admin force stop."""
+    stopped = []
+    for job_id, meta_path, original in iter_json_records(get_benchmark_log_dir(), "meta.json"):
+        meta = refresh_benchmark_job_meta(job_id, meta_path, original)
+        if str(meta.get("service_instance_id") or "") != instance_id:
+            continue
+        if meta.get("status") != "running":
+            continue
+        result = stop_benchmark_job_runtime(job_id, meta_path, meta)
+        final_meta = refresh_benchmark_job_meta(
+            job_id, meta_path, load_json_file(meta_path, {})
+        )
+        stopped.append(
+            {
+                "job_id": str(meta.get("job_id") or job_id),
+                "status": str(final_meta.get("status") or "unknown"),
+                "result": result,
+            }
+        )
+    return stopped
+
+
+def service_stop_by_reservation_result(
+    reservation_id: str = "", force: bool = False
+) -> dict:
+    if force and not current_request_is_admin():
+        result_text = "强制停止资源预约绑定的推理服务仅允许管理员执行。"
+        return {
+            "status": "error",
+            "stopped": False,
+            "reservation_id": str(reservation_id or ""),
+            "service_stop": service_stop_payload(
+                stopped=False,
+                reservation_id=str(reservation_id or ""),
+                status="forbidden",
+                result=result_text,
+            ),
+            "result": result_text,
+        }
     resource_context = current_request_resource_context()
     reservation_id = str(reservation_id or resource_context.get("reservation_id") or "").strip()
     if not reservation_id:
@@ -4100,7 +4144,7 @@ def service_stop_by_reservation_result(reservation_id: str = "") -> dict:
                 ),
                 "result": result_text,
             }
-        stop_response = stop_service_instance(instance_id)
+        stop_response = stop_service_instance(instance_id, force=force)
         result_text = local_tool_text(stop_response)
         stop_data = local_tool_response_data(stop_response)
         service_stop = stop_data.get("service_stop") if isinstance(stop_data.get("service_stop"), dict) else {}
@@ -5033,7 +5077,9 @@ def preview_service_instance_stop(instance_id: str = "latest") -> dict:
     )
 
 
-def stop_service_instance(instance_id: str, confirm: bool = False) -> str:
+def stop_service_instance(
+    instance_id: str, confirm: bool = False, force: bool = False
+) -> str:
     meta = visible_service_instance_meta(instance_id)
     if not meta:
         return f"推理服务实例不存在: {instance_id}"
@@ -5041,12 +5087,31 @@ def stop_service_instance(instance_id: str, confirm: bool = False) -> str:
     current = current_request_user_id()
     owner = str(meta.get("owner_user_id") or "").strip()
     if current_request_is_admin():
-        block_text = running_instance_tasks_block_text(
-            instance_id, running_tasks_for_service_instance(instance_id)
-        )
-        if block_text:
-            return block_text
-        return stop_service_instance_runtime(meta)
+        if force:
+            forced_benchmarks = stop_running_benchmarks_for_service_instance(instance_id)
+        else:
+            block_text = running_instance_tasks_block_text(
+                instance_id, running_tasks_for_service_instance(instance_id)
+            )
+            if block_text:
+                return block_text
+            forced_benchmarks = []
+        stop_response = stop_service_instance_runtime(meta)
+        if forced_benchmarks:
+            text = local_tool_text(stop_response)
+            text += "\n管理员强制停止关联 benchmark："
+            for item in forced_benchmarks:
+                text += f"\n- job_id={item['job_id']} status={item['status']}"
+            return build_local_tool_response(
+                text,
+                {
+                    "service_stop": local_tool_response_data(stop_response).get(
+                        "service_stop"
+                    ),
+                    "forced_benchmarks": forced_benchmarks,
+                },
+            )
+        return stop_response
 
     if not current:
         return (

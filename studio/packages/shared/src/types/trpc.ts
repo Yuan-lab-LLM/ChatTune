@@ -434,6 +434,12 @@ export interface DatasetInfo {
   nodeName?: string;
   containerName?: string;
   canDelete?: boolean;
+  resourceId?: string;
+  ownerUserId?: string | null;
+  visibility?: "public" | "private";
+  publicationStatus?: "pending" | "approved" | "rejected" | null;
+  storageState?: "creating" | "ready" | "moving" | "error";
+  sourcePath?: string;
   name: string;
   type: string;
   path?: string;
