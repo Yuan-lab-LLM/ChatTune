@@ -306,11 +306,16 @@ async def lifespan(app: FastAPI):
         raise RuntimeError(f"Studio run registration failed: {exc}") from exc
 
     await start_workflow_background_tasks()
+    from utils.experiment_tracker import get_experiment_tracker
+    experiment_tracker = get_experiment_tracker()
     await get_memory_manager()
     start_gpu_background_refresh()
+    from inference_runtime_config import warm_up_inference_runtime
+    warm_up_inference_runtime()
     try:
         yield
     finally:
+        experiment_tracker.close()
         stop_gpu_background_refresh()
         memory_manager = await get_memory_manager()
         await memory_manager.stop()
@@ -452,6 +457,8 @@ async def _handle_agent_request(
         owner_aliases=owner_aliases,
         actor_user_id=actor_user_id,
         dataset_access_manifest=dataset_access_manifest,
+        conversation_run_id=str(request.session_id or request.id or ''),
+        experiment_project=_request_extra_value(request, 'project', kwargs) or 'default',
     )
 
     response_text = result.get("message", "")
@@ -536,36 +543,44 @@ def _runtime_sse_event(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+async def _runtime_result_stream(agent_request: AgentRequest, heartbeat_seconds: float = 15):
+    """Keep the Studio response active while a synchronous tool call runs."""
+    work = asyncio.create_task(_run_agent_request(agent_request))
+    try:
+        yield ": connected\n\n"
+        while not work.done():
+            done, _ = await asyncio.wait({work}, timeout=heartbeat_seconds)
+            if not done:
+                yield ": keepalive\n\n"
+        text, metadata = await work
+        if text:
+            yield _runtime_sse_event({"object": "content", "text": text})
+        yield _runtime_sse_event(
+            {"object": "message", "status": "completed", "metadata": metadata or {}}
+        )
+        yield _runtime_sse_event({"object": "response", "status": "completed"})
+    except Exception as exc:
+        logger.exception("Agent runtime stream failed")
+        yield _runtime_sse_event(
+            {"object": "response", "status": "failed", "error": {"message": str(exc)}}
+        )
+    finally:
+        if not work.done():
+            logger.warning("Agent runtime stream closed before its worker completed")
+            work.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+
+
 @agent_app.post("/runtime-process")
 async def runtime_process(request: Request):
     """Studio Bridge endpoint that returns the SSE protocol Studio already parses."""
     payload = await request.json()
     agent_request = AgentRequest(**payload)
 
-    async def event_stream():
-        try:
-            text, metadata = await _run_agent_request(agent_request)
-            if text:
-                yield _runtime_sse_event({"object": "content", "text": text})
-            yield _runtime_sse_event(
-                {
-                    "object": "message",
-                    "status": "completed",
-                    "metadata": metadata or {},
-                }
-            )
-            yield _runtime_sse_event({"object": "response", "status": "completed"})
-        except Exception as exc:
-            print(f"[AgentAPI] runtime-process failed: {exc}", flush=True)
-            yield _runtime_sse_event(
-                {
-                    "object": "response",
-                    "status": "failed",
-                    "error": {"message": str(exc)},
-                }
-            )
-
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        _runtime_result_stream(agent_request),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
 
 
 class ResetRequest(BaseModel):

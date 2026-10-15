@@ -298,6 +298,8 @@ def _monitor_protocol_hint(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _monitor_response(payload: Dict[str, Any]) -> ToolResponse:
+    from utils.experiment_launch import try_record_monitor_result
+    try_record_monitor_result(payload)
     payload = _payload_with_user_visible_wandb(payload)
     display_payload = _payload_for_monitor_display(payload)
     text = json.dumps(payload, ensure_ascii=False)
@@ -1094,7 +1096,9 @@ def _infer_wandb_mode(
 
 
 def _is_log_viewer_cmd(cmd: str) -> bool:
-    parts = shlex.split(cmd or "")
+    # ps prints argv without shell escaping; quotes inside an argument need
+    # not be balanced. Only the executable is needed to filter log viewers.
+    parts = (cmd or "").split(maxsplit=1)
     if not parts:
         return False
     executable = os.path.basename(parts[0])
@@ -6509,6 +6513,7 @@ def monitor_training(
     except Exception as exc:
         err_text = str(exc)
         tb = traceback.format_exc()
+        logger.exception("[train-monitor] query_failed container=%s pid=%s", container_name, pid)
         # 若存在上次成功结果，优先回退，避免用户卡在错误状态
         cached = _last_ok_for_job(container_name, pid, pid_started_at)
         if cached:
@@ -6536,9 +6541,9 @@ def monitor_training(
             "status": "unknown",
             "metrics": {
                 "container_name": container_name,
-                "error_reason": "internal_error_suppressed"
-                if "exceptions must derive from BaseException" in err_text
-                else err_text,
+                "pid": pid,
+                "error_reason": "monitor_internal_error",
+                "error_summary": "训练状态查询发生异常，暂时无法确认训练状态，请稍后重试。",
                 "debug": {
                     "internal_error": err_text,
                     "traceback": tb,
@@ -6719,6 +6724,9 @@ def run_script_by_name_monitor1(
 
         return run_script_by_name_train(
             script_query="grpo训练",
+            actor_user_id=kwargs.get('actor_user_id', ''),
+            experiment_context=kwargs.get('experiment_context'),
+            dataset_access_manifest=kwargs.get('dataset_access_manifest'),
             additional_args=start_args,
             env_vars=env_vars,
             use_docker=use_docker,
@@ -6954,6 +6962,9 @@ def run_script_by_name_monitor1(
 
         return run_script_by_name_train(
             script_query="grpo",
+            actor_user_id=kwargs.get('actor_user_id', ''),
+            experiment_context=kwargs.get('experiment_context'),
+            dataset_access_manifest=kwargs.get('dataset_access_manifest'),
             additional_args=start_args,
             env_vars=env_vars,
             use_docker=use_docker,

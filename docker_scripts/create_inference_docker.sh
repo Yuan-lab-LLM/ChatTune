@@ -21,7 +21,7 @@ require_host_directory() {
 }
 ## 请在运行前修改此处的默认参数 
 HOST_IP="replace-host-ip"
-IMAGE_NAME="qingnang_v20260709"
+IMAGE_NAME="qingnang_v20260917"
 IMAGE_VERSION="v1"
 DOCKER_NAME="qingnang"
 HOST_WORKSPACE=""

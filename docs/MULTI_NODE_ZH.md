@@ -54,7 +54,7 @@ bash runtime.sh init --profile center --nodes node-b=http://<worker-b-host>:8099
 | `MODEL_NAME` / `MODEL_API_KEY` / `MODEL_BASE_URL` | 中心本机 Agent 调用的 OpenAI-compatible 模型名、API key 和服务地址。 |
 | `INFERENCE_AGENT_URL` | 中心本机 Agent 使用的推理 Agent controller `/inference_agent` 地址；页面管理员运维动作使用 Studio 登录态判权，如启用推理 Agent `/admin/*`，应限制为仅可信 Studio Server 可访问。 |
 | `INFERENCE_OPS_AUTH_MODE` | 默认 `trusted_network`；只有显式设为 `token` 时才启用 Inference Ops Bearer 鉴权。 |
-| `INFERENCE_OPS_API_TOKEN` | 仅在 `INFERENCE_OPS_AUTH_MODE=token` 时由中心 Studio/主 Agent 与 Inference Ops 共享。 |
+| `INFERENCE_OPS_API_TOKEN` | `token` 模式或远端 HTTP 初始化时，由主 Agent 与 Inference Ops 共享；`token` 模式下 Studio 也使用该值。 |
 | `STUDIO_PUBLIC_URL` | 用户浏览器访问中心 Studio 的地址。 |
 | `STUDIO_URL` | Runtime/Agent 回调中心 Studio 后端的地址。 |
 
@@ -81,7 +81,7 @@ bash runtime.sh init --profile node --node-id node-b --center-url http://<center
 | `MODEL_NAME` / `MODEL_API_KEY` / `MODEL_BASE_URL` | 该节点 Agent 调用的 OpenAI-compatible 模型名、API key 和服务地址。 |
 | `INFERENCE_AGENT_URL` | 该节点任务使用的推理 Agent controller `/inference_agent` 地址；页面管理员运维动作使用 Studio 登录态判权，如启用推理 Agent `/admin/*`，应限制为仅可信 Studio Server 可访问。 |
 | `INFERENCE_OPS_AUTH_MODE` | 默认 `trusted_network`；启用 `token` 模式时必须与中心和 Inference Ops 保持一致。 |
-| `INFERENCE_OPS_API_TOKEN` | 仅在 `token` 模式下从中心节点复制。 |
+| `INFERENCE_OPS_API_TOKEN` | `token` 模式或远端 HTTP 初始化时，与主 Agent、controller 和 worker 保持一致。 |
 
 ## 启动顺序
 

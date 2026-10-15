@@ -16,6 +16,7 @@ export type RunPageSection =
     | 'overview'
     | 'datasets'
     | 'models'
+    | 'experiments'
     | 'evaluation';
 interface StudioSidebarContextType {
     clearDataDialogOpen: boolean;
@@ -30,6 +31,8 @@ interface StudioSidebarContextType {
     setLatestVersion: (version: string) => void;
     setRunPagePanelOpen: (open: boolean) => void;
     setRunPageSection: (section: RunPageSection) => void;
+    selectedExperimentId?: string;
+    setSelectedExperimentId: (id: string | undefined) => void;
 }
 
 const StudioSidebarContext = createContext<StudioSidebarContextType | null>(
@@ -51,6 +54,7 @@ export const StudioSidebarProvider = ({
     const defaultRunPageSection: RunPageSection = isAdmin ? 'runs' : 'overview';
     const [runPageSection, setRunPageSection] = useState<RunPageSection>(defaultRunPageSection);
     const [isRunPagePanelOpen, setRunPagePanelOpen] = useState(false);
+    const [selectedExperimentId, setSelectedExperimentId] = useState<string>();
     const { data: currentVersionData } = trpc.getCurrentVersion.useQuery();
     const { data: databaseInfo } = trpc.getDataInfo.useQuery(undefined, {
         enabled: isAdmin,
@@ -91,6 +95,8 @@ export const StudioSidebarProvider = ({
         setClearDataDialogOpen,
         setRunPagePanelOpen,
         setRunPageSection,
+        selectedExperimentId,
+        setSelectedExperimentId,
     };
 
     return (

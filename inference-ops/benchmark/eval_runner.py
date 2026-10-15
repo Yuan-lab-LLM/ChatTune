@@ -9,9 +9,9 @@ from typing import Any, Dict, List, Optional
 
 from openai import OpenAI
 from pydantic import BaseModel
+from benchmark_logging import error_text, log_event, log_sample, log_finished
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-os.makedirs(os.path.join(SCRIPT_DIR, "logs"), exist_ok=True)
 
 
 class OutputFormat(BaseModel):
@@ -35,6 +35,7 @@ def parse_args():
 
 def normalize_item(item: Dict[str, Any]) -> Dict[str, Any]:
     return {
+        **{key: item[key] for key in ('subset', 'subject', 'category', 'question_type') if key in item},
         "question": item.get("question") or item.get("prompt"),
         "answer": (item.get("answer") or item.get("label") or "").upper(),
         "options": item.get("options", None),
@@ -143,6 +144,7 @@ def call_model(
     options: List[str],
     max_retries: int = 3,
     timeout: int = 30,
+    sample_id=None,
 ):
     option_str = "/".join(options)
     prompt = f"""
@@ -173,31 +175,31 @@ def call_model(
                 response_format=OutputFormat,
                 # extra_body={"chat_template_kwargs": {"enable_thinking": True}}
             )
-            # timeout=timeout,
             return resp.choices[0].message.parsed
 
         except Exception as e:
             last_error = e
+            log_event('request_error', sample=sample_id, attempt=attempt + 1, max_attempts=max_retries, error=error_text(e))
+            if attempt + 1 < max_retries:
+                time.sleep(2**attempt)
 
-            sleep_time = 1 * (2**attempt)
-            time.sleep(sleep_time)
-
-    return f"ERROR: {last_error}"
+    return f"ERROR: {error_text(last_error)}"
 
 
 def process_one(client, model, idx, item, dataset):
+    started = time.monotonic()
     item = normalize_item(item)
     question = item["question"]
     ground_truth = item["answer"]
     options = detect_options(item)
 
-    response = call_model(client, model, question, ground_truth, options)
+    response = call_model(client, model, question, ground_truth, options, sample_id=idx)
 
     predicted = None
 
     if isinstance(response, OutputFormat):
         predicted = response.answer
-    else:
+    elif not str(response).startswith('ERROR:'):
         predicted = extract_answer_fallback(str(response), options)
         # predicted = None
 
@@ -208,7 +210,7 @@ def process_one(client, model, idx, item, dataset):
     gt_set = normalize_answer(ground_truth)
     pred_set = normalize_answer(predicted)
 
-    is_correct = pred_set == gt_set
+    is_correct = bool(gt_set and pred_set) and pred_set == gt_set
 
     if gt_set and pred_set:
         precision = len(gt_set & pred_set) / len(pred_set)
@@ -224,6 +226,7 @@ def process_one(client, model, idx, item, dataset):
     score = get_score(dataset, idx - 1, is_correct)
 
     return {
+        **{key: item[key] for key in ('subset', 'subject', 'category', 'question_type') if key in item},
         "index": idx,
         "question": question,
         "ground_truth": ground_truth,
@@ -232,6 +235,8 @@ def process_one(client, model, idx, item, dataset):
         "f1": f1,
         "score": score,
         "invalid": predicted is None,
+        "latency_seconds": round(time.monotonic() - started, 3),
+        **({'error': str(response)[7:]} if str(response).startswith('ERROR:') else {}),
         "response": response.model_dump()
         if isinstance(response, OutputFormat)
         else str(response),
@@ -239,10 +244,13 @@ def process_one(client, model, idx, item, dataset):
 
 
 def run_eval(args):
+    started = time.monotonic()
     client = OpenAI(api_key=args.api_key, base_url=args.base_url)
 
     with open(args.dataset, "r", encoding="utf-8") as f:
         data = json.load(f)
+    log_event('benchmark_started', dataset=os.path.basename(args.dataset), model=args.model,
+              total=len(data), max_workers=args.max_workers, mode='eval')
 
     results = []
     lock = threading.Lock()
@@ -262,14 +270,19 @@ def run_eval(args):
         total_score += res.get("score", 0)
 
     with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
-        futures = [
-            executor.submit(process_one, client, args.model, i + 1, item, args.dataset)
-            for i, item in enumerate(data)
-        ]
+        futures = {executor.submit(process_one, client, args.model, i + 1, item, args.dataset): i + 1
+                   for i, item in enumerate(data)}
         total = len(data)
 
         for idx, future in enumerate(as_completed(futures), start=1):
-            res = future.result()
+            try:
+                res = future.result()
+            except Exception as exc:
+                sample_index = futures[future]
+                item = normalize_item(data[sample_index - 1])
+                res = {'index': sample_index, 'question': item['question'], 'ground_truth': item['answer'],
+                       'predicted': None, 'is_correct': False, 'invalid': True, 'f1': 0, 'score': 0,
+                       'error': error_text(exc), 'response': 'ERROR: ' + error_text(exc)}
 
             with lock:
                 results.append(res)
@@ -287,7 +300,7 @@ def run_eval(args):
                         idx,
                     )
 
-            print(f"[{idx}/{total}] done")
+            log_sample(res, idx, total)
 
             if args.sleep:
                 time.sleep(args.sleep)
@@ -295,7 +308,8 @@ def run_eval(args):
     save_partial(
         args.output, results, correct, invalid, f1_sum, total_score, total, total
     )
-    print("DONE")
+    log_finished(started, results, {'accuracy': correct / total if total else 0,
+        'avg_f1': f1_sum / total if total else 0, 'invalid': invalid, 'total_score': total_score})
 
 
 def save_partial(
@@ -323,7 +337,7 @@ def save_partial(
 
 
 def call_model_medbench(
-    client: OpenAI, model: str, question: str, max_retries: int = 3, timeout: int = 30
+    client: OpenAI, model: str, question: str, max_retries: int = 3, timeout: int = 30, sample_id=None
 ):
     last_error = None
     for attempt in range(max_retries):
@@ -342,24 +356,34 @@ def call_model_medbench(
         except Exception as e:
             last_error = e
             sleep_time = 1 * (2**attempt)
-            time.sleep(sleep_time)
-    return f"ERROR: {last_error}"
+            log_event('request_error', sample=sample_id, attempt=attempt + 1, max_attempts=max_retries, error=error_text(e))
+            if attempt + 1 < max_retries:
+                time.sleep(sleep_time)
+    return f"ERROR: {error_text(last_error)}"
 
 
 def call_one_medbench(client, model, idx, obj):
+    started = time.monotonic()
     question = obj.get("question", "")
-    answer = call_model_medbench(client, model, question)
+    answer = call_model_medbench(client, model, question, sample_id=idx + 1)
 
     obj["answer"] = answer
+    obj['latency_seconds'] = round(time.monotonic() - started, 3)
+    if answer.startswith('ERROR:'):
+        obj['error'] = answer[7:]
 
     return idx, obj
 
 
 def process_one_medbench(input_path, output_path, client, model, max_workers: int = 1):
+    started = time.monotonic()
     with open(input_path, "r", encoding="utf-8") as fin:
         items = [(i, json.loads(line)) for i, line in enumerate(fin) if line.strip()]
 
     max_workers = max(1, max_workers)
+    log_event('benchmark_started', dataset=os.path.basename(input_path), model=model,
+              total=len(items), max_workers=max_workers, mode='medbench')
+    outcomes = []
     results = {}
     next_write_idx = 0
 
@@ -367,15 +391,19 @@ def process_one_medbench(input_path, output_path, client, model, max_workers: in
         ThreadPoolExecutor(max_workers=max_workers) as executor,
         open(output_path, "w", encoding="utf-8") as fout,
     ):
-        futures = [
-            executor.submit(call_one_medbench, client, model, idx, obj)
-            for idx, obj in items
-        ]
+        futures = {executor.submit(call_one_medbench, client, model, idx, obj): (idx, obj)
+                   for idx, obj in items}
 
         for done, future in enumerate(as_completed(futures), start=1):
-            idx, obj = future.result()
+            try:
+                idx, obj = future.result()
+            except Exception as exc:
+                idx, original = futures[future]
+                obj = {**original, 'error': error_text(exc), 'answer': 'ERROR: ' + error_text(exc)}
             results[idx] = obj
-            print(f"[{done}/{len(items)}] done")
+            outcome = {'index': idx + 1, **({'error': obj['error']} if obj.get('error') else {})}
+            outcomes.append(outcome)
+            log_sample(outcome, done, len(items))
 
             while next_write_idx in results:
                 fout.write(
@@ -383,6 +411,7 @@ def process_one_medbench(input_path, output_path, client, model, max_workers: in
                 )
                 fout.flush()
                 next_write_idx += 1
+    log_finished(started, outcomes)
 
 
 def run_medbench(args):

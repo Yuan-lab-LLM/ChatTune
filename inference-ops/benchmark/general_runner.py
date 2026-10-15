@@ -21,6 +21,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import pandas as pd
 from openai import OpenAI
+from benchmark_logging import error_text, log_event, log_sample, log_finished
 
 
 CHOICE_LABELS = list(string.ascii_uppercase)
@@ -972,16 +973,19 @@ def call_model(client: OpenAI, model: str, sample: dict, max_retries: int = 3) -
             return resp.choices[0].message.content.strip()
         except Exception as e:
             last_error = e
-            error_text = str(e)
+            log_event('request_error', sample=sample.get('id', sample.get('_index')),
+                      attempt=attempt + 1, max_attempts=max_retries, error=error_text(e))
+            error_message = str(e)
             if extra_body and (
-                "chat_template_kwargs" in error_text
-                or "enable_thinking" in error_text
-                or "extra_body" in error_text
+                "chat_template_kwargs" in error_message
+                or "enable_thinking" in error_message
+                or "extra_body" in error_message
             ):
                 extra_body = None
-            time.sleep(2**attempt)
+            if attempt + 1 < max_retries:
+                time.sleep(2**attempt)
 
-    return f"ERROR: {last_error}"
+    return f"ERROR: {error_text(last_error)}"
 
 
 def extract_choice(text: str, valid_options: Iterable[str]) -> Optional[str]:
@@ -1742,8 +1746,10 @@ def score_sample(sample: dict, response: str, args=None) -> dict:
 
 
 def process_sample(client: OpenAI, model: str, sample: dict, args=None) -> dict:
+    started = time.monotonic()
     response = call_model(client, model, sample)
-    scored = score_sample(sample, response, args)
+    scored = ({'error': response[7:], 'invalid': True} if response.startswith('ERROR:')
+              else score_sample(sample, response, args))
     return {
         "id": sample.get("id"),
         "_index": sample.get("_index"),
@@ -1753,6 +1759,7 @@ def process_sample(client: OpenAI, model: str, sample: dict, args=None) -> dict:
         "reference": sample.get("reference"),
         "references": sample.get("references"),
         "response": response,
+        "latency_seconds": round(time.monotonic() - started, 3),
         "meta": sample.get("meta", {}),
         **scored,
     }
@@ -1931,11 +1938,14 @@ def save_result(
 
 
 def run(args):
+    started = time.monotonic()
     key = canonical_dataset(args.dataset)
     meta = dataset_meta(key)
     split = resolve_split(key, args.split)
     samples = load_samples(args.dataset_root, key, split, args.limit)
     total = len(samples)
+    log_event('benchmark_started', dataset=meta['name'], split=split, model=args.model,
+              total=total, max_workers=max(1, args.max_workers), mode=meta['type'])
 
     if key == "humaneval" and args.humaneval_executor == "docker":
         docker_error = docker_available(args.humaneval_docker_image)
@@ -1950,12 +1960,16 @@ def run(args):
         sample["_index"] = idx
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
-            executor.submit(process_sample, client, args.model, s, args) for s in samples
-        ]
+        futures = {executor.submit(process_sample, client, args.model, s, args): s for s in samples}
         for idx, future in enumerate(as_completed(futures), start=1):
-            details.append(future.result())
-            print(f"[{idx}/{len(samples)}] done", flush=True)
+            try:
+                detail = future.result()
+            except Exception as exc:
+                sample = futures[future]
+                detail = {'id': sample.get('id'), '_index': sample['_index'], 'question': sample.get('question'),
+                          'answer': sample.get('answer'), 'error': error_text(exc), 'response': 'ERROR: ' + error_text(exc)}
+            details.append(detail)
+            log_sample(detail, idx, total)
 
             if idx % save_every == 0:
                 save_result(
@@ -1966,6 +1980,7 @@ def run(args):
         try:
             apply_lcb_official_docker_scores(args.dataset_root, samples, details, args)
         except Exception as e:
+            log_event('evaluator_error', error=error_text(e))
             for detail in details:
                 detail.update(
                     {
@@ -1979,6 +1994,7 @@ def run(args):
                 )
 
     save_result(args.output, meta["name"], split, meta["type"], details, total)
+    log_finished(started, details, summarize(meta['name'], split, meta['type'], details, total).get('metrics'))
 
     if not args.output:
         ordered = sorted(details, key=lambda x: x.get("_index", 0))

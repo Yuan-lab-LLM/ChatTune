@@ -147,6 +147,7 @@ export interface MedicalTestFile {
 }
 
 export interface EvaluationResult {
+    experimentId?: string;
     jobId: string;
     model: string;
     dataset: string;
@@ -1021,11 +1022,13 @@ export class DockerManager {
             'folder, folder_path = sys.argv[1], sys.argv[2]',
             'load_json = lambda path: json.load(open(path, encoding="utf-8")) if os.path.exists(path) else {}',
             'meta = load_json(os.path.join(folder_path, "meta.json"))',
+            'experiment = meta.get("experiment") if isinstance(meta.get("experiment"), dict) else {}',
             'result = load_json(os.path.join(folder_path, "result.json"))',
             'summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}',
             'total_score = result.get("total_score", summary.get("total_score"))',
             'payload = {"jobId": meta.get("job_id") or folder, "model": meta.get("model") or "unknown", "dataset": meta.get("dataset") or "unknown", "status": meta.get("status") or "unknown", "accuracy": summary.get("accuracy") or 0, "avgF1": summary.get("avg_f1") or 0, "startTime": meta.get("start_time") or "", "endTime": meta.get("end_time"), "folderPath": folder_path}',
             'payload.update({"totalScore": total_score} if isinstance(total_score, (int, float)) else {})',
+            'payload.update({"experimentId": experiment["experimentId"]} if isinstance(experiment.get("experimentId"), str) else {})',
             'print(json.dumps(payload, ensure_ascii=False))',
         ].join('; ');
         const safePythonScript = this.escapeForDoubleQuotes(pythonScript);

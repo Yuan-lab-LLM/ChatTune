@@ -30,6 +30,11 @@ import { AddTrainingReservationTaskType1890000000000 } from './1890000000000-Add
 import { AddUserGroupMultinodeContainer1900000000000 } from './1900000000000-AddUserGroupMultinodeContainer';
 import { BackfillUserGroupGrpoContainer1910000000000 } from './1910000000000-BackfillUserGroupGrpoContainer';
 import { AddDatasetStorageState1920000000000 } from './1920000000000-AddDatasetStorageState';
+import { CreateExperimentRecords1930000000000 } from './1930000000000-CreateExperimentRecords';
+import { AddExperimentReservation1940000000000 } from './1940000000000-AddExperimentReservation';
+import { CreateExperimentLogs1950000000000 } from './1950000000000-CreateExperimentLogs';
+import { OptimizeExperimentQueries1960000000000 } from './1960000000000-OptimizeExperimentQueries';
+import { AddExperimentMetadata1970000000000 } from './1970000000000-AddExperimentMetadata';
 
 /**
  * 所有迁移列表（按时间戳顺序）
@@ -55,6 +60,11 @@ export const migrations: (new () => MigrationInterface)[] = [
     AddUserGroupMultinodeContainer1900000000000,
     BackfillUserGroupGrpoContainer1910000000000,
     AddDatasetStorageState1920000000000,
+    CreateExperimentRecords1930000000000,
+    AddExperimentReservation1940000000000,
+    CreateExperimentLogs1950000000000,
+    OptimizeExperimentQueries1960000000000,
+    AddExperimentMetadata1970000000000,
 ];
 
 

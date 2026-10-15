@@ -17,7 +17,6 @@ import {
   RefreshCw,
   Cpu,
   Box,
-  CheckCircle2,
   XCircle,
   ChevronDown,
   Clock,
@@ -31,6 +30,9 @@ import { GuideModal } from "@/components/GuideModal";
 import { ManagerButton } from "@/components/buttons/ASButton";
 import ManagerSectionHeader from "../ManagerSectionHeader";
 import { getModelMergeBadgeKind } from "./modelMergeBadge";
+import ExperimentSourceButton from '../ExperimentManager/SourceButton';
+import { modelExperimentPath } from './modelExperimentPath';
+import PublishModelButton from './PublishModelButton';
 
 const tagSelectClassName =
   "w-[84px] [&_.ant-select-selector]:!h-8 [&_.ant-select-selector]:!rounded-lg [&_.ant-select-selector]:!border-border/40 [&_.ant-select-selector]:!bg-muted/35 [&_.ant-select-selection-item]:!text-xs [&_.ant-select-selection-item]:!font-medium [&_.ant-select-selection-item]:!leading-[30px] [&_.ant-select-arrow]:!text-muted-foreground";
@@ -126,9 +128,9 @@ const ModelManager = ({
     `     • ${t("model.guide.section1.item7") || "Inference：推理部署模型"}`,
     "",
     `2. ${t("model.guide.section2.title") || "合并产物说明"}`,
-    `   - ${t("model.guide.section2.item1") || "已生成合并模型：原始训练目录已有对应的合并产物"}`,
-    `   - ${t("model.guide.section2.item2") || "未生成合并模型：未检测到对应的合并产物"}`,
-    `   - ${t("model.guide.section2.item3") || "合并模型：当前目录就是合并产物"}`,
+    `   - ${t("model.guide.section2.item1") || "发现合并目录：训练目录旁检测到合并目录，尚未验证模型可加载"}`,
+    `   - ${t("model.guide.section2.item2") || "未检测到完整合并目录：目录缺失或模型分片不齐"}`,
+    `   - ${t("model.guide.section2.item3") || "合并目录：当前目录是合并输出，尚未验证模型可加载"}`,
   ].join("\n");
   const renderMergeBadge = (model: ModelInfo) => {
     const kind = getModelMergeBadgeKind(model);
@@ -137,21 +139,21 @@ const ModelManager = ({
     const hasMergedOutput = kind !== "merged-output-missing";
     const label =
       kind === "merged-artifact"
-        ? t("model.merged-artifact") || "合并模型"
+        ? t("model.merged-artifact") || "合并目录"
         : kind === "merged-output-exists"
-          ? t("model.merged-output-exists") || "已生成合并模型"
-          : t("model.merged-output-missing") || "未生成合并模型";
+          ? t("model.merged-output-exists") || "发现合并目录"
+          : t("model.merged-output-missing") || "未检测到完整合并目录";
 
     return (
       <span
         className={`rounded-full px-2.5 py-1 text-[11px] font-medium flex items-center gap-1 border ${
           hasMergedOutput
-            ? "bg-green-50 text-green-700 border-green-200/70"
+            ? "bg-blue-50 text-blue-700 border-blue-200/70"
             : "bg-yellow-50 text-yellow-700 border-yellow-200/70"
         }`}
       >
         {hasMergedOutput ? (
-          <CheckCircle2 className="w-3 h-3" />
+          <Box className="w-3 h-3" />
         ) : (
           <XCircle className="w-3 h-3" />
         )}
@@ -679,9 +681,9 @@ const ModelManager = ({
             </div>
           ) : (
             <div className="grid grid-cols-1 gap-2">
-              {visibleModels.map((model, index) => (
+              {visibleModels.map((model) => (
                 <Card
-                  key={index}
+                  key={`${model.nodeId}:${model.containerName || containerName}:${model.type}:${model.path}:${model.name}`}
                   size="small"
                   className="model-manager-card overflow-hidden rounded-2xl border border-slate-200/75 bg-[linear-gradient(180deg,rgba(255,255,255,0.98)_0%,rgba(248,250,252,0.98)_100%)] shadow-[0_18px_40px_-34px_rgba(15,23,42,0.28)] transition-all hover:-translate-y-[1px] hover:border-slate-300/80 hover:shadow-[0_24px_48px_-34px_rgba(15,23,42,0.3)] dark:border-white/10 dark:bg-[linear-gradient(180deg,rgba(15,23,42,0.94)_0%,rgba(17,24,39,0.98)_100%)] dark:shadow-[0_18px_40px_-34px_rgba(2,6,23,0.82)] dark:hover:border-white/15"
                 >
@@ -716,6 +718,8 @@ const ModelManager = ({
                           </span>
                         )}
                         {renderMergeBadge(model)}
+                        <ExperimentSourceButton resourceKind="model" nodeId={model.nodeId} container={model.containerName || containerName} path={modelExperimentPath(model)} />
+                        {model.type !== 'inference' && <PublishModelButton model={model} container={containerName} />}
                       </div>
                     </div>
                     {onDelete && model.canDelete !== false && (

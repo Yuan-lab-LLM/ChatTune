@@ -182,6 +182,8 @@ def _monitor_protocol_hint(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _monitor_response(payload: Dict[str, Any]) -> ToolResponse:
     payload = _enrich_monitor_evaluation_identity(payload)
+    from utils.experiment_launch import try_record_monitor_result
+    try_record_monitor_result(payload)
     display_text = _monitor_display_text(payload)
     return ToolResponse(content=[TextBlock(type="text", text=json.dumps(payload, ensure_ascii=False))],
         metadata={
@@ -1510,9 +1512,19 @@ def _start_auto_tagging_recovery_rerun(
     additional_args = {key: value for key, value in additional_args.items() if value}
     try:
         from .runlocal_evaluate import run_script_by_name_evaluate
+        from utils.experiment_tracker import get_experiment_tracker, TERMINAL
+        import uuid
+        tracker = get_experiment_tracker()
+        execution = tracker.find_execution(container, str((record or {}).get('pid') or ''))
+        if not execution or execution['state'] not in TERMINAL:
+            return None, '实验执行尚未确认结束；请先核对原执行，不能自动重复启动'
+        tracker.flush_once()
 
         response = run_script_by_name_evaluate(
             script_name,
+            actor_user_id=execution['actor_user_id'],
+            experiment_context={'experimentId': execution['experiment_id'], 'taskId': execution['task_id'],
+                                'requestKey': f'recovery-{uuid.uuid4()}'},
             additional_args=additional_args,
             background=True,
             env_vars=env_vars,

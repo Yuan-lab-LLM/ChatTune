@@ -37,6 +37,7 @@ import { GuideModal } from "@/components/GuideModal";
 import { ManagerButton } from "@/components/buttons/ASButton";
 import { translateAuthError } from "@/utils/authErrors";
 import ManagerSectionHeader from "../ManagerSectionHeader";
+import ExperimentSourceButton from '../ExperimentManager/SourceButton';
 
 const tagSelectClassName =
   "w-[84px] [&_.ant-select-selector]:!h-8 [&_.ant-select-selector]:!rounded-lg [&_.ant-select-selector]:!border-border/40 [&_.ant-select-selector]:!bg-muted/35 [&_.ant-select-selection-item]:!text-xs [&_.ant-select-selection-item]:!font-medium [&_.ant-select-selection-item]:!leading-[30px] [&_.ant-select-arrow]:!text-muted-foreground";
@@ -736,6 +737,7 @@ const DatasetManager = ({
         {/* 头部：标题和刷新按钮 */}
         <ManagerSectionHeader
           title={t("dataset.title") || "数据集列表"}
+          stackActions
           count={visibleDatasets.length}
           cacheMeta={effectiveCacheMeta}
           actions={
@@ -813,7 +815,7 @@ const DatasetManager = ({
         />
 
         {/* 数据集卡片网格 - 过滤掉大小为 0 B 的数据集 */}
-        <div className="flex-1 overflow-y-auto pr-4 min-h-0">
+        <div className="flex-1 min-h-0 overflow-y-auto pr-1">
           {visibleDatasets.length === 0 ? (
             <div className="flex h-full items-center justify-center">
               <div className="text-center rounded-2xl border border-border/25 bg-muted/15 px-8 py-8">
@@ -899,7 +901,7 @@ const DatasetManager = ({
                           <Folder className="w-4.5 h-4.5 text-primary" />
                         </div>
                       </div>
-                      <div className="flex-1 min-w-0 space-y-2.5">
+                      <div className="min-w-0 flex-1 space-y-2.5">
                         <div className="min-w-0">
                           <h4 className="truncate text-[18px] font-semibold tracking-[-0.01em] text-foreground">
                             {dataset.name}
@@ -957,7 +959,9 @@ const DatasetManager = ({
                           </div>
                         </div>
                       </div>
-                      <div className="shrink-0 flex items-center gap-1">
+                    </div>
+                    <div className="mt-3 flex flex-wrap items-center justify-end gap-1 border-t border-border/20 pt-2">
+                        <ExperimentSourceButton resourceKind="dataset" nodeId={dataset.nodeId} container={dataset.containerName || containerName} path={datasetFullPath} />
                         <Button
                           type="text"
                           size="small"
@@ -1021,7 +1025,6 @@ const DatasetManager = ({
                             />
                           </Popconfirm>
                         )}
-                      </div>
                     </div>
 
                     {effectiveVisibility === "private" &&

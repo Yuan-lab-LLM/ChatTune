@@ -165,6 +165,9 @@ def workflow_benchmark_result(report: dict[str, Any]) -> dict[str, Any]:
         "folder_path": str(Path(artifacts["meta"]).parent) if artifacts.get("meta") else None,
         "error": report.get("error"),
     }
+    experiment = report.get('experiment') if isinstance(report.get('experiment'), dict) else {}
+    payload.update(experiment_id=experiment.get('experimentId'), experiment_task_id=experiment.get('taskId'),
+                   experiment_attempt_id=experiment.get('attemptId'))
     for key in ("correct", "accuracy", "invalid", "invalid_rate", "avg_f1", "record_only", "executed", "passed", "failed", "timeout", "executor_error", "pass@1"):
         value = metrics.get(key, summary.get(key))
         if value is not None:

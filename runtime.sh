@@ -48,6 +48,7 @@ Examples:
   bash runtime.sh check
   bash runtime.sh --env-file runtime.node.env start
   bash runtime.sh logs agent
+  bash runtime.sh logs inference
   bash runtime.sh reset-admin-password --username admin
 EOF
 }
@@ -288,6 +289,11 @@ AGENT3_WORKFLOW_PUBLISH_DIR=/home/workspace/medical_models
 AGENT3_SESSION_TIMEOUT=3600
 AGENT3_MAX_CONCURRENT_SESSIONS=100
 RUNTIME_STOP_TIMEOUT_SECONDS=5
+START_LOCAL_INFERENCE=false
+# Optional inference overrides use paths inside the inference container.
+# MEDFLOW_INFERENCE_CONTAINER=qingnang
+# MEDFLOW_INFERENCE_OPS_DIR=/custom/mount/inference-ops
+# MEDFLOW_INFERENCE_PYTHON=/opt/venv/bin/python
 # NVIDIA_SMI_PATH=/usr/bin/nvidia-smi
 # PYTHON_BIN=python
 # NPM_BIN=npm
@@ -315,10 +321,11 @@ START_LOCAL_AGENT=true
 # Local node identity and task containers.
 MEDFLOW_RESOURCE_NODE_ID=local
 MEDFLOW_RESOURCE_NODE_NAME=local
-MEDFLOW_LOCAL_TRAINING_CONTAINER=replace-training-container
-MULTINODE_DOCKER_CONTAINER=replace-multinode-container
-MEDFLOW_LOCAL_EVALUATE_CONTAINER=replace-evaluate-container
-MEDFLOW_LOCAL_GRPO_CONTAINER=replace-grpo-container
+# Container names match the defaults in docker_scripts/create_*.sh.
+MEDFLOW_LOCAL_TRAINING_CONTAINER=qingnang_train
+MULTINODE_DOCKER_CONTAINER=qingnang_train_multi
+MEDFLOW_LOCAL_EVALUATE_CONTAINER=qingnang
+MEDFLOW_LOCAL_GRPO_CONTAINER=qingnang_grpo
 
 # Model and inference Agent services.
 MODEL_NAME=replace-model-name
@@ -352,7 +359,7 @@ EOF
     write_common_runtime_defaults
   } >"$ENV_FILE"
   echo "Generated single-machine runtime env: $ENV_FILE"
-  echo "Next: edit container/model URLs, then run bash runtime.sh --env-file \"$ENV_FILE\" check"
+  echo "Next: configure model settings and service URLs; adjust container names only if customized, then run bash runtime.sh --env-file \"$ENV_FILE\" check"
 }
 
 init_center_env() {
@@ -867,6 +874,7 @@ doctor() {
         failed=1
       }
     fi
+    inference_runtime check || failed=1
   fi
   [[ "$failed" -eq 0 ]] && echo "Runtime check passed."
   return "$failed"
@@ -886,12 +894,17 @@ wait_for_url() {
   exit 1
 }
 
+inference_runtime() {
+  "$PYTHON_BIN" "$ROOT_DIR/agent/inference_container.py" "$1" --state-file "$STATE_DIR/inference-container.json"
+}
+
 start_agent() {
   require_value MEDFLOW_RESOURCE_NODE_ID
   require_value MEDFLOW_RESOURCE_NODE_NAME
   require_value AGENT3_DEFAULT_DOCKER_CONTAINER
   require_value STUDIO_URL
   wait_for_url Studio "$STUDIO_URL"
+  inference_runtime start
   export HOST="$AGENT_API_HOST"
   export PORT="$AGENT_API_PORT"
   start_process agent "$ROOT_DIR/agent" "$PYTHON_BIN" api_app.py
@@ -930,6 +943,7 @@ show_status() {
       echo "$name: stopped"
     fi
   done
+  inference_runtime status || true
 }
 
 case "$ACTION" in
@@ -938,6 +952,9 @@ case "$ACTION" in
     ;;
   start)
     validate_common
+    if [[ "$RUNTIME_ROLE" == "node" || "$START_LOCAL_AGENT" == "true" ]]; then
+      inference_runtime check
+    fi
     case "$RUNTIME_ROLE" in
       center) start_center ;;
       node) start_agent ;;
@@ -950,9 +967,12 @@ case "$ACTION" in
     echo "Logs: $LOG_DIR"
     ;;
   stop)
+    inference_stop_status=0
     stop_process agent
+    inference_runtime stop || inference_stop_status=$?
     stop_process bridge
     stop_process studio
+    exit "$inference_stop_status"
     ;;
   restart)
     bash "$ROOT_DIR/runtime.sh" --env-file "$ENV_FILE" --role "$RUNTIME_ROLE" stop
@@ -993,7 +1013,9 @@ case "$ACTION" in
     show_status
     ;;
   logs)
-    if [[ -n "$LOG_SERVICE" ]]; then
+    if [[ "$LOG_SERVICE" == "inference" ]]; then
+      inference_runtime logs
+    elif [[ -n "$LOG_SERVICE" ]]; then
       tail -n 100 -F "$LOG_DIR/$LOG_SERVICE.log"
     else
       tail -n 100 -F "$LOG_DIR"/*.log

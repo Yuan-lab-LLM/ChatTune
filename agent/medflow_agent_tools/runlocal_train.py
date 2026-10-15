@@ -54,6 +54,7 @@ from ._training_descriptors import (
     list_training_descriptors,
     validate_training_descriptors,
 )
+from utils.experiment_launch import launch_with_experiment
 
 
 _RUNTIME_DIR = os.path.abspath(
@@ -103,6 +104,8 @@ RESOURCE_LAUNCHER_ONLY_PARAMS = {
 MANUAL_GPU_ENV_KEYS = {"MEDFLOW_ASSIGNED_GPUS", "CUDA_VISIBLE_DEVICES", "LOCALHOST_ID"}
 _ACTIVE_RESERVATION_HEARTBEATS: set[str] = set()
 _ACTIVE_RESERVATION_HEARTBEATS_LOCK = threading.Lock()
+_RECOVERED_RELEASED_RESERVATIONS: set[str] = set()
+_RESERVATION_RECOVERY_LOCK = threading.Lock()
 
 MULTINODE_SFT_CLI_PARAMS = [
     "base-dataset-path", "base-model-path", "batch-train-path",
@@ -871,6 +874,7 @@ def _preflight_resource_allocation(
     env_vars: Dict[str, str],
     launcher_options: Dict[str, Any],
 ) -> None:
+    started = time.monotonic()
     _resume_resource_reservation_heartbeats()
     is_multinode = _is_multinode_train_script(script_info.get("name"))
     if is_multinode and str(cli_args.get("allocation-file") or "").strip():
@@ -892,10 +896,17 @@ def _preflight_resource_allocation(
         gpus_per_node,
         "yes" if request_data.get("runtimeGpuSnapshot") else "no",
     )
-    _runtime_training_resource_request(
-        "preflightTrainingResourcesForRuntime",
-        request_data,
-    )
+    try:
+        _runtime_training_resource_request(
+            "preflightTrainingResourcesForRuntime",
+            request_data,
+        )
+    finally:
+        logger.info(
+            "Training resource preflight: script=%s elapsedMs=%.1f",
+            script_info.get("name"),
+            (time.monotonic() - started) * 1000,
+        )
 
 
 def _prepare_resource_allocation(
@@ -904,6 +915,7 @@ def _prepare_resource_allocation(
     env_vars: Dict[str, str],
     launcher_options: Dict[str, Any],
 ) -> Optional[str]:
+    started = time.monotonic()
     _resume_resource_reservation_heartbeats()
     is_multinode = _is_multinode_train_script(script_info.get("name"))
     if is_multinode and str(cli_args.get("allocation-file") or "").strip():
@@ -925,10 +937,17 @@ def _prepare_resource_allocation(
         gpus_per_node,
         "yes" if request_data.get("runtimeGpuSnapshot") else "no",
     )
-    allocation = _runtime_training_resource_request(
-        "reserveTrainingResourcesForRuntime",
-        request_data,
-    )
+    try:
+        allocation = _runtime_training_resource_request(
+            "reserveTrainingResourcesForRuntime",
+            request_data,
+        )
+    finally:
+        logger.info(
+            "Training resource allocation: script=%s elapsedMs=%.1f",
+            script_info.get("name"),
+            (time.monotonic() - started) * 1000,
+        )
     if not isinstance(allocation, dict):
         raise ValueError("Studio 返回了无效的 GPU 资源分配结果")
     reservation_id = str(allocation.get("reservationId") or "").strip() or None
@@ -1162,7 +1181,7 @@ def _finish_resource_launch(
     response.metadata = metadata
     if reservation_id:
         metadata["trainingReservationId"] = reservation_id
-    if metadata.get("success") is False:
+    if metadata.get("success") is False and not metadata.get("experiment_launch_uncertain"):
         _release_resource_allocation(reservation_id, env_vars)
     elif reservation_id:
         _start_resource_reservation_heartbeat(reservation_id, env_vars, response)
@@ -1172,43 +1191,54 @@ def _finish_resource_launch(
 def _resume_resource_reservation_heartbeats() -> None:
     if not os.path.exists(_BACKGROUND_TASK_REGISTRY):
         return
-    latest: Dict[str, Dict[str, Any]] = {}
-    try:
-        with open(_BACKGROUND_TASK_REGISTRY, "r", encoding="utf-8") as handle:
-            for line in handle:
-                try:
-                    record = json.loads(line)
-                except (TypeError, ValueError):
-                    continue
-                env = record.get("env_vars") if isinstance(record, dict) else None
-                reservation_id = str((env or {}).get("MEDFLOW_TRAINING_RESERVATION_ID") or "").strip()
-                if reservation_id:
-                    latest[reservation_id] = record
-    except OSError:
-        logger.exception("Failed to read background task registry for reservation recovery")
-        return
-    for reservation_id, record in latest.items():
-        container = str(record.get("container") or "").strip()
-        pid = str(record.get("pid") or "").strip()
-        env_vars = record.get("env_vars") if isinstance(record.get("env_vars"), dict) else {}
-        if not container or not pid:
-            continue
-        if not _check_pid_in_container(container, pid):
-            if _release_resource_allocation(reservation_id, env_vars):
-                logger.info(
-                    "Released stopped GPU resource reservation during recovery: "
-                    "reservationId=%s container=%s pid=%s",
-                    reservation_id,
-                    container,
-                    pid,
-                )
-            continue
-        response = ToolResponse(content=[], metadata={
-            "success": True,
-            "protocol_hint": {"container": container, "pid": pid},
-        })
-        _start_resource_reservation_heartbeat(reservation_id, env_vars, response)
-        logger.info("Recovered multi-node reservation heartbeat %s", reservation_id)
+    with _RESERVATION_RECOVERY_LOCK:
+        started = time.monotonic()
+        latest: Dict[str, Dict[str, Any]] = {}
+        scanned = released = skipped = failed = active = 0
+        try:
+            with open(_BACKGROUND_TASK_REGISTRY, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        record = json.loads(line)
+                    except (TypeError, ValueError):
+                        continue
+                    env = record.get("env_vars") if isinstance(record, dict) else None
+                    reservation_id = str((env or {}).get("MEDFLOW_TRAINING_RESERVATION_ID") or "").strip()
+                    if reservation_id:
+                        latest[reservation_id] = record
+        except OSError:
+            logger.exception("Failed to read background task registry for reservation recovery")
+            return
+        for reservation_id, record in latest.items():
+            scanned += 1
+            if reservation_id in _RECOVERED_RELEASED_RESERVATIONS:
+                skipped += 1
+                continue
+            container = str(record.get("container") or "").strip()
+            pid = str(record.get("pid") or "").strip()
+            env_vars = record.get("env_vars") if isinstance(record.get("env_vars"), dict) else {}
+            if not container or not pid:
+                skipped += 1
+                continue
+            if not _check_pid_in_container(container, pid):
+                if _release_resource_allocation(reservation_id, env_vars):
+                    _RECOVERED_RELEASED_RESERVATIONS.add(reservation_id)
+                    released += 1
+                    logger.debug("Released stopped GPU reservation during recovery: reservationId=%s", reservation_id)
+                else:
+                    failed += 1
+                continue
+            response = ToolResponse(content=[], metadata={
+                "success": True,
+                "protocol_hint": {"container": container, "pid": pid},
+            })
+            _start_resource_reservation_heartbeat(reservation_id, env_vars, response)
+            active += 1
+        logger.info(
+            "GPU reservation recovery: scanned=%s released=%s skipped=%s "
+            "releaseFailed=%s active=%s elapsedMs=%.1f",
+            scanned, released, skipped, failed, active, (time.monotonic() - started) * 1000,
+        )
 
 
 def _launch_mode_for_script(script_name: Optional[str]) -> Optional[str]:
@@ -1878,13 +1908,18 @@ class ScriptManager:
                     "val_files": "",
                     "wandb_mode": "online",
                 },
-                "supported_cli_params": ["model_path", "train_files", "val_files", "wandb_mode"],
+                "supported_cli_params": ["model_path", "train_files", "val_files", "wandb_mode", "resume_from_path", "resume_mode"],
                 "required_cli_params": ["model_path", "train_files", "val_files"],
                 "param_mapping": {
                     "模型路径": "model_path",
                     "model_path": "model_path",
                     "模型位置": "model_path",
                     "actor_rollout_ref.model.path": "model_path",
+                    "resume_from_path": "resume_from_path",
+                    "trainer.resume_from_path": "resume_from_path",
+                    "续训路径": "resume_from_path",
+                    "resume_mode": "resume_mode",
+                    "trainer.resume_mode": "resume_mode",
                     "训练数据": "train_files",
                     "训练集": "train_files",
                     "训练文件": "train_files",
@@ -3014,6 +3049,7 @@ def validate_training_inputs_preflight(
                     "未找到可用的批量训练数据目录，请提供 DATASET_DIR 或 DATASET_DATE。",
                 )
             dataset_dir = f"{base_dataset_path}/{latest_name}"
+        env_vars["DATASET_DIR"] = dataset_dir
         return validate_dataset_info_dir(dataset_dir)
 
     if script_name in {MULTINODE_SFT_SCRIPT, MULTINODE_SFT_FULL_SCRIPT}:
@@ -3039,6 +3075,7 @@ def validate_training_inputs_preflight(
                     f"未找到可用的多机 SFT 批量训练数据目录：{base_dataset_path}，请提供 dataset-dir 或 dataset-date。",
                 )
             dataset_dir = f"{base_dataset_path.rstrip('/')}/{latest_name}"
+        cli_args["dataset-dir"] = dataset_dir
         return validate_dataset_info_dir(dataset_dir)
 
     if script_name == "grpo_train":
@@ -3049,6 +3086,12 @@ def validate_training_inputs_preflight(
         model_issue = check_path(model_path, "-e", "model_path_missing", "GRPO 模型路径", model_path=model_path)
         if model_issue:
             return model_issue
+        resume_path = str(grpo_values.get("resume_from_path") or "").strip()
+        if resume_path:
+            resume_issue = check_path(resume_path, "-d", "checkpoint_missing", "GRPO 续训 checkpoint 路径",
+                                      checkpoint_path=resume_path)
+            if resume_issue:
+                return resume_issue
         for param_name, raw_value, label in (
             ("train_files", train_files, "GRPO 训练文件"),
             ("val_files", val_files, "GRPO 验证文件"),
@@ -3339,7 +3382,8 @@ def run_script_by_name_train(
         `ToolResponse`: 包含脚本执行结果的ToolResponse对象
     """
     dataset_access_manifest = kwargs.pop("dataset_access_manifest", None)
-    kwargs.pop("actor_user_id", None)
+    actor_user_id = str(kwargs.pop("actor_user_id", "") or "")
+    experiment_context = kwargs.pop("experiment_context", None)
     manager = ScriptManager()
     
     if list_only or script_query.lower() in ["列表", "list", "ls", "all"]:
@@ -4001,6 +4045,12 @@ def run_script_by_name_train(
         model_path = str(cli_args.pop("model_path", "")).strip()
         train_files = str(cli_args.pop("train_files", "")).strip()
         val_files = str(cli_args.pop("val_files", "")).strip()
+        resume_path = str(cli_args.pop("resume_from_path", "") or "").strip()
+        resume_mode = str(cli_args.pop("resume_mode", "") or ("resume_path" if resume_path else "auto")).strip()
+        if resume_mode not in {"auto", "disable", "resume_path"} or bool(resume_path) != (resume_mode == "resume_path"):
+            return _train_error_response(script_name,
+                "GRPO 续训需要同时设置 resume_mode=resume_path 和 resume_from_path；不续训时可用 auto 或 disable。",
+                error_reason="invalid_resume_configuration", recoverable=True)
         wandb_mode = str(cli_args.pop("wandb_mode", "online")).strip().lower()
         if wandb_mode not in {"online", "offline"}:
             return _train_error_response(
@@ -4021,7 +4071,11 @@ def run_script_by_name_train(
             "model_path": model_path,
             "train_files": train_files,
             "val_files": val_files,
+            "resume_from_path": resume_path,
         }
+        positional_args.append(f"trainer.resume_mode={resume_mode}")
+        if resume_path:
+            positional_args.append(f"trainer.resume_from_path={resume_path}")
         positional_args.extend(
             [
                 f"actor_rollout_ref.model.path={model_path}",
@@ -4293,6 +4347,8 @@ def run_script_by_name_train(
             resource_request,
             container_prechecked=True,
         )
+        if preflight_args.get("dataset-dir"):
+            args["dataset-dir"] = preflight_args["dataset-dir"]
         if validation_issue:
             return _train_error_response(
                 script_name,
@@ -4345,11 +4401,15 @@ def run_script_by_name_train(
                 )
         try:
             return _finish_resource_launch(
-                run_docker_in_background(**run_kwargs),
+                launch_with_experiment(run_docker_in_background, run_kwargs,
+                    actor_user_id=actor_user_id, script_name=script_name, kind="train",
+                    requested=additional_args, context=experiment_context),
                 reservation_id,
                 final_env_vars,
             )
-        except Exception:
+        except Exception as exc:
+            if getattr(exc, "experiment_launch_uncertain", False):
+                raise
             _release_resource_allocation(reservation_id, final_env_vars)
             raise
     
@@ -4588,7 +4648,12 @@ def run_script_in_docker(
 
         if docker_container and env_vars and env_vars.get("MEDFLOW_TRAINING_RESERVATION_ID"):
             try:
-                _validate_assigned_gpus_available(docker_container, env_vars)
+                gpu_check_started = time.monotonic()
+                try:
+                    _validate_assigned_gpus_available(docker_container, env_vars)
+                finally:
+                    logger.info("Assigned GPU launch check: script=%s elapsedMs=%.1f",
+                                script_name, (time.monotonic() - gpu_check_started) * 1000)
             except Exception as exc:
                 return _train_error_response(
                     script_name or script_path,
@@ -4788,7 +4853,12 @@ def run_docker_in_background(
 
         if docker_container and env_vars and env_vars.get("MEDFLOW_TRAINING_RESERVATION_ID"):
             try:
-                _validate_assigned_gpus_available(docker_container, env_vars)
+                gpu_check_started = time.monotonic()
+                try:
+                    _validate_assigned_gpus_available(docker_container, env_vars)
+                finally:
+                    logger.info("Assigned GPU launch check: script=%s elapsedMs=%.1f",
+                                script_name, (time.monotonic() - gpu_check_started) * 1000)
             except Exception as exc:
                 return _train_error_response(
                     script_name or script_path,
@@ -4818,6 +4888,7 @@ def run_docker_in_background(
                 log_file=log_file,
                 shell_prefix=shell_prefix,
                 shell_suffix=shell_suffix,
+                experiment_runner=kwargs.get('experiment_runner'),
             )
             command.extend(["sh", "-c", shell_command])
         
@@ -4881,11 +4952,16 @@ def run_docker_in_background(
 
         if docker_container:
             logger.info(f"执行命令: {' '.join(command)}")
-            process = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-            )
+            launch_started = time.monotonic()
+            try:
+                process = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                )
+            finally:
+                logger.info("Docker process start: script=%s elapsedMs=%.1f",
+                            script_name, (time.monotonic() - launch_started) * 1000)
             stdout = process.stdout or ""
             stderr = process.stderr or ""
             if process.returncode != 0:

@@ -10,6 +10,7 @@ interface Props {
   actions?: ReactNode;
   guideAction?: ReactNode;
   cacheMeta?: ManagementCacheMeta | null;
+  stackActions?: boolean;
 }
 
 const ManagerSectionHeader = ({
@@ -18,6 +19,7 @@ const ManagerSectionHeader = ({
   actions,
   guideAction,
   cacheMeta,
+  stackActions = false,
 }: Props) => {
   const { t } = useTranslation();
   const { isAdmin } = useAuth();
@@ -25,9 +27,9 @@ const ManagerSectionHeader = ({
 
   return (
     <div className="mb-0 shrink-0 space-y-1.5">
-      <div className="flex items-center justify-between gap-3">
-        <h3 className="min-w-0 flex-1 truncate text-[13px] font-semibold uppercase tracking-[0.06em] text-foreground">
-          <span className="truncate align-middle">{title}</span>
+      <div className={stackActions ? "flex flex-col gap-2" : "flex items-center justify-between gap-3"}>
+        <h3 className={`${stackActions ? "w-full" : "min-w-0 flex-1 truncate"} text-[13px] font-semibold uppercase tracking-[0.06em] text-foreground`}>
+          <span className="align-middle">{title}</span>
           {typeof count === "number" ? (
             <span className="ml-1.5 whitespace-nowrap text-[11px] text-muted-foreground">
               ({count})
@@ -35,7 +37,7 @@ const ManagerSectionHeader = ({
           ) : null}
         </h3>
         {actions ? (
-          <div className="shrink-0 flex items-center justify-end gap-1.5">
+          <div className={`${stackActions ? "w-full" : "shrink-0"} flex items-center justify-end gap-1.5`}>
             {actions}
           </div>
         ) : null}

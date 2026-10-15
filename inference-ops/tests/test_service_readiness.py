@@ -2,13 +2,14 @@ import ast
 import importlib.util
 import json
 import os
+import sys
 import tempfile
 import time
 import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any, Dict, List, Optional
 from unittest import mock
 
@@ -17,6 +18,19 @@ REPO = Path(__file__).resolve().parents[2]
 TOOLS = REPO / "inference-ops" / "inference_ops" / "tools.py"
 RUNTIME = REPO / "agent" / "runtime_agent.py"
 MANAGER = REPO / "agent" / "utils" / "workflow_manager.py"
+
+
+def load_workflow_manager(name):
+    package_name = 'workflow_readiness_test_utils'
+    if package_name not in sys.modules:
+        package = ModuleType(package_name)
+        package.__path__ = [str(MANAGER.parent)]
+        sys.modules[package_name] = package
+    spec = importlib.util.spec_from_file_location(f'{package_name}.{name}', MANAGER)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def load_function(path, name, namespace):
@@ -244,11 +258,7 @@ class ServiceReadinessTests(unittest.TestCase):
         self.assertFalse(matches(status, None, target_model_path="/models/other-model"))
 
     def test_workflow_defers_then_submits_once(self):
-        spec = importlib.util.spec_from_file_location("workflow_manager_readiness_test", MANAGER)
-        module = importlib.util.module_from_spec(spec)
-        import sys
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
+        module = load_workflow_manager('workflow_manager_readiness_test')
         starts = []
 
         def start_benchmark(_workflow):
@@ -291,11 +301,7 @@ class ServiceReadinessTests(unittest.TestCase):
                 manager.shutdown()
 
     def test_stopped_service_requeues_deploy_once(self):
-        spec = importlib.util.spec_from_file_location("workflow_manager_restart_test", MANAGER)
-        module = importlib.util.module_from_spec(spec)
-        import sys
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
+        module = load_workflow_manager('workflow_manager_restart_test')
         noop = lambda *_args, **_kwargs: {}
         polls = []
 

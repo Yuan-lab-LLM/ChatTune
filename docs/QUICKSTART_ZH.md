@@ -53,9 +53,9 @@ bash runtime.sh init --profile single --iphost <本机IP>
 | `MEDFLOW_LOCAL_EVALUATE_CONTAINER` | 本机实际存在的评测/推理容器名，用于模型评测和推理相关任务。 |
 | `MEDFLOW_LOCAL_GRPO_CONTAINER` | 本机实际存在的 GRPO/verl 容器名，用于 GRPO/verl 训练任务。 |
 | `MODEL_NAME` / `MODEL_API_KEY` / `MODEL_BASE_URL` | Agent 调用的 OpenAI-compatible 模型名、API key 和服务地址。 |
-| `INFERENCE_AGENT_URL` | 在部署手册中启动的推理 Agent controller `/inference_agent` 地址；页面管理员运维动作使用 Studio 登录态判权，如启用推理 Agent `/admin/*`，应限制为仅可信 Studio Server 可访问。 |
+| `INFERENCE_AGENT_URL` | 手动启动的推理 Agent controller `/inference_agent` 地址；需对主 Agent 可达。 |
 | `INFERENCE_OPS_AUTH_MODE` | 默认 `trusted_network`，依赖可信容器网络；显式设为 `token` 时启用 Bearer 鉴权。 |
-| `INFERENCE_OPS_API_TOKEN` | 仅在 `INFERENCE_OPS_AUTH_MODE=token` 时由 Studio、主 Agent、controller 和 worker 共享。 |
+| `INFERENCE_OPS_API_TOKEN` | `token` 模式或远端 HTTP 初始化时，由主 Agent、controller 和 worker 共享；`token` 模式下 Studio 也使用该值。 |
 | `STUDIO_PUBLIC_URL` | 用户浏览器访问 Studio 的地址；跨机器访问时不要保留 `127.0.0.1`。 |
 | `STUDIO_URL` | Runtime/Agent 回调 Studio 后端的地址，默认后端端口为 `3000`；跨机器访问时改成宿主机可达 IP 或域名。 |
 | `MEDFLOW_RESOURCE_NODES` | Studio 资源池节点列表，单机通常包含本机节点的 `id`、`name`、`baseUrl`；`baseUrl` 要指向本机 Agent API。 |
@@ -87,6 +87,7 @@ bash runtime.sh status
 | `bash runtime.sh status` | 查看服务状态和 PID。 |
 | `bash runtime.sh logs` | 查看全部日志。 |
 | `bash runtime.sh logs agent` | 查看 Agent 日志；也可使用 `studio` 或 `bridge`。 |
+| `bash runtime.sh logs inference` | 显式开启自动管理时，查看推理容器内控制进程最近 100 行日志。 |
 | `bash runtime.sh --help` | 查看全部参数。 |
 
 忘记唯一管理员密码时，先执行 `bash runtime.sh stop`，只修改 `runtime.env` 中的 `MEDFLOW_ADMIN_PASSWORD` 为新密码（至少 6 个字符），再执行 `bash runtime.sh reset-admin-password --username admin`，最后执行 `bash runtime.sh start`。若使用其他配置文件，加上 `--env-file`。重置会撤销该账号的登录会话；不要为找回密码运行 `init --force`，因为它还会轮换其他运行时 token。

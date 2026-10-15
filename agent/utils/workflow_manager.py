@@ -28,6 +28,26 @@ AGENT_EVENT_TYPES = {"start_evaluate", "deploy_model", "start_benchmark", "notif
 WORKFLOW_KEY_VERSION = "workflow:v2"
 
 
+def workflow_inference_experiment_context(workflow: Dict[str, Any], inherited=None) -> Dict[str, Any]:
+    context = workflow.get('context') or {}
+    result = {**(inherited or {}), **(context.get('experiment_context') or {}),
+              'workflowId': workflow['workflow_id'], 'operationTrigger': 'workflow'}
+    if context.get('experiment_id'):
+        result['experimentId'] = context['experiment_id']
+    stage = (workflow.get('stages') or {}).get('benchmark') or {}
+    recorded = stage.get('result') if isinstance(stage.get('result'), dict) else {}
+    task = stage.get('experiment_task_id') or recorded.get('experiment_task_id')
+    experiment = stage.get('experiment_id') or recorded.get('experiment_id')
+    # These are benchmark-specific: a service restart in the same request must
+    # never accidentally reuse a benchmark task as a deployment task.
+    result.pop('taskId', None)
+    result.pop('benchmarkTaskId', None)
+    result.pop('benchmarkExperimentId', None)
+    if task and experiment:
+        result.update(benchmarkTaskId=task, benchmarkExperimentId=experiment)
+    return result
+
+
 def parse_workflow_control_command(message: str) -> Optional[str]:
     """Recognize persisted workflow controls without catching standalone jobs."""
     text = (message or "").lower()
@@ -371,6 +391,14 @@ class WorkflowDependencies:
     stop_inference_service: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None
 
 
+class _WorkflowConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 class WorkflowManager:
     """SQLite-backed workflow state machine with a lightweight polling worker."""
 
@@ -384,6 +412,7 @@ class WorkflowManager:
         train_start_grace_seconds: int = 180,
         event_lease_seconds: int = 300,
         on_terminal_update: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_update: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         self.db_path = str(Path(db_path).resolve())
         self.dependencies = dependencies
@@ -393,6 +422,7 @@ class WorkflowManager:
         self.train_start_grace_seconds = max(0, int(train_start_grace_seconds))
         self.event_lease_seconds = max(1, int(event_lease_seconds))
         self.on_terminal_update = on_terminal_update
+        self.on_update = on_update
         self._terminal_updates_sent: set[str] = set()
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
@@ -406,7 +436,7 @@ class WorkflowManager:
             self.start_worker()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path, timeout=30)
+        connection = sqlite3.connect(self.db_path, timeout=30, factory=_WorkflowConnection)
         connection.row_factory = sqlite3.Row
         return connection
 
@@ -575,6 +605,7 @@ class WorkflowManager:
                     workflow["workflow_id"],
                 ),
             )
+        self._notify_update(workflow)
         if workflow.get("status") in TERMINAL_WORKFLOW_STATUSES:
             workflow_id = str(workflow["workflow_id"])
             should_notify = False
@@ -590,6 +621,13 @@ class WorkflowManager:
                 except Exception:
                     logger.exception("Failed to notify terminal workflow update %s", workflow_id)
         return workflow
+
+    def _notify_update(self, workflow: Dict[str, Any]) -> None:
+        if self.on_update:
+            try:
+                self.on_update(workflow)
+            except Exception:
+                logger.exception('Failed to queue experiment workflow state %s', workflow.get('workflow_id'))
 
     def _get(self, workflow_id: str) -> Optional[Dict[str, Any]]:
         with self._connect() as connection:
@@ -634,7 +672,10 @@ class WorkflowManager:
 
     def get_status_snapshot(self, workflow_id: str) -> Dict[str, Any]:
         """Return the persisted workflow row and repair missing terminal benchmark cleanup."""
-        return self._repair_finished_benchmark_shutdown(self._get(workflow_id))
+        workflow = self._repair_finished_benchmark_shutdown(self._get(workflow_id))
+        if workflow:
+            self._notify_update(workflow)
+        return workflow
 
     def is_running(self, workflow_id: str) -> bool:
         workflow = self._get(workflow_id)
@@ -839,8 +880,13 @@ class WorkflowManager:
             deploy_stage.pop("error", None)
             deploy_stage["updated_at"] = time.time()
             benchmark_stage = workflow["stages"]["benchmark"]
+            previous = benchmark_stage.get('result') if isinstance(benchmark_stage.get('result'), dict) else {}
+            identity = {key: benchmark_stage.get(key) or previous.get(key) for key in
+                        ('experiment_id', 'experiment_task_id', 'experiment_attempt_id')}
             benchmark_stage.clear()
-            benchmark_stage.update({"status": "pending", "updated_at": time.time()})
+            benchmark_stage.update({"status": "pending", "updated_at": time.time(),
+                                    **{key: value for key, value in identity.items() if value}})
+            (workflow['context'].get('experiment_launches') or {}).pop('benchmark', None)
             workflow["context"].pop("inference_service_stopped_by_benchmark_stop", None)
             workflow["context"].pop("benchmark_service_stopped_at", None)
             workflow["status"] = "running"
@@ -852,6 +898,9 @@ class WorkflowManager:
         # through the pending path; its artifact check can still skip a rerun
         # when a valid merged model actually exists.
         stage["status"] = "pending"
+        # A deliberate retry gets a fresh launch key but keeps the logical task ID.
+        # The experiment service still rejects retries while an execution is non-terminal.
+        (workflow["context"].get("experiment_launches") or {}).pop(workflow["current_stage"], None)
         stage.pop("error", None)
         stage["updated_at"] = time.time()
         if workflow["current_stage"] == "train":
@@ -1469,6 +1518,12 @@ class WorkflowManager:
         stage["status"] = status
         stage["updated_at"] = time.time()
         stage.update({key: value for key, value in fields.items() if value is not None})
+        result = fields.get('result') if isinstance(fields.get('result'), dict) else {}
+        for key in ('experiment_id', 'experiment_task_id', 'experiment_attempt_id'):
+            if result.get(key):
+                stage[key] = result[key]
+        if stage.get('experiment_id'):
+            workflow['context'].setdefault('experiment_id', stage['experiment_id'])
 
     def _details(self, result: Dict[str, Any]) -> Dict[str, Any]:
         return {key: value for key, value in result.items() if key != "status"}
@@ -2066,6 +2121,7 @@ class WorkflowManager:
                 self._defer_benchmark_stage(workflow)
                 return
             if not result.get("success", True):
+                self._stage_result(workflow, 'failed', result=result)
                 raise RuntimeError(result.get("error") or f"{_benchmark_name(workflow)}基准评测启动失败")
             result = _benchmark_enrich_runtime_result({**result, "result_entry": _benchmark_result_entry(workflow)})
             self._stage_result(workflow, "running", result=result)
@@ -2123,11 +2179,10 @@ class WorkflowManager:
             result.get("result_entry"),
         )
         if status in {"failed", "stopped", "interrupted"}:
+            self._stage_result(workflow, 'failed', result=result)
             raise RuntimeError(result.get("error") or f"{_benchmark_name(workflow)}基准评测失败")
         if status != "finished":
-            stage["result"] = result
-            stage["status"] = "running"
-            stage["updated_at"] = time.time()
+            self._stage_result(workflow, 'running', result=result)
             for key in ("log_path", "log_tail", "log_updated_at", "log_command"):
                 if result.get(key) is not None:
                     stage[key] = result[key]

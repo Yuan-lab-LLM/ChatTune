@@ -24,6 +24,7 @@ import SystemOverviewSider from "../SystemOverviewSider";
 import DatasetManager from "../DatasetManager";
 import ModelManager from "../ModelManager";
 import EvaluationManager from "../EvaluationManager";
+import ExperimentManager from "../ExperimentManager";
 import { GuideModal } from "@/components/GuideModal";
 import { useIsMobile } from "@/hooks/use-mobile";
 import { useTheme } from "@/context/ThemeContext.tsx";
@@ -50,9 +51,9 @@ interface Props {
   systemOverviewData: SystemOverviewData | null;
   gpuInfo: GPUInfo[] | null;
   onRefreshGPUInfo?: () => void;
-  activeTab: "runs" | "overview" | "datasets" | "models" | "evaluation";
+  activeTab: "runs" | "overview" | "datasets" | "models" | "evaluation" | "experiments";
   onTabChange: (
-    tab: "runs" | "overview" | "datasets" | "models" | "evaluation",
+    tab: "runs" | "overview" | "datasets" | "models" | "evaluation" | "experiments",
   ) => void;
   onClose?: () => void;
   // Dataset management props
@@ -384,6 +385,8 @@ const ProjectRunSider = ({
 
   const panelTitle = useMemo(() => {
     switch (activeTab) {
+      case "experiments":
+        return t("tab.experiments", { defaultValue: "实验记录" });
       case "runs":
         return t("overview.tab.runs");
       case "overview":
@@ -605,6 +608,7 @@ const ProjectRunSider = ({
             )}
 
             {activeTab !== "runs" && <ResourceNodeSelector extra={renderDockerFilter()} />}
+            {activeTab === "experiments" && <ExperimentManager />}
             {activeTab === "overview" && (
               <SystemOverviewSider
                 data={

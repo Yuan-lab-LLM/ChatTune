@@ -30,6 +30,8 @@ import { Reply } from "@shared/types";
 import { useMessageApi } from "@/context/MessageApiContext.tsx";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { InferenceConfig, ServiceStatus } from "./types";
+import { ExperimentLink } from "../ExperimentManager/SourceButton";
+import { serviceExperimentReferences } from "./experimentReferences";
 import { validateConfig, ValidationResult } from "./validation";
 
 interface Props {
@@ -513,6 +515,11 @@ const serviceStatusesFromProtocol = (
   }
 
   const serviceInstances = protocol.service_instances || protocol.serviceInstances;
+  const instances: ServiceStatus[] = serviceExperimentReferences(serviceInstances?.items).map(item => ({
+    ...item, name: item.instanceId, isInstance: true, node: nodeName, description: item.model,
+    status: serviceInstanceStatus(item.status), rawStatus: String(item.status || ''),
+  }));
+  if (instances.length) return instances;
   let sawStructuredSource = false;
   const structuredSources = [
     protocolArray(serviceInstances?.port_statuses),
@@ -2487,6 +2494,7 @@ const InferenceServicePanel = memo<Props>(function InferenceServicePanel({
                             </div>
                           </div>
                           <div className="flex shrink-0 items-center gap-2 self-end sm:self-auto">
+                            <ExperimentLink experimentId={service.experimentId} />
                             <Badge
                               variant={
                                 service.status === "running"

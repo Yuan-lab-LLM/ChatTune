@@ -23,11 +23,19 @@ from agentscope.tool import ToolResponse
 
 logger = logging.getLogger(__name__)
 from ._config_defaults import get_default_docker_container
+from ._medical_tp import (
+    MEDICAL_SCRIPTS,
+    PLAN_ENV,
+    MedicalTPError,
+    plan_medical_resources,
+    validate_allocation,
+)
 from ._evaluation_descriptors import (
     find_evaluation_descriptor,
     list_evaluation_descriptors,
 )
 from agentscope.message import TextBlock
+from utils.experiment_capture import recorded_input
 from ._train_monitor_helpers import (
     build_background_shell_command,
     parse_pid_from_output,
@@ -41,6 +49,7 @@ from ._template_policy import (
 )
 from .runlocal_train import (
     MANUAL_GPU_ENV_KEYS,
+    _default_resource_request,
     _finish_resource_launch,
     _local_gpu_snapshot_for_runtime_request,
     _prepare_resource_allocation,
@@ -474,6 +483,7 @@ def run_evaluate_preflight(
     script_info: Dict[str, Any],
     launcher_options: Dict[str, Any],
     resource_request: Optional[Dict[str, Any]],
+    replay_assets: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[Dict[str, Any]]:
     container_issue = _validate_evaluate_container_preflight(container)
     if container_issue:
@@ -606,6 +616,11 @@ def run_evaluate_preflight(
                     path=adapter_config_path,
                     param="CKPT_PATH",
                 )
+            if replay_assets is not None:
+                try:
+                    base_model = recorded_input(replay_assets, container, 'model', 'base_model')['location']['path']
+                except ValueError as exc:
+                    return _evaluate_preflight_issue('draft_input_unavailable', str(exc), container=container)
             if not base_model.startswith("/"):
                 return _evaluate_preflight_issue(
                     "base_model_unavailable",
@@ -652,6 +667,11 @@ def run_evaluate_preflight(
             )
         for dataset in datasets:
             dataset_root = f"/home/workspace/evaluation/{dataset}"
+            if replay_assets is not None:
+                try:
+                    dataset_root = recorded_input(replay_assets, container, 'dataset', 'evaluation_dataset', dataset)['location']['path']
+                except ValueError as exc:
+                    return _evaluate_preflight_issue('draft_input_unavailable', str(exc), container=container)
             for suffix, label in (
                 (f"{dataset}.py", "数据集加载脚本"),
                 ("mapping.json", "数据集映射"),
@@ -690,6 +710,33 @@ def run_evaluate_preflight(
         snapshot_issue = _validate_evaluate_gpu_snapshot_preflight(container)
         if snapshot_issue:
             return snapshot_issue
+        if script_name in MEDICAL_SCRIPTS:
+            base_model_path = None
+            if script_name == "ckpt_eval" and replay_assets is not None:
+                try:
+                    base_model_path = recorded_input(replay_assets, container, 'model', 'base_model')['location']['path']
+                except ValueError as exc:
+                    return _evaluate_preflight_issue('draft_input_unavailable', str(exc), container=container)
+            try:
+                _, requested_count = _default_resource_request(script_info, launcher_options, env_vars)
+                # Explicit user counts must remain exact; defaults act as a cap.
+                plan = plan_medical_resources(
+                    script_name, container, cli_args, env_vars,
+                    launcher_options["gpu-count"] if "gpu-count" in launcher_options else requested_count,
+                    explicit="gpu-count" in launcher_options,
+                    base_model_path=base_model_path,
+                )
+                launcher_options["gpu-count"] = plan["gpuCount"]
+                env_vars[PLAN_ENV] = json.dumps(plan, ensure_ascii=False)
+                logger.info(
+                    "Medical evaluation TP plan: script=%s requestedGPUs=%s selectedGPUs=%s TP=%s models=%s",
+                    script_name, requested_count, plan["gpuCount"], plan["tensorParallelSizes"],
+                    [model["modelPath"] for model in plan["models"]],
+                )
+            except MedicalTPError as exc:
+                return _evaluate_preflight_issue(exc.reason, str(exc), container=container)
+            except ValueError as exc:
+                return _evaluate_preflight_issue("medical_gpu_count_invalid", str(exc), container=container)
         try:
             _preflight_resource_allocation(
                 script_info,
@@ -1503,6 +1550,8 @@ def run_script_by_name_evaluate(
     Returns:
         `ToolResponse`: 包含脚本执行结果的ToolResponse对象
     """
+    actor_user_id = str(kwargs.pop("actor_user_id", "") or "")
+    experiment_context = kwargs.pop("experiment_context", None)
     manager = ScriptManager()
     
     if list_only or script_query.lower() in ["列表", "list", "ls", "all"]:
@@ -1774,6 +1823,7 @@ def run_script_by_name_evaluate(
                 invalidParams=invalid_params,
             )
     template_resolution: Optional[Dict[str, Any]] = None
+    replay_assets = (experiment_context or {}).get('replayInputAssets')
     if script_name in {"ckpt_eval", "generic_ckpt_eval"}:
         checkpoint_path = first_nonempty([
             cli_args.get("CKPT_PATH"),
@@ -1799,9 +1849,15 @@ def run_script_by_name_evaluate(
                 **{key: value for key, value in container_issue.items() if key not in {"message", "error_reason"}},
             )
         explicit_template = _evaluate_template_value(script_name, params_to_update, cli_args)
+        template_model_path = checkpoint_path
+        if replay_assets is not None:
+            try:
+                template_model_path = recorded_input(replay_assets, selected_container, 'model', 'base_model')['location']['path']
+            except ValueError as exc:
+                return _evaluate_error_response(script_name, str(exc), error_reason='draft_input_unavailable', recoverable=True)
         template_resolution = resolve_model_template(
             selected_container,
-            checkpoint_path,
+            template_model_path,
             "evaluation",
             explicit_template=explicit_template,
         )
@@ -2100,6 +2156,7 @@ def run_script_by_name_evaluate(
             script_info,
             launcher_options,
             resource_request,
+            replay_assets=replay_assets,
         )
         if validation_issue:
             return _evaluate_error_response(
@@ -2112,7 +2169,7 @@ def run_script_by_name_evaluate(
         if template_resolution:
             changed_issue = verify_model_template_resolution(
                 docker_kwargs["docker_container"],
-                checkpoint_path,
+                template_model_path,
                 "evaluation",
                 template_resolution,
                 explicit_template=explicit_template or None,
@@ -2138,6 +2195,13 @@ def run_script_by_name_evaluate(
                     final_env_vars,
                     launcher_options,
                 )
+                if script_name in MEDICAL_SCRIPTS:
+                    plan = json.loads(final_env_vars[PLAN_ENV])
+                    for warning in validate_allocation(
+                        plan, final_env_vars.get("MEDFLOW_ASSIGNED_GPUS", ""),
+                        _local_gpu_snapshot_for_runtime_request() or {},
+                    ):
+                        logger.warning("Medical evaluation memory preflight: %s", warning)
                 final_env_vars = require_assigned_gpu_env(final_env_vars)
                 run_kwargs["env_vars"] = final_env_vars
             except Exception as exc:
@@ -2145,16 +2209,21 @@ def run_script_by_name_evaluate(
                 return _evaluate_error_response(
                     script_name,
                     f"错误: GPU 资源分配失败: {exc}",
-                    error_reason="resource_allocation_failed",
+                    error_reason=exc.reason if isinstance(exc, MedicalTPError) else "resource_allocation_failed",
                     recoverable=True,
                 )
         try:
+            from utils.experiment_launch import launch_with_experiment
             return _finish_resource_launch(
-                run_docker_in_background(**run_kwargs),
+                launch_with_experiment(run_docker_in_background, run_kwargs,
+                    actor_user_id=actor_user_id, script_name=script_name, kind="evaluate",
+                    requested=additional_args, context=experiment_context),
                 reservation_id,
                 final_env_vars,
             )
-        except Exception:
+        except Exception as exc:
+            if getattr(exc, "experiment_launch_uncertain", False):
+                raise
             _release_resource_allocation(reservation_id, final_env_vars)
             raise
 
@@ -2562,6 +2631,7 @@ def run_docker_in_background(
                 script_args=script_args,
                 docker_working_dir=docker_working_dir,
                 log_file=log_file,
+                experiment_runner=kwargs.get('experiment_runner'),
             )
             command.extend(["/bin/bash", "-c", shell_command])
         

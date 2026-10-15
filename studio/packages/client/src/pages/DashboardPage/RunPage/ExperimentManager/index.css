@@ -1,0 +1,275 @@
+.experiment-filters {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    max-width: 640px;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+}
+
+.experiment-filters > * {
+    min-width: 0;
+    width: 100%;
+}
+
+.experiment-filter-search,
+.experiment-filter-project,
+.experiment-filter-dates,
+.experiment-filter-actions {
+    grid-column: 1 / -1;
+}
+
+.experiment-filters .ant-input,
+.experiment-filters .ant-select-selection-item,
+.experiment-filters .ant-select-selection-placeholder,
+.experiment-filters .ant-picker-input > input,
+.experiment-filters .ant-btn {
+    font-size: 12px;
+}
+
+.experiment-assets {
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+}
+
+.experiment-assets-group {
+    min-width: 0;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+}
+
+.experiment-assets-heading {
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--muted);
+}
+
+.experiment-assets-group--output .experiment-assets-heading {
+    border-left: 3px solid var(--primary);
+    padding-left: 13px;
+}
+
+.experiment-assets-count {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 24px;
+    height: 22px;
+    padding: 0 6px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--background);
+    color: var(--muted-foreground);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+}
+
+.experiment-assets-list {
+    padding: 0 16px;
+}
+
+.experiment-asset-card {
+    min-width: 0;
+    padding: 16px 0 8px;
+}
+
+.experiment-asset-card + .experiment-asset-card {
+    border-top: 1px solid var(--border);
+}
+
+.experiment-assets .experiment-asset-name {
+    overflow-wrap: anywhere;
+}
+
+.experiment-assets .ant-tag {
+    margin-inline-end: 0;
+}
+
+.experiment-assets .experiment-asset-details {
+    margin-top: 8px;
+    background: transparent;
+}
+
+.experiment-assets .experiment-asset-details > .ant-collapse-item > .ant-collapse-header {
+    padding: 6px 0;
+    background: transparent;
+    color: var(--muted-foreground);
+    font-size: 13px;
+}
+
+.experiment-assets .experiment-asset-details > .ant-collapse-item > .ant-collapse-content > .ant-collapse-content-box {
+    padding: 12px;
+    border-radius: 8px;
+    background: var(--muted);
+}
+
+.experiment-assets-empty {
+    padding: 24px 0;
+    color: var(--muted-foreground);
+    font-size: 14px;
+    text-align: center;
+}
+
+.experiment-evaluation {
+    margin-bottom: 20px;
+    padding: 20px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    min-width: 0;
+}
+
+.evaluation-header {
+    margin-bottom: 20px;
+}
+
+.experiment-evaluation .evaluation-model {
+    display: block;
+    margin-top: 6px;
+    overflow-wrap: anywhere;
+    font-size: 12px;
+}
+
+.evaluation-stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));
+    gap: 12px;
+    margin: 0 0 24px;
+}
+
+.evaluation-stats > div {
+    padding: 12px 16px;
+    border-radius: 8px;
+    background: var(--muted);
+}
+
+.evaluation-stats dt,
+.evaluation-score-label {
+    color: var(--muted-foreground);
+    font-size: 13px;
+}
+
+.evaluation-stats dd {
+    margin: 6px 0 0;
+    font-size: 24px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+}
+
+.evaluation-stats dd > span {
+    color: var(--muted-foreground);
+    font-size: 14px;
+    font-weight: 400;
+}
+
+.evaluation-stats .evaluation-failed {
+    color: var(--destructive);
+}
+
+.evaluation-section {
+    margin-bottom: 24px;
+}
+
+.evaluation-section-title {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 600;
+}
+
+.evaluation-score-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+    gap: 12px;
+    margin-top: 12px;
+}
+
+.evaluation-score {
+    min-width: 0;
+    padding: 16px;
+    border: 1px solid var(--border);
+    border-top: 3px solid var(--primary);
+    border-radius: 8px;
+    overflow-wrap: anywhere;
+}
+
+.evaluation-score-value {
+    margin: 6px 0 10px;
+    color: var(--primary);
+    font-size: 28px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+}
+
+.evaluation-score-dataset,
+.evaluation-score-samples,
+.evaluation-table-dataset {
+    color: var(--muted-foreground);
+    font-size: 12px;
+    overflow-wrap: anywhere;
+}
+
+.evaluation-score-samples {
+    margin-top: 4px;
+}
+
+.evaluation-table-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+
+.experiment-evaluation .evaluation-search {
+    width: 240px;
+    max-width: 100%;
+}
+
+.evaluation-table-dataset {
+    margin: 0 0 12px;
+}
+
+.evaluation-subset-name,
+.evaluation-dataset-name {
+    overflow-wrap: anywhere;
+}
+
+.evaluation-table-value {
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+}
+
+.experiment-evaluation .evaluation-table .ant-table-tbody > tr > td {
+    background: var(--background);
+    padding-top: 10px;
+    padding-bottom: 10px;
+    font-variant-numeric: tabular-nums;
+}
+
+.experiment-evaluation .evaluation-technical-details {
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+    background: transparent;
+}
+
+.experiment-evaluation .evaluation-technical-details > .ant-collapse-item > .ant-collapse-header {
+    padding: 6px 0;
+    background: transparent;
+    color: var(--muted-foreground);
+    font-size: 13px;
+}
+
+.experiment-evaluation .evaluation-technical-details > .ant-collapse-item > .ant-collapse-content > .ant-collapse-content-box {
+    padding: 12px;
+    border-radius: 8px;
+    background: var(--muted);
+}
+
+@media (max-width: 540px) {
+    .experiment-evaluation {
+        padding: 14px;
+    }
+}

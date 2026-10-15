@@ -231,6 +231,7 @@ def build_background_shell_command(
     log_file: Optional[str],
     shell_prefix: Optional[str] = None,
     shell_suffix: Optional[str] = None,
+    experiment_runner: Optional[List[str]] = None,
 ) -> str:
     inner_parts: List[str] = []
     if docker_executable and script_path and (
@@ -265,6 +266,8 @@ def build_background_shell_command(
                 inner_parts.append(f"--{key}")
                 inner_parts.append(str(value))
 
+    if experiment_runner:
+        inner_parts = [*experiment_runner, *inner_parts]
     inner_cmd_str = " ".join(shlex.quote(part) for part in inner_parts)
     if shell_suffix:
         inner_cmd_str = f"{inner_cmd_str} {shell_suffix}"

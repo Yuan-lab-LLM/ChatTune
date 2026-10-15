@@ -1641,6 +1641,21 @@
           "label": "验证文件"
         },
         {
+          "name": "resume_from_path",
+          "type": "checkpoint",
+          "required": false,
+          "label": "续训 checkpoint 路径（global_step_数字）",
+          "advanced": true
+        },
+        {
+          "name": "resume_mode",
+          "type": "enum",
+          "required": false,
+          "label": "续训模式",
+          "options": ["auto", "disable", "resume_path"],
+          "advanced": true
+        },
+        {
           "name": "gpu-count",
           "type": "number",
           "required": false,

@@ -28,6 +28,9 @@ from .dataset_access import (
     require_allowed_dataset_path,
 )
 from .dataset_naming import build_dataset_output_name
+from ._train_monitor_helpers import build_background_shell_command, parse_pid_from_output
+from utils.experiment_launch import launch_with_experiment
+from utils.experiment_capture import container_json
 
 logger = logging.getLogger(__name__)
 from agentscope.tool import ToolResponse
@@ -1382,6 +1385,7 @@ def run_script_by_name_data(
     manager = ScriptManager()
     dataset_access_manifest = kwargs.pop("dataset_access_manifest", None)
     actor_user_id = str(kwargs.pop("actor_user_id", "") or "").strip()
+    experiment_context = kwargs.pop('experiment_context', None)
     actor_is_normal_user = bool(kwargs.pop("actor_is_normal_user", False))
     private_output_registration = None
 
@@ -1572,12 +1576,12 @@ def run_script_by_name_data(
 
     # All ordinary-user processing products are born private. The caller cannot
     # redirect them back into a shared dataset root.
-    if actor_is_normal_user and script_name in {
+    if script_name in {
         "data_preprocessing", "score_based_filtering"
     } and not actor_user_id:
         return _data_error_response(
             script_name,
-            "普通用户请求缺少 actor_user_id，无法确定私有输出目录，已阻止执行。",
+            "请求缺少 actor_user_id，无法登记数据处理实验，已阻止执行。",
             error_reason="actor_user_id_required",
             recoverable=False,
         )
@@ -2042,6 +2046,45 @@ def run_script_by_name_data(
                 run_kwargs[k] = v
 
         # 对于Docker执行，需要特殊处理后台运行
+        record_experiment = script_name in {'data_preprocessing', 'score_based_filtering'}
+        if record_experiment:
+            relative_path_base = script_info.get('container_relative_path_base') or docker_kwargs.get('docker_working_dir')
+            output_folder = str(args.get('output_folder') or '').strip()
+            if not output_folder:
+                output_type = str(args.get('data_type') or 'sft').lower()
+                output_root = {'dpo': '/home/workspace/dataset_daily_train',
+                               'pt': '/home/workspace/dataset_pretrain',
+                               'text': '/home/workspace/dataset_pretrain'}.get(output_type, '/home/workspace/dataset_batch_train')
+                output_folder = f'{output_root}/{time.strftime("%Y%m%d")}'
+            args['output_folder'] = _resolve_container_path(output_folder, relative_path_base)
+            if cli_args.get('resume') is True:
+                # Ordinary users' output has already been redirected to a new private
+                # product. The explicit original argument identifies the prior result.
+                resume_source = str(cli_params_to_update.get('output_folder') or '').strip()
+                if not resume_source:
+                    return _data_error_response(script_name,
+                        '续跑需要通过 output_folder 指定上次结果目录；本次结果会保存到新的执行目录。',
+                        error_reason='resume_output_required', recoverable=True)
+                resume_source = _resolve_container_path(resume_source, relative_path_base)
+                if dataset_access_manifest is not None:
+                    try:
+                        require_allowed_dataset_path(resume_source, dataset_access_manifest, docker_kwargs['docker_container'])
+                    except DatasetAccessError as exc:
+                        return _data_error_response(script_name, str(exc),
+                            error_reason='dataset_access_denied', recoverable=False)
+                elif actor_is_normal_user and not resume_source.startswith(f'/home/workspace/medflow/users/{actor_user_id}/datasets/'):
+                    return _data_error_response(script_name, '续跑来源不在当前用户的授权数据目录中。',
+                        error_reason='dataset_access_denied', recoverable=False)
+                run_kwargs['experiment_resume_output'] = resume_source
+            run_kwargs['script_name'] = script_name
+            run_kwargs['script_args'] = args
+
+        def register_actual_output():
+            if private_output_registration and record_experiment:
+                actual_output = run_kwargs['script_args']['output_folder']
+                private_output_registration.update(source_path=actual_output,
+                    dataset_name=posixpath.basename(actual_output))
+
         if background and script_info.get("supports_background"):
             # 对于Docker后台运行，使用专门的Docker后台执行函数
             log_file = script_info.get("default_args", {}).get("log_file")
@@ -2055,7 +2098,10 @@ def run_script_by_name_data(
                     "threshold": float(cli_args.get("threshold") or 90),
                     "outputDatasetName": filter_output_dataset_name,
                 }
-            response = run_docker_in_background(**run_kwargs)
+            response = (launch_with_experiment(run_docker_in_background, run_kwargs, actor_user_id=actor_user_id,
+                script_name=script_name, kind='preprocess', requested=additional_args, context=experiment_context)
+                if record_experiment else run_docker_in_background(**run_kwargs))
+            register_actual_output()
             if private_output_registration and (response.metadata or {}).get("success", False):
                 try:
                     registered = _register_runtime_dataset(
@@ -2083,23 +2129,19 @@ def run_script_by_name_data(
             return response
         else:
             # 普通Docker执行
-            response = run_local_script(**run_kwargs)
+            response = (launch_with_experiment(run_local_script, run_kwargs, actor_user_id=actor_user_id,
+                script_name=script_name, kind='preprocess', requested=additional_args, context=experiment_context)
+                if record_experiment else run_local_script(**run_kwargs))
+            register_actual_output()
             if private_output_registration and (response.metadata or {}).get("success", True):
                 expected_output = str(private_output_registration.get("source_path") or "")
-                output_check = subprocess.run(
-                    [
-                        "docker",
-                        "exec",
-                        str(docker_kwargs["docker_container"]),
-                        "test",
-                        "-d",
-                        expected_output,
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                )
-                if output_check.returncode != 0:
+                attempt_id = (response.metadata or {}).get('experiment', {}).get('attemptId')
+                output_check = container_json(str(docker_kwargs['docker_container']), 'experiment_process.py',
+                    {'directory': f'/home/workspace/medflow/users/{actor_user_id}/experiments/{attempt_id}'}, 'probe')
+                usable_output = output_check.get('state') == 'succeeded' and any(
+                    item.get('path') == expected_output and item.get('role') == 'processed_dataset'
+                    for item in output_check.get('outputs', []))
+                if not usable_output:
                     return _data_error_response(
                         script_name,
                         f"数据处理脚本未在受控私有目录生成产物：{expected_output}。已禁止登记和后续使用。",
@@ -2363,6 +2405,8 @@ def run_script_in_docker(
         #if docker_working_dir:
             #shell_command_parts.append(f"cd {docker_working_dir}")
         # 添加执行命令
+        if kwargs.get('experiment_runner'):
+            command.extend(kwargs['experiment_runner'])
         #command.append(docker_executable)
         #command.append(script_path)
         if docker_executable and script_path and (
@@ -2432,7 +2476,9 @@ def run_script_in_docker(
                 type="text",
                 text="\n\n".join(result_text)
             )
-        ])
+        ], metadata={'success': process.returncode == 0, 'protocol_hint': {
+            'scriptName': kwargs.get('script_name'), 'container': docker_container,
+            'status': 'finished' if process.returncode == 0 else 'failed', 'returnCode': process.returncode}})
 
     except subprocess.TimeoutExpired:
         return ToolResponse(content=[
@@ -2602,6 +2648,10 @@ def run_docker_in_background(
 
             # 将所有命令用 && 连接
             shell_command = " && ".join(shell_command_parts)
+            if kwargs.get('experiment_runner'):
+                shell_command = build_background_shell_command(script_path=script_path, docker_executable=docker_executable,
+                    prefix_args=None, positional_args=positional_args, script_args=script_args,
+                    docker_working_dir=docker_working_dir, log_file=log_file, experiment_runner=kwargs['experiment_runner'])
 
             # 通过 /bin/bash -c 执行shell命令
             command.extend(["/bin/bash", "-c", shell_command])
@@ -2697,9 +2747,10 @@ def run_docker_in_background(
                 # 获取容器ID或进程信息
                 container_id = stdout.strip() if docker_image else docker_container
 
+                container_pid = parse_pid_from_output('\n'.join([stdout or '', stderr or ''])) if kwargs.get('experiment_runner') else None
                 process_info = {
                     "container_id": container_id,
-                    "pid": process.pid,
+                    "pid": container_pid if kwargs.get('experiment_runner') else process.pid,
                     "command": " ".join(command),
                     "log_file": log_file,
                     "pid_file": pid_file,
@@ -2803,6 +2854,7 @@ def run_docker_in_background(
                     script_name,
                     response_text,
                     container=docker_container or docker_image,
+                    pid=process_info.get('pid'),
                     command=" ".join(command),
                     scriptArgs=script_args or {},
                     envKeys=sorted((env_vars or {}).keys()),

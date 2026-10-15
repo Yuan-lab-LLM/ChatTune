@@ -2950,7 +2950,7 @@ interface RunContentPageProps {
   >;
   // Command handling props
   onTabChange: (
-    tab: "runs" | "overview" | "datasets" | "models" | "evaluation",
+    tab: "runs" | "overview" | "datasets" | "models" | "evaluation" | "experiments",
   ) => void;
   onQueryDatasets: (containerName?: string) => Promise<DatasetInfo[]>;
   onRefreshDatasets: (containerName?: string) => Promise<DatasetInfo[]>;
@@ -8019,7 +8019,7 @@ const RunContentPage = ({
                     >
                       <X className="h-3.5 w-3.5" />
                     </button>
-                    <div className="flex flex-col gap-2 pl-2 sm:flex-row sm:items-center sm:justify-between">
+                    <div className="flex min-w-0 flex-col gap-2 pl-2 pr-12 sm:flex-row sm:items-center sm:justify-between">
                       <div className="min-w-0 flex-1">
                         <div className="flex flex-wrap items-center gap-2 text-[15px] font-semibold text-violet-950 dark:text-violet-50">
                           <span className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-violet-500/90 text-white shadow-[0_8px_18px_-15px_rgba(124,58,237,0.54)] dark:bg-violet-400/90 dark:text-violet-950">
@@ -8040,14 +8040,23 @@ const RunContentPage = ({
                                     ? t("runpage.statusBar.dataFilterStatusFailed")
                                     : t("runpage.statusBar.dataFilterStatusNotStarted")}
                             </span>
-                            {displayedDataFilterTask.outputDatasetName && (
-                              <span className="rounded-md bg-white/42 px-2 py-0.5 ring-1 ring-violet-100/70 dark:bg-violet-950/20 dark:ring-violet-300/12">
+                          </div>
+                          {displayedDataFilterTask.outputDatasetName && (
+                            <div className="flex w-fit min-w-0 max-w-full self-start items-center gap-1 rounded-md bg-white/42 px-2 py-0.5 text-[11px] font-medium text-violet-800 ring-1 ring-violet-100/70 dark:bg-violet-950/20 dark:text-violet-100 dark:ring-violet-300/12">
+                              <span className="shrink-0">
                                 {t("runpage.statusBar.dataFilterOutputDataset")}
                                 {t("runpage.statusBar.labelSeparator")}
-                                {displayedDataFilterTask.outputDatasetName}
                               </span>
-                            )}
-                          </div>
+                              <Tooltip
+                                title={<span className="break-all">{displayedDataFilterTask.outputDatasetName}</span>}
+                                trigger={["hover", "focus", "click"]}
+                              >
+                                <span tabIndex={0} className="min-w-0 flex-1 truncate">
+                                  {displayedDataFilterTask.outputDatasetName}
+                                </span>
+                              </Tooltip>
+                            </div>
+                          )}
                           {displayedDataFilterTask.status === "running" &&
                             (displayedDataFilterTask.percent !== undefined ||
                               displayedDataFilterTask.processedItems !== undefined ||
@@ -8079,23 +8088,26 @@ const RunContentPage = ({
                                 </div>
                               )}
                               {displayedDataFilterTask.currentFile && (
-                                <div className="text-[11px] font-medium text-violet-800 dark:text-violet-200">
-                                  {t("runpage.statusBar.dataFilterCurrentFile", {
-                                    file: displayedDataFilterTask.currentFile,
-                                  })}
-                                </div>
+                                <Tooltip
+                                  title={<span className="break-all">{displayedDataFilterTask.currentFile}</span>}
+                                  trigger={["hover", "focus", "click"]}
+                                >
+                                  <div tabIndex={0} className="min-w-0 truncate text-[11px] font-medium text-violet-800 dark:text-violet-200">
+                                    {t("runpage.statusBar.dataFilterCurrentFile", {
+                                      file: displayedDataFilterTask.currentFile,
+                                    })}
+                                  </div>
+                                </Tooltip>
                               )}
                             </>
                           )}
                           {displayedDataFilterTask.status === "completed" && (
                             <div className="text-[11px] font-medium text-violet-800 dark:text-violet-200">
-                              {t("runpage.statusBar.dataFilterCompletedHint", {
-                                dataset: displayedDataFilterTask.outputDatasetName || "-",
-                              })}
+                              {t("runpage.statusBar.dataFilterCompletedHint")}
                             </div>
                           )}
                           {displayedDataFilterTask.status === "failed" && (
-                            <div className="text-[11px] font-medium text-red-600 dark:text-red-400">
+                            <div className="break-all text-[11px] font-medium text-red-600 dark:text-red-400">
                               {t("runpage.statusBar.dataFilterFailedHint")}
                               {displayedDataFilterTask.error
                                 ? `：${displayedDataFilterTask.error}`
@@ -8125,7 +8137,7 @@ const RunContentPage = ({
                           </div>
                         </div>
                       </div>
-                      <div className="flex flex-wrap items-center gap-2 pl-10 sm:pl-0">
+                      <div className="flex shrink-0 flex-wrap items-center gap-2 pl-10 sm:pl-0">
                         <Button
                           size="small"
                           loading={dataFilterMonitorState.isManualRefreshing}
@@ -8259,13 +8271,12 @@ const RunContentPage = ({
                             "该用户组暂无训练资源池配额"}
                         </span>
                       )}
-                    <span className="text-slate-400 dark:text-slate-500">
-                      {isTrainingPoolRequired
-                        ? t("runpage.trainingPoolRequired") ||
-                          "请选择本次训练资源池"
-                        : t("runpage.trainingPoolHint") ||
-                          "训练/评估启动会使用所选资源池"}
-                    </span>
+                    {isTrainingPoolRequired && (
+                      <span className="text-slate-400 dark:text-slate-500">
+                        {t("runpage.trainingPoolRequired") ||
+                          "请选择本次训练资源池"}
+                      </span>
+                    )}
                   </div>
                 )}
                 <div className="min-h-0 flex-1">
@@ -8742,9 +8753,9 @@ interface RunPageWithMetricsProps {
   systemOverviewData: SystemOverviewData | null;
   gpuInfo: GPUInfo[] | null;
   onRefreshGPUInfo: () => void;
-  activeTab: "runs" | "overview" | "datasets" | "models" | "evaluation";
+  activeTab: "runs" | "overview" | "datasets" | "models" | "evaluation" | "experiments";
   onTabChange: (
-    tab: "runs" | "overview" | "datasets" | "models" | "evaluation",
+    tab: "runs" | "overview" | "datasets" | "models" | "evaluation" | "experiments",
   ) => void;
   isMetricsSheetOpen: boolean;
   setIsMetricsSheetOpen: (open: boolean) => void;
@@ -11638,7 +11649,7 @@ const RunPage = () => {
 
   // 处理标签切换
   const handleTabChange = useCallback(
-    (tab: "runs" | "overview" | "datasets" | "models" | "evaluation") => {
+    (tab: "runs" | "overview" | "datasets" | "models" | "evaluation" | "experiments") => {
       setRunPageSection(tab);
       setRunPagePanelOpen(true);
     },

@@ -66,6 +66,7 @@ from utils.workflow_manager import (
     _benchmark_status_command,
     parse_workflow_control_command,
     train_result_reached_completion,
+    workflow_inference_experiment_context,
 )
 
 # 初始化配置（必须在导入 agentscope 之前）
@@ -616,6 +617,7 @@ REQUEST_ACTOR_USER_ID: ContextVar[str] = ContextVar(
     "request_actor_user_id",
     default="",
 )
+REQUEST_EXPERIMENT_CONTEXT: ContextVar[Optional[Dict[str, Any]]] = ContextVar('request_experiment_context', default=None)
 REQUEST_DATASET_ACCESS_MANIFEST: ContextVar[Optional[tuple[dict[str, Any], ...]]] = ContextVar(
     "request_dataset_access_manifest",
     default=None,
@@ -697,8 +699,8 @@ def _inference_gpus_per_node(
         if str(item or "").strip()
     ]
     request_payload = {
-        "tool": "config_show",
-        "args": {},
+        "tool": "gpu_recommend_allocation",
+        "args": {"for_reservation": True},
         "user_id": resolved_user_id,
         "user_aliases": aliases,
         "user_role": str(user_role or "").strip().lower(),
@@ -715,32 +717,35 @@ def _inference_gpus_per_node(
         payload = response.json()
     except Exception as exc:
         raise RuntimeError(
-            f"读取当前用户推理配置失败 user_id={resolved_user_id}: {exc}"
+            f"估算当前用户推理资源失败 user_id={resolved_user_id}: {exc}"
         ) from exc
 
     if not isinstance(payload, dict):
-        raise RuntimeError("当前用户推理配置返回格式无效")
+        raise RuntimeError("推理资源推荐返回格式无效")
     status = str(payload.get("status") or "").strip().lower()
     if status != "ok":
         detail = str(payload.get("result") or payload.get("message") or status or "unknown error")
-        raise RuntimeError(f"读取当前用户推理配置失败: {detail}")
+        raise RuntimeError(f"推理资源推荐失败: {detail}")
 
-    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-    config_draft = data.get("config_draft") if isinstance(data.get("config_draft"), dict) else {}
-    values = config_draft.get("values") if isinstance(config_draft.get("values"), dict) else {}
-    runtime = values.get("RUNTIME") if isinstance(values.get("RUNTIME"), dict) else {}
-    if "TENSOR_PARALLEL_SIZE" not in runtime:
-        raise RuntimeError(
-            "当前用户推理配置缺少 "
-            "data.config_draft.values.RUNTIME.TENSOR_PARALLEL_SIZE"
-        )
+    recommendation = payload.get("result")
+    if isinstance(recommendation, str):
+        try:
+            recommendation = json.loads(recommendation)
+        except ValueError as exc:
+            raise RuntimeError("推理资源推荐返回格式无效") from exc
+    if not isinstance(recommendation, dict):
+        raise RuntimeError("推理资源推荐返回格式无效")
+    if recommendation.get("ok") is not True:
+        raise RuntimeError("推理资源推荐失败: " + str(recommendation.get("analysis") or "没有可用的模型兼容 GPU 组合"))
     return _positive_inference_gpu_count(
-        runtime.get("TENSOR_PARALLEL_SIZE"),
-        "当前用户推理配置 RUNTIME.TENSOR_PARALLEL_SIZE",
+        recommendation.get("recommended_tp"),
+        "模型及 GPU 状态推荐的 TP",
     )
 
 
 def _inference_ops_headers() -> Dict[str, str]:
+    from inference_runtime_config import ensure_inference_runtime
+    ensure_inference_runtime(config.agents.inference.inference_agent_url)
     auth_mode = str(
         os.getenv("INFERENCE_OPS_AUTH_MODE") or "trusted_network"
     ).strip().lower()
@@ -1561,6 +1566,7 @@ def _workflow_inference_owner_kwargs(context: Optional[Dict[str, Any]]) -> Dict[
     }
 @wraps(run_script_by_name_data)
 def run_group_data(*args, **kwargs):
+    kwargs.setdefault('experiment_context', dict(REQUEST_EXPERIMENT_CONTEXT.get() or {}))
     container = _current_training_container()
     env_vars = dict(kwargs.get("env_vars") or {})
     env_vars.setdefault("container", container)
@@ -1640,6 +1646,7 @@ def run_group_data_collect(*args, **kwargs):
 
 @wraps(run_script_by_name_train)
 def run_group_train(script_query: str, *args, **kwargs):
+    kwargs.setdefault('experiment_context', dict(REQUEST_EXPERIMENT_CONTEXT.get() or {}))
     env_vars = dict(kwargs.get("env_vars") or {})
     resource_group_id = _current_resource_group_id().strip()
     if resource_group_id:
@@ -1673,6 +1680,8 @@ def run_group_train(script_query: str, *args, **kwargs):
 
 @wraps(run_script_by_name_assessment)
 def run_group_assessment(script_query: str, *args, **kwargs):
+    kwargs.setdefault('experiment_context', dict(REQUEST_EXPERIMENT_CONTEXT.get() or {}))
+    kwargs["actor_user_id"] = _current_actor_user_id()
     env_vars = dict(kwargs.get("env_vars") or {})
     resource_group_id = _current_resource_group_id().strip()
     if resource_group_id:
@@ -1689,6 +1698,18 @@ def run_group_assessment(script_query: str, *args, **kwargs):
 def run_group_assessment_monitor(script_query: str = "assessment_monitor", *args, **kwargs):
     kwargs.setdefault("container_name", _current_training_container())
     return run_script_by_name_assessment_monitor(script_query, *args, **kwargs)
+
+
+_raw_training_monitor = run_script_by_name_monitor1
+@wraps(_raw_training_monitor)
+def run_group_training_monitor(*args, **kwargs):
+    kwargs.setdefault('actor_user_id', _current_actor_user_id())
+    kwargs.setdefault('experiment_context', dict(REQUEST_EXPERIMENT_CONTEXT.get() or {}))
+    kwargs.setdefault('dataset_access_manifest', _current_dataset_access_manifest())
+    return _raw_training_monitor(*args, **kwargs)
+
+
+run_script_by_name_monitor1 = run_group_training_monitor
 
 
 # Legacy aliases retained for existing callers and persisted workflows.
@@ -1948,6 +1969,10 @@ def _workflow_response_payload(response: ToolResponse) -> Dict[str, Any]:
     metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
     return {
         "status": status,
+        "experiment_id": hint.get("experimentId"),
+        "experiment_task_id": hint.get("experimentTaskId"),
+        "experiment_attempt_id": hint.get("experimentAttemptId"),
+        "evaluated_model_path": hint.get("evaluatedModelPath"),
         "pid": hint.get("pid") or metrics.get("pid"),
         "container": hint.get("container") or metrics.get("container_name"),
         "error": metrics.get("error_detail") or hint.get("errorReason") or metrics.get("error_reason"),
@@ -2008,7 +2033,7 @@ def _workflow_evaluate_result_matches_workflow(
 ) -> bool:
     """Return True only when monitor evidence belongs to this workflow model."""
     context = workflow.get("context") or {}
-    target_path = str(context.get("trained_model_path") or "").strip()
+    target_path = str(context.get("evaluation_model_path") or context.get("trained_model_path") or "").strip()
     target_name = os.path.basename(target_path.rstrip("/"))
     if not target_name:
         return True
@@ -2121,6 +2146,23 @@ def _workflow_train_rebound_matches_workflow(
     return True
 
 
+def _workflow_experiment_context(workflow: Dict[str, Any], stage_name: str) -> Dict[str, Any]:
+    context = workflow["context"]
+    launch = context.setdefault("experiment_launches", {}).get(stage_name)
+    if not launch:
+        launch = {**(context.get('experiment_context') or {}),
+                  "requestKey": f"request-{uuid.uuid4()}", "workflowId": workflow["workflow_id"]}
+        if context.get("experiment_id"):
+            launch["experimentId"] = context["experiment_id"]
+        stage = workflow["stages"][stage_name]
+        if stage.get("experiment_task_id"):
+            launch["taskId"] = stage["experiment_task_id"]
+        context["experiment_launches"][stage_name] = launch
+        # The request key must survive a lost launch response or Runtime restart.
+        get_workflow_manager().update_context(workflow["workflow_id"], experiment_launches=context["experiment_launches"])
+    return launch
+
+
 def _workflow_start_train(workflow: Dict[str, Any]) -> Dict[str, Any]:
     dataset_ref = workflow["dataset_ref"]
     context = workflow["context"]
@@ -2199,8 +2241,12 @@ def _workflow_start_train(workflow: Dict[str, Any]) -> Dict[str, Any]:
         background=True,
         dataset_access_manifest=context.get("dataset_access_manifest") or [],
         actor_user_id=str(context.get("actor_user_id") or ""),
+        experiment_context=_workflow_experiment_context(workflow, "train"),
     )
     result = _workflow_response_payload(response)
+    if result.get("experiment_id"):
+        context["experiment_id"] = result["experiment_id"]
+        get_workflow_manager().update_context(workflow["workflow_id"], experiment_id=result["experiment_id"])
     if not (response.metadata or {}).get("success", False):
         raise RuntimeError(result.get("message") or "LoRA训练启动失败")
     return result
@@ -2634,6 +2680,8 @@ def _workflow_start_evaluate(workflow: Dict[str, Any]) -> Dict[str, Any]:
         })
     response = run_script_by_name_evaluate(
         evaluation_script,
+        actor_user_id=str(workflow["context"].get("actor_user_id") or ""),
+        experiment_context=_workflow_experiment_context(workflow, "evaluate"),
         additional_args=additional_args,
         env_vars={
             "container": _workflow_single_model_evaluation_container(workflow),
@@ -2649,6 +2697,9 @@ def _workflow_start_evaluate(workflow: Dict[str, Any]) -> Dict[str, Any]:
     result = _workflow_response_payload(response)
     if not (response.metadata or {}).get("success", False):
         raise RuntimeError(result.get("message") or "单模型评估启动失败")
+    if result.get("evaluated_model_path"):
+        workflow["context"]["evaluation_model_path"] = result["evaluated_model_path"]
+    run_id = result.get('run_id') or run_id
     report_path = f"/home/workspace/eval/llamafactory/{run_id}/summary.txt" if run_id else None
     return {
         **result,
@@ -2672,7 +2723,7 @@ def _workflow_monitor_evaluate(workflow: Dict[str, Any]) -> Dict[str, Any]:
         additional_args=monitor_args,
         container_name=stage.get("container") or _workflow_single_model_evaluation_container(workflow),
         pid=stage.get("pid"),
-        model_fir=workflow["context"]["trained_model_path"],
+        model_fir=workflow["context"].get("evaluation_model_path") or workflow["context"]["trained_model_path"],
     )
     result = _workflow_response_payload(response)
     if evaluation_scope == "general":
@@ -2703,104 +2754,17 @@ def _workflow_monitor_evaluate(workflow: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _workflow_start_publish(workflow: Dict[str, Any]) -> Dict[str, Any]:
-    """启动后台异步复制，返回进程信息。"""
-    source = workflow["context"]["trained_model_path"]
-    model_name = os.path.basename(source)
-    destination = f"{config.workflow.publish_dir.rstrip('/')}/{model_name}"
-    inference_container = _workflow_evaluation_container(workflow)
-    workflow_id = workflow["workflow_id"]
-    marker_json = json.dumps(
-        {
-            "workflow_id": workflow_id,
-            "source_model_path": source,
-            "source_model_name": model_name,
-        },
-        ensure_ascii=False,
-    )
-
-    temp_dir = f"/tmp/workflow_publish_{workflow_id}_{model_name}"
-    progress_file = f"/tmp/workflow_publish_{workflow_id}_progress"
-    script_path = f"/tmp/workflow_publish_{workflow_id}.sh"
-
-    # 创建后台复制脚本
-    script_content = (
-        f"#!/bin/bash\n"
-        f"set -e\n"
-        f'PROGRESS_FILE="{progress_file}"\n'
-        f'TEMP_DIR="{temp_dir}"\n'
-        f'DESTINATION="{destination}"\n'
-        f'INFERENCE_CONTAINER="{inference_container}"\n'
-        f'SOURCE="{source}"\n'
-        f'TRAIN_CONTAINER="{_workflow_training_container(workflow)}"\n\n'
-        f'write_progress() {{\n'
-        f'  local percent="$1"\n'
-        f'  local step="$2"\n'
-        f'  local step_name="$3"\n'
-        f'  local message="$4"\n'
-        f'  {{\n'
-        f'    echo "percent=${{percent}}"\n'
-        f'    echo "current_step=${{step}}"\n'
-        f'    echo "total_steps=4"\n'
-        f'    echo "step_name=${{step_name}}"\n'
-        f'    echo "message=${{message}}"\n'
-        f'    echo "source=${{SOURCE}}"\n'
-        f'    echo "destination=${{DESTINATION}}"\n'
-        f'    echo "temp_dir=${{TEMP_DIR}}"\n'
-        f'    echo "train_container=${{TRAIN_CONTAINER}}"\n'
-        f'    echo "inference_container=${{INFERENCE_CONTAINER}}"\n'
-        f'  }} > "$PROGRESS_FILE"\n'
-        f'}}\n\n'
-        f'rm -rf "$TEMP_DIR"\n'
-        f'write_progress 0 1 "copy_to_host" "正在复制模型到宿主机"\n\n'
-        f'# 步骤1: 训练容器 → 宿主机\n'
-        f'docker cp "$TRAIN_CONTAINER:$SOURCE" "$TEMP_DIR"\n'
-        f'printf %s {shlex.quote(marker_json)} > "$TEMP_DIR/.workflow_publish_source.json"\n'
-        f'write_progress 45 2 "prepare_destination" "正在准备推理容器目标目录"\n\n'
-        f'# 步骤2: 宿主机 → 推理容器\n'
-        f'docker exec "$INFERENCE_CONTAINER" mkdir -p "$(dirname "$DESTINATION")"\n'
-        f'docker exec "$INFERENCE_CONTAINER" rm -rf "${{DESTINATION}}.tmp"\n'
-        f'write_progress 55 3 "copy_to_inference" "正在复制模型到推理容器"\n'
-        f'docker cp "$TEMP_DIR" "$INFERENCE_CONTAINER:${{DESTINATION}}.tmp"\n'
-        f'write_progress 90 4 "activate_model" "正在完成发布"\n\n'
-        f'# 步骤3: 原子性重命名\n'
-        f'docker exec "$INFERENCE_CONTAINER" mv "${{DESTINATION}}.tmp" "$DESTINATION"\n'
-        f'rm -rf "$TEMP_DIR"\n\n'
-        f'write_progress 100 4 "finished" "发布完成"\n'
-    )
-
-    with open(script_path, "w", encoding="utf-8") as f:
-        f.write(script_content)
-    os.chmod(script_path, 0o755)
-
-    # 启动后台进程
-    process = subprocess.Popen(
-        ["nohup", "bash", script_path],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-
-    return {
-        "pid": str(process.pid),
-        "container": "host",
-        "model_path": destination,
-        "model_name": model_name,
-        "progress_file": progress_file,
-        "progress_percent": 0,
-        "message": "正在复制模型到宿主机",
-        "metrics": {
-            "progress_percent": 0,
-            "current_step": 1,
-            "total_steps": 4,
-            "step_name": "copy_to_host",
-            "source": source,
-            "destination": destination,
-            "temp_dir": temp_dir,
-            "train_container": _workflow_training_container(workflow),
-            "inference_container": inference_container,
-            "message": "正在复制模型到宿主机",
-        },
-    }
+    from utils.experiment_tracker import get_experiment_tracker
+    from utils.experiment_publish import start_publish
+    source = workflow["context"]["trained_model_path"].rstrip("/")
+    destination = f"{config.workflow.publish_dir.rstrip('/')}/{os.path.basename(source)}"
+    return start_publish(get_experiment_tracker(),
+        owner=str(workflow["context"].get("actor_user_id") or ""),
+        source_container=_workflow_training_container(workflow), source=source,
+        target_container=_workflow_evaluation_container(workflow), destination=destination,
+        context=_workflow_experiment_context(workflow, "publish"),
+        source_attempts=[(workflow["stages"].get(stage) or {}).get("experiment_attempt_id")
+                         for stage in ("evaluate", "train")])
 
 
 def _workflow_parse_publish_progress(content: str) -> Dict[str, Any]:
@@ -2838,6 +2802,19 @@ def _workflow_parse_publish_progress(content: str) -> Dict[str, Any]:
 def _workflow_monitor_publish(workflow: Dict[str, Any]) -> Dict[str, Any]:
     """检查复制进度。"""
     stage = workflow["stages"]["publish"]
+    if stage.get("experiment_attempt_id"):
+        from utils.experiment_tracker import get_experiment_tracker
+        from utils.experiment_publish import collect_publish, summary
+        tracker = get_experiment_tracker()
+        execution = tracker.execution(stage["experiment_attempt_id"])
+        if not execution or execution['actor_user_id'] != str(workflow['context'].get('actor_user_id') or ''):
+            raise ValueError('Publication record is unavailable for this workflow owner')
+        try:
+            collect_publish(tracker, execution)
+        except Exception as exc:
+            tracker.emit(execution['attempt_id'], 'status', {'status': execution['state'],
+                'runtime': {'archiveStatus': 'retrying', 'archiveError': str(exc)}}, preserve_terminal=True)
+        return summary(tracker.execution(execution['attempt_id']))
     pid = str(stage.get("pid") or "").strip()
     progress_file = stage.get("progress_file")
     model_path = stage.get("model_path") or ""
@@ -3489,6 +3466,7 @@ def _workflow_start_benchmark(workflow: Dict[str, Any]) -> Dict[str, Any]:
     result = _workflow_inference_command(
         _benchmark_start_command(workflow),
         container,
+        workflow=workflow,
         resource_group_id=resource_group_id,
         training_pool_id=training_pool_id,
         **owner_kwargs,
@@ -4064,6 +4042,11 @@ def _workflow_inference_command(
         }
         if user_role:
             request_payload["user_role"] = user_role.strip().lower()
+        experiment_context = dict(REQUEST_EXPERIMENT_CONTEXT.get() or {})
+        if workflow is not None:
+            experiment_context = workflow_inference_experiment_context(workflow, experiment_context)
+        if experiment_context:
+            resource_context = {**(resource_context or {}), 'experiment_context': experiment_context}
         if resource_context:
             request_payload["resource_context"] = resource_context
         response = requests.post(
@@ -4167,6 +4150,8 @@ def _workflow_inference_command(
     }
 
 def _workflow_stop_task(workflow: Dict[str, Any]) -> Dict[str, Any]:
+    from utils.experiment_launch import request_workflow_cancellation
+    request_workflow_cancellation(workflow)
     stage_name = workflow["current_stage"]
     stage = workflow["stages"][stage_name]
     if stage_name == "benchmark":
@@ -4217,6 +4202,14 @@ def _workflow_stop_task(workflow: Dict[str, Any]) -> Dict[str, Any]:
             "stop_service_log_updated_at": stop_service_result.get("stop_service_log_updated_at"),
             **_workflow_stage_log_fields(workflow, "deploy"),
         }
+    if stage_name == "publish" and stage.get("experiment_attempt_id"):
+        from utils.experiment_tracker import get_experiment_tracker
+        from utils.experiment_publish import stop_publish
+        execution = get_experiment_tracker().execution(stage["experiment_attempt_id"])
+        if not execution or execution['actor_user_id'] != str(workflow['context'].get('actor_user_id') or ''):
+            raise ValueError('Publication record is unavailable for this workflow owner')
+        stop_publish(execution)
+        return {"message": "已向发布执行发送停止信号，等待进程日志确认终态"}
     pid = str(stage.get("pid") or "").strip()
     container = str(stage.get("container") or "").strip()
     if not pid:
@@ -4337,6 +4330,11 @@ async def _push_terminal_workflow_update(workflow: Dict[str, Any]) -> None:
         logger.exception("Failed to push terminal workflow update %s", workflow.get("workflow_id"))
 
 
+def _sync_workflow_experiment(workflow: Dict[str, Any]) -> None:
+    from utils.experiment_tracker import get_experiment_tracker
+    get_experiment_tracker().record_workflow(workflow)
+
+
 def get_workflow_manager() -> WorkflowManager:
     global _WORKFLOW_MANAGER
     with _WORKFLOW_MANAGER_LOCK:
@@ -4348,6 +4346,7 @@ def get_workflow_manager() -> WorkflowManager:
                 train_start_grace_seconds=config.workflow.train_start_grace_seconds,
                 event_lease_seconds=config.workflow.event_lease_seconds,
                 on_terminal_update=_notify_terminal_workflow_update,
+                on_update=_sync_workflow_experiment,
                 dependencies=WorkflowDependencies(
                     start_train=_workflow_start_train,
                     monitor_train=_workflow_monitor_train,
@@ -7417,6 +7416,8 @@ class OrchestratorSystem:
                 "generic_eval_failed": "通用评测失败，请查看错误信息或评测日志。",
                 "manifest_missing": "评测进程已结束，但没有生成任务清单。",
                 "run_id_required": "评测启动记录缺少 Run ID，无法定位本次评测结果。",
+                "monitor_internal_error": "训练状态查询发生异常，暂时无法确认训练状态，请稍后重试。",
+                "internal_error_suppressed": "监控查询发生异常，请稍后刷新状态。",
                 "unknown": "训练未正常完成，暂时无法从日志判断具体原因。",
             }.get(reason, "")
 
@@ -7430,12 +7431,17 @@ class OrchestratorSystem:
                 exit_code = reason.removeprefix("wandb_exitcode_")
                 return f"训练进程返回非零退出码 {exit_code}，未能正常完成。"
             if reason:
+                reason_text = _monitor_error_reason_text(reason)
+                if status_raw == "unknown" and reason == "unknown":
+                    reason_text = ""
                 fallback_reason = (
-                    "评估任务未正常完成，暂时无法从日志判断具体原因。"
+                    "暂时无法确认任务状态，请稍后刷新。"
+                    if status_raw == "unknown"
+                    else "评估任务未正常完成，暂时无法从日志判断具体原因。"
                     if is_assessment
                     else "训练未正常完成，暂时无法从日志判断具体原因。"
                 )
-                return _monitor_error_reason_text(reason) or fallback_reason
+                return reason_text or fallback_reason
             return ""
 
         if is_generic_assessment:
@@ -10233,6 +10239,9 @@ class OrchestratorSystem:
                 "thread_id": inference_thread_id,
                 "container": self.evaluation_container,
             }
+            experiment_context = dict(REQUEST_EXPERIMENT_CONTEXT.get() or {})
+            if experiment_context:
+                resource_context = {**(resource_context or {}), 'experiment_context': experiment_context}
             if resource_context:
                 request_payload["resource_context"] = resource_context
             response = requests.post(
@@ -13370,6 +13379,7 @@ exit 0
                 "dataset_resource_id": selected_entry.get("resourceId"),
                 "dataset_access_manifest": manifest,
                 "actor_user_id": _current_actor_user_id(),
+                'experiment_context': dict(REQUEST_EXPERIMENT_CONTEXT.get() or {}),
             }
             if launch_mode == "multinode":
                 context["launch_mode"] = "multinode"
@@ -13426,6 +13436,7 @@ exit 0
             "dataset_resource_id": selected_entry.get("resourceId"),
             "dataset_access_manifest": manifest,
             "actor_user_id": _current_actor_user_id(),
+            'experiment_context': dict(REQUEST_EXPERIMENT_CONTEXT.get() or {}),
         }
         if launch_mode == "multinode":
             context["launch_mode"] = "multinode"
@@ -13544,8 +13555,11 @@ exit 0
         role_value = str(context.get("user_role") or _current_user_role()).strip().lower()
         resource_group_token = training_pool_token = user_role_token = None
         owner_user_id_token = owner_aliases_token = None
+        experiment_token = None
         try:
             if workflow:
+                experiment_token = REQUEST_EXPERIMENT_CONTEXT.set(
+                    workflow_inference_experiment_context(workflow, REQUEST_EXPERIMENT_CONTEXT.get()))
                 resource_group_token = REQUEST_RESOURCE_GROUP_ID.set(
                     str(context.get("resource_group_id") or "").strip()
                 )
@@ -13561,6 +13575,8 @@ exit 0
                 )
             response = await self._call_inference(command, command=command)
         finally:
+            if experiment_token is not None:
+                REQUEST_EXPERIMENT_CONTEXT.reset(experiment_token)
             if owner_aliases_token is not None:
                 REQUEST_INFERENCE_OWNER_ALIASES.reset(owner_aliases_token)
             if owner_user_id_token is not None:
@@ -13742,6 +13758,8 @@ exit 0
                     f"必须使用 model_fir={model_fir}，evaluation_scope=medical。"
                 )
             previous_child_context = self._workflow_child_context
+            experiment_token = REQUEST_EXPERIMENT_CONTEXT.set(_workflow_experiment_context(workflow, 'evaluate'))
+            actor_token = REQUEST_ACTOR_USER_ID.set(str(workflow['context'].get('actor_user_id') or ''))
             self._workflow_child_context = {
                 "workflow_id": workflow["workflow_id"],
                 "stage": "evaluate",
@@ -13767,6 +13785,8 @@ exit 0
                 REQUEST_EVALUATION_CONTAINER.reset(evaluation_token)
                 REQUEST_TRAINING_CONTAINER.reset(training_container_token)
                 self._workflow_child_context = previous_child_context
+                REQUEST_EXPERIMENT_CONTEXT.reset(experiment_token)
+                REQUEST_ACTOR_USER_ID.reset(actor_token)
             require_running()
             if result.get("failed"):
                 raise RuntimeError(result.get("display") or "evaluator 启动评测失败")
@@ -13776,8 +13796,11 @@ exit 0
             if evaluation_scope == "general":
                 actual_script = str(protocol.get("scriptName") or protocol.get("script") or "").strip()
                 actual_run_id = str(protocol.get("runId") or "").strip()
-                if actual_script != evaluation_script or actual_run_id != run_id:
+                if actual_script != evaluation_script or (actual_run_id != run_id and actual_run_id != protocol.get('experimentAttemptId')):
                     raise RuntimeError("evaluator 未按当前工作流的通用评测脚本或 run_id 启动任务")
+                run_id = actual_run_id
+            if protocol.get('evaluatedModelPath'):
+                manager.update_context(workflow['workflow_id'], evaluation_model_path=protocol['evaluatedModelPath'])
             report_path = f"/home/workspace/eval/llamafactory/{run_id}/summary.txt" if run_id else None
             workflow = manager.record_running_stage(
                 workflow["workflow_id"],
@@ -14430,6 +14453,8 @@ exit 0
 
     async def _stop_workflow_runtime(self, workflow: Dict[str, Any]) -> Optional[str]:
         """Stop the active runtime task with the same cleanup used by standalone jobs."""
+        from utils.experiment_launch import request_workflow_cancellation
+        request_workflow_cancellation(workflow)
         stage_name = str(workflow.get("current_stage") or "")
         stage = (workflow.get("stages") or {}).get(stage_name, {})
         pid = str(stage.get("pid") or "").strip() or None
@@ -15197,6 +15222,8 @@ async def process_user_message_structured(
     owner_aliases: Any = None,
     actor_user_id: str = "",
     dataset_access_manifest: Any = None,
+    conversation_run_id: str = '',
+    experiment_project: str = 'default',
 ) -> Dict[str, Any]:
     """处理用户消息，并返回前端可直接消费的轻量协议结果。"""
     logger.info(f"用户{user_id}; 输入{message}")
@@ -15253,6 +15280,8 @@ async def process_user_message_structured(
     owner_user_id_token = REQUEST_INFERENCE_OWNER_USER_ID.set(resolved_owner_user_id)
     owner_aliases_token = REQUEST_INFERENCE_OWNER_ALIASES.set(tuple(resolved_owner_aliases))
     actor_user_id_token = REQUEST_ACTOR_USER_ID.set(resolved_actor_user_id)
+    experiment_token = REQUEST_EXPERIMENT_CONTEXT.set({'project': experiment_project,
+        **({'conversationRunId': conversation_run_id} if conversation_run_id else {})})
     dataset_manifest_token = REQUEST_DATASET_ACCESS_MANIFEST.set(resolved_dataset_access_manifest)
     last_dataset_output_token = begin_dataset_output_capture()
     session.system.training_container = resolved_training_container
@@ -15265,6 +15294,7 @@ async def process_user_message_structured(
         reset_dataset_output_capture(last_dataset_output_token)
         REQUEST_DATASET_ACCESS_MANIFEST.reset(dataset_manifest_token)
         REQUEST_ACTOR_USER_ID.reset(actor_user_id_token)
+        REQUEST_EXPERIMENT_CONTEXT.reset(experiment_token)
         REQUEST_INFERENCE_OWNER_ALIASES.reset(owner_aliases_token)
         REQUEST_INFERENCE_OWNER_USER_ID.reset(owner_user_id_token)
         REQUEST_USER_ROLE.reset(user_role_token)

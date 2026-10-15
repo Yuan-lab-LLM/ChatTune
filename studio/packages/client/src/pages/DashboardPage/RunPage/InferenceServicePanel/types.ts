@@ -32,6 +32,7 @@ export interface ServiceStatus {
   serviceKey?: string;
   displayName?: string;
   instanceId?: string;
+  experimentId?: string;
   node?: string;
   gpus?: string[];
   model?: string;

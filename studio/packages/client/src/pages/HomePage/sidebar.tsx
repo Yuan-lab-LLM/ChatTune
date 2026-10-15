@@ -99,6 +99,7 @@ const StudioSidebar = () => {
     icon: typeof ListIcon;
     label: string;
   }> = [
+    { key: "experiments", icon: BeakerIcon, label: t("tab.experiments", { defaultValue: "实验记录" }) },
     {
       key: "overview",
       icon: LayoutDashboardIcon,

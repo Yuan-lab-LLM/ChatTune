@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -22,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from resource_catalog import load_resource_catalog_config, resource_path_maps
 from utils.benchmark_status import (
@@ -168,10 +169,20 @@ class ModelRequest(ContainerRequest):
     modelPath: str | None = None
 
 
+class ModelPublicationRequest(ModelRequest):
+    actorUserId: str
+    requestKey: str
+    destinationContainer: str
+    destinationDirectory: str
+    destinationName: str
+    allowCustomDestination: bool = False
+
+
 class UploadDatasetRequest(DatasetRequest):
     filename: str
     fileBase64: str
     ownerUserId: str | None = None
+    actorUserId: str
 
 
 class DatasetMoveRequest(DatasetRequest):
@@ -253,6 +264,7 @@ class TrainingReservationStopProcessRequest(BaseModel):
 
 class InferenceReservationStopServiceRequest(BaseModel):
     reservationId: str
+    actorUserId: str | None = None
     container: str | None = None
     resourceContext: dict[str, Any] | None = None
     force: bool = False
@@ -737,6 +749,28 @@ def _authorize(authorization: str | None = Header(default=None)) -> None:
         raise HTTPException(401, "Invalid resource API token")
 
 
+class ExperimentDraftLaunchRequest(BaseModel):
+    nodeId: str
+    actorUserId: str
+    experimentId: str
+    name: str
+    project: str = 'default'
+    groupId: str | None = None
+    container: str
+    kind: str
+    spec: dict[str, Any]
+    inputAssets: list[dict[str, Any]] = Field(default_factory=list)
+
+
+@router.post('/experiments/launch', dependencies=[Depends(_authorize)])
+def launch_experiment_draft(request: ExperimentDraftLaunchRequest):
+    from utils.experiment_replay import launch_draft
+    try:
+        return _response(launch_draft(request.model_dump()))
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
 def _safe_name(value: str, label: str) -> str:
     value = value.strip()
     if not SAFE_NAME.fullmatch(value):
@@ -946,6 +980,52 @@ def _model_contains_lora_adapter(container: str, model_dir: str) -> bool:
     return bool(str(output or "").strip())
 
 
+_MODEL_SHARD = re.compile(r"^(model|pytorch_model)-(\d{5})-of-(\d{5})\.(safetensors|bin)$")
+
+
+def _complete_merged_weights(file_sizes: dict[str, int]) -> bool:
+    """Accept a merged directory only when its advertised weight set is present."""
+    shards = []
+    for name, size in file_sizes.items():
+        match = _MODEL_SHARD.fullmatch(name)
+        if match:
+            shards.append((match, size))
+    if shards:
+        formats = {(match.group(1), match.group(3), match.group(4)) for match, _ in shards}
+        if len(formats) != 1:
+            return False
+        prefix, total_text, extension = next(iter(formats))
+        total = int(total_text)
+        actual = {int(match.group(2)) for match, size in shards if size > 0}
+        index_name = (
+            "model.safetensors.index.json"
+            if extension == "safetensors"
+            else "pytorch_model.bin.index.json"
+        )
+        return (
+            prefix == ("model" if extension == "safetensors" else "pytorch_model")
+            and total > 0
+            and len(shards) == total
+            and actual == set(range(1, total + 1))
+            and file_sizes.get(index_name, 0) > 0
+        )
+    return any(file_sizes.get(name, 0) > 0 for name in ("model.safetensors", "pytorch_model.bin"))
+
+
+def _model_has_complete_merged_weights(container: str, model_dir: str) -> bool:
+    script = 'find "$1" -maxdepth 1 -type f -printf "%f\\t%s\\n" 2>/dev/null'
+    output = _docker(
+        container,
+        ["sh", "-c", script, "merged-weight-list", model_dir],
+    ).stdout
+    file_sizes: dict[str, int] = {}
+    for line in output.splitlines():
+        name, separator, size = line.partition("\t")
+        if separator and size.isdigit():
+            file_sizes[name] = int(size)
+    return _complete_merged_weights(file_sizes)
+
+
 def _model_artifact_types(
     legacy_type: str,
     *,
@@ -1135,6 +1215,10 @@ def _models(container: str) -> dict[str, list[dict[str, Any]]]:
                 (DPO_MODEL_PATHS["export"], True),
             ):
                 for entry in _list_dirs(container, dpo_path):
+                    if merged and not _model_has_complete_merged_weights(
+                        container, f"{dpo_path}/{entry['name']}"
+                    ):
+                        continue
                     entry["type"] = kind
                     entry["merged"] = merged
                     entry["checkpoints"] = _list_model_checkpoints(
@@ -1161,12 +1245,21 @@ def _models(container: str) -> dict[str, list[dict[str, Any]]]:
             continue
 
         entries = _list_dirs(container, path)
+        if kind in {"batch_trained", "pretrain"}:
+            entries = [
+                entry for entry in entries
+                if not entry["name"].endswith(("_merged", "-merged"))
+                or _model_has_complete_merged_weights(
+                    container, f"{path}/{entry['name']}"
+                )
+            ]
         entry_names = {entry["name"] for entry in entries}
         for entry in entries:
             entry["type"] = kind
             entry["merged"] = (
-                entry["name"].endswith("_merged")
+                entry["name"].endswith(("_merged", "-merged"))
                 or f"{entry['name']}_merged" in entry_names
+                or f"{entry['name']}-merged" in entry_names
             )
             if kind in {"batch_trained", "pretrain"}:
                 entry["checkpoints"] = _list_model_checkpoints(
@@ -2310,6 +2403,8 @@ def _inference_agent_url() -> str:
 
 
 def _inference_ops_request_headers() -> dict[str, str]:
+    from inference_runtime_config import ensure_inference_runtime
+    ensure_inference_runtime(_inference_agent_url())
     auth_mode = str(
         os.getenv("INFERENCE_OPS_AUTH_MODE") or "trusted_network"
     ).strip().lower()
@@ -2378,7 +2473,7 @@ def _stop_inference_service(request: InferenceReservationStopServiceRequest) -> 
         raise HTTPException(400, "INFERENCE_AGENT_URL is not configured")
     payload = {
         "command": "停止推理服务",
-        "user_id": "resource-reservation-admin",
+        "user_id": request.actorUserId or "resource-reservation-admin",
         "user_role": "admin",
         "thread_id": f"reservation:{request.reservationId}:inference-stop",
         "force": bool(request.force),
@@ -2547,6 +2642,7 @@ if os.path.isdir(root):
             except (OSError, ValueError):
                 return {}
         meta = load("meta.json")
+        experiment = meta.get("experiment") if isinstance(meta.get("experiment"), dict) else {}
         result = load("result.json")
         summary = result.get("summary")
         summary = summary if isinstance(summary, dict) else {}
@@ -2564,6 +2660,8 @@ if os.path.isdir(root):
         }
         if isinstance(total_score, (int, float)):
             item["totalScore"] = total_score
+        if isinstance(experiment.get("experimentId"), str):
+            item["experimentId"] = experiment["experimentId"]
         items.append(item)
 print(json.dumps(items, ensure_ascii=False))
 """
@@ -2876,6 +2974,58 @@ def quarantine_dataset(request: DatasetMoveRequest):
     return _move_dataset(request, False)
 
 
+def _publication_source(request: ModelRequest) -> str:
+    if request.modelType not in MODEL_PATHS:
+        raise HTTPException(400, 'Invalid model type')
+    name = _safe_name(request.modelName, 'model name')
+    allowed = set(DPO_MODEL_PATHS.values()) if request.modelType == 'daily_trained' else {MODEL_PATHS[request.modelType]}
+    base = request.modelPath or MODEL_PATHS[request.modelType]
+    if base not in allowed:
+        raise HTTPException(400, 'Invalid model path')
+    return f'{base.rstrip("/")}/{name}'
+
+
+def _publication_directory() -> str:
+    return (os.getenv('MEDFLOW_MODEL_PUBLICATION_DIR', '').strip() or MODEL_PATHS['inference']).rstrip('/')
+
+
+@router.get('/models/publication-targets', dependencies=[Depends(_authorize)])
+def model_publication_targets():
+    names = _run(['docker', 'ps', '--format', '{{.Names}}']).stdout.splitlines()
+    return _response({'containers': [name.strip() for name in names if name.strip()],
+                      'directory': _publication_directory()})
+
+
+@router.post('/models/publish', dependencies=[Depends(_authorize)])
+def publish_model(request: ModelPublicationRequest):
+    from pathlib import PurePosixPath
+    from utils.experiment_tracker import get_experiment_tracker
+    from utils.model_publication import start
+    source = _publication_source(request)
+    directory = request.destinationDirectory.rstrip('/')
+    path = PurePosixPath(directory)
+    if not path.is_absolute() or '..' in path.parts or not path.name or '\\' in directory:
+        raise HTTPException(400, 'Invalid publication directory')
+    if not request.allowCustomDestination and directory != _publication_directory():
+        raise HTTPException(403, 'Publication directory is not assigned to this user')
+    name = _safe_name(request.destinationName, 'destination model name')
+    target = _container(request.destinationContainer)
+    try:
+        return _response(start(get_experiment_tracker(), {'requestKey': request.requestKey,
+            'owner': request.actorUserId, 'sourceContainer': _container(request.container), 'source': source,
+            'destinationContainer': target, 'destination': f'{directory}/{name}'}))
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@router.get('/models/publications', dependencies=[Depends(_authorize)])
+def model_publications(actorUserId: str, container: str, modelType: str, modelName: str, modelPath: str | None = None):
+    from utils.experiment_tracker import get_experiment_tracker
+    from utils.model_publication import list_for_source
+    source = _publication_source(ModelRequest(container=container, modelType=modelType, modelName=modelName, modelPath=modelPath))
+    return _response(list_for_source(get_experiment_tracker(), actorUserId, _container(container), source))
+
+
 @router.delete("/models", dependencies=[Depends(_authorize)])
 def delete_model(request: ModelRequest):
     kind = request.modelType
@@ -3006,20 +3156,28 @@ def upload_dataset(request: UploadDatasetRequest):
         ).stdout.strip()
         if exists == "yes":
             raise HTTPException(409, f'Dataset "{name}" already exists')
-        _docker(target, ["mkdir", "-p", destination])
-        _run(
-            [
-                "docker",
-                "cp",
-                f"{content_root}/.",
-                f"{target}:{destination}",
-            ],
-            timeout=60,
-        )
+        from utils.experiment_tracker import get_experiment_tracker
+        from utils.experiment_upload import prepare_dataset_upload
+        tracker = get_experiment_tracker()
+        handle = prepare_dataset_upload(tracker, actor_user_id=request.actorUserId, container=target,
+            source=content_root, destination=destination, filename=request.filename,
+            archive_sha256=hashlib.sha256(payload).hexdigest(), dataset_type=request.datasetType)
+        try:
+            _docker(target, ["mkdir", "-p", destination.rsplit('/', 1)[0]])
+            _docker(target, ["mkdir", destination])
+            _run(["docker", "cp", f"{content_root}/.", f"{target}:{destination}"], timeout=60)
+        except Exception as exc:
+            # A failed/uncertain copy must never be presented as an imported version.
+            tracker.emit(handle['attemptId'], 'status', {'status': 'failed', 'error': str(exc),
+                'runtime': {'archiveStatus': 'complete', 'archiveWarning': 'Dataset copy failed; inspect partial destination'}},
+                preserve_terminal=True)
+            raise
     return _response({
         "success": True,
         "sourcePath": destination,
         "ownerUserId": request.ownerUserId,
+        "experiment": handle,
+        "message": "上传成功，数据版本正在归档，可在实验记录中查看",
     })
 
 

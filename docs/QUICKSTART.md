@@ -47,9 +47,9 @@ This creates `runtime.env`, including local runtime tokens and the initial admin
 | `MEDFLOW_LOCAL_EVALUATE_CONTAINER` | Evaluation/inference container name that actually exists on this machine, used for evaluation and inference-related tasks. |
 | `MEDFLOW_LOCAL_GRPO_CONTAINER` | GRPO/verl container name that actually exists on this machine, used for GRPO/verl training tasks. |
 | `MODEL_NAME` / `MODEL_API_KEY` / `MODEL_BASE_URL` | OpenAI-compatible model name, API key, and service URL used by Agent. |
-| `INFERENCE_AGENT_URL` | Inference Agent controller `/inference_agent` URL started according to the deployment guide. Studio administrator maintenance actions use the Studio login session; restrict Inference Agent `/admin/*` to trusted Studio Server access if enabled. |
+| `INFERENCE_AGENT_URL` | Manually started Inference Agent controller `/inference_agent` URL, reachable from the main Agent. |
 | `INFERENCE_OPS_AUTH_MODE` | Defaults to `trusted_network` and relies on a trusted container network; set explicitly to `token` to enable Bearer authentication. |
-| `INFERENCE_OPS_API_TOKEN` | Shared by Studio, the main Agent, controller, and workers only when `INFERENCE_OPS_AUTH_MODE=token`. |
+| `INFERENCE_OPS_API_TOKEN` | Shared by the main Agent, controller, and workers for `token` mode or remote HTTP initialization; Studio also uses it in `token` mode. |
 | `STUDIO_PUBLIC_URL` | Studio URL opened by users in a browser; do not keep `127.0.0.1` for cross-machine access. |
 | `STUDIO_URL` | Studio backend URL used by Runtime/Agent callbacks, with default backend port `3000`; use a host-reachable IP or domain for cross-machine access. |
 | `MEDFLOW_RESOURCE_NODES` | Studio resource-pool node list; single-machine mode usually includes the local node `id`, `name`, and `baseUrl`, and `baseUrl` must point to the local Agent API. |
@@ -81,6 +81,7 @@ bash runtime.sh status
 | `bash runtime.sh status` | Show service status and PIDs. |
 | `bash runtime.sh logs` | Show all logs. |
 | `bash runtime.sh logs agent` | Show Agent logs; `studio` and `bridge` are also supported. |
+| `bash runtime.sh logs inference` | With automatic management explicitly enabled, show the last 100 controller log lines from the inference container. |
 | `bash runtime.sh --help` | Show all options. |
 
 If the only administrator password is forgotten, run `bash runtime.sh stop`, change only `MEDFLOW_ADMIN_PASSWORD` in `runtime.env` to a new password of at least 6 characters, run `bash runtime.sh reset-admin-password --username admin`, then run `bash runtime.sh start`. Add `--env-file` if using another configuration file. The reset revokes that account's sessions. Do not use `init --force` for password recovery because it also rotates other runtime tokens.

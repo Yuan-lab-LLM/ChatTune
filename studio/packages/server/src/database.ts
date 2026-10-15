@@ -32,6 +32,7 @@ import {
     UserGroupTable,
 } from './models/ResourceAccess';
 import { ResourceAccessService } from './services/resourceAccessService';
+import { experimentEntities } from './models/Experiment';
 
 export const initializeDatabase = async (
     databaseConfig: DataSourceOptions,
@@ -40,6 +41,7 @@ export const initializeDatabase = async (
         const options = {
             ...databaseConfig,
             entities: [
+                ...experimentEntities,
                 RunTable,
                 RunView,
                 MessageTable,

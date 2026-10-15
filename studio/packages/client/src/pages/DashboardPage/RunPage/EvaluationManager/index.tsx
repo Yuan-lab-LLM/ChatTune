@@ -50,6 +50,7 @@ import { useEnvironmentConfig } from "@/hooks/useEnvironmentConfig";
 import { GuideModal } from "@/components/GuideModal";
 import { ManagerButton } from "@/components/buttons/ASButton";
 import ManagerSectionHeader from "../ManagerSectionHeader";
+import ExperimentSourceButton, { ExperimentLink } from "../ExperimentManager/SourceButton";
 import type { ColumnsType } from "antd/es/table";
 
 interface Props {
@@ -781,10 +782,14 @@ const EvaluationManager = ({
     action: {
       title: t("evaluation.results-table.action") || "操作",
       key: "action",
-      width: 92,
+      width: 210,
       fixed: "right",
       render: (_: any, record: any) => (
         <Space size="small">
+          {record.experimentId ? <ExperimentLink experimentId={record.experimentId} /> :
+            <ExperimentSourceButton resourceKind="report" nodeId={record.nodeId || normalizedCurrentRunNodeId}
+              container={record.containerName || resultContainerName}
+              path={record.folderPath ? `${record.folderPath.replace(/\/$/, '')}/result.json` : undefined} />}
           <Button
             type="text"
             size="small"

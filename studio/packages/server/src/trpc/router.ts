@@ -21,6 +21,7 @@ import {
   ContentBlocks,
   Status,
   EnvironmentCheckResult,
+  ModelPublication,
   AUDIT_LEVELS,
   AUDIT_MODULES,
   AUDIT_OPERATION_TYPES,
@@ -49,6 +50,9 @@ import { ResourceAccessService } from "../services/resourceAccessService";
 import { ResourceCatalogConfigService } from "../services/resourceCatalogConfigService";
 import { TrainingResourceService } from "../services/trainingResourceService";
 import { TrainingDescriptorService } from "../services/trainingDescriptorService";
+import { ExperimentService } from "../services/experimentService";
+import { appendExperimentEventsSchema, appendExperimentLogSchema, experimentIdSchema, prepareExperimentSchema, listExperimentsSchema } from "../../../shared/src/experiment";
+import { experimentMetadataSchema, searchExperimentLogsSchema, experimentLogContextSchema } from "../../../shared/src/experiment";
 
 const textBlock = z.object({
   text: z.string(),
@@ -153,18 +157,22 @@ const serializeAuthCookie = (token: string, maxAgeSeconds: number) => {
   ].join("; ");
 };
 
+export const getRequestAuthToken = (headers: { authorization?: string | string[]; cookie?: string }) => {
+  const authorization = headers.authorization;
+  const authHeader = Array.isArray(authorization)
+    ? authorization[0]
+    : authorization;
+  const cookies = parseCookies(headers.cookie);
+  return authHeader?.startsWith("Bearer ")
+    ? authHeader.slice("Bearer ".length).trim()
+    : cookies[AUTH_COOKIE_NAME];
+};
+
 export const createContext = ({
   req,
   res,
 }: CreateExpressContextOptions): TrpcContext => {
-  const authorization = req.headers.authorization;
-  const authHeader = Array.isArray(authorization)
-    ? authorization[0]
-    : authorization;
-  const cookies = parseCookies(req.headers.cookie);
-  const authToken = authHeader?.startsWith("Bearer ")
-    ? authHeader.slice("Bearer ".length).trim()
-    : cookies[AUTH_COOKIE_NAME];
+  const authToken = getRequestAuthToken(req.headers);
   const runtimeTokenHeader = req.headers["x-medflow-runtime-token"];
   const runtimeToken = Array.isArray(runtimeTokenHeader)
     ? runtimeTokenHeader[0]
@@ -720,6 +728,7 @@ const sanitizeResourceItemsForUser = <T extends object>(
     }
     return {
       jobId: item.jobId,
+      experimentId: item.experimentId,
       model: item.model,
       dataset: item.dataset,
       status: item.status,
@@ -1046,6 +1055,67 @@ const queryEvaluationDatasetSnapshot = async (
 };
 
 export const appRouter = t.router({
+  prepareExperimentTask: runtimeNodeProcedure
+    .input(prepareExperimentSchema)
+    .mutation(async ({ ctx, input }) => {
+      assertRuntimeNodeAuthorized(ctx, input.runtimeNodeId);
+      return { success: true, data: await ExperimentService.prepare(input) };
+    }),
+  appendExperimentEvents: runtimeNodeProcedure
+    .input(appendExperimentEventsSchema)
+    .mutation(async ({ ctx, input }) => {
+      assertRuntimeNodeAuthorized(ctx, input.runtimeNodeId);
+      return { success: true, data: await ExperimentService.append(input.runtimeNodeId, input.events) };
+    }),
+  appendExperimentLogChunks: runtimeNodeProcedure
+    .input(appendExperimentLogSchema)
+    .mutation(async ({ ctx, input }) => {
+      assertRuntimeNodeAuthorized(ctx, input.runtimeNodeId);
+      return { success: true, data: await ExperimentService.appendLog(input) };
+    }),
+  listExperimentLogSources: protectedProcedure
+    .input(z.object({ experimentId: experimentIdSchema, attemptId: experimentIdSchema }))
+    .query(({ ctx, input }) => ExperimentService.logSources(ctx.user, input.experimentId, input.attemptId)),
+  searchExperimentLogs: protectedProcedure.input(searchExperimentLogsSchema)
+    .query(({ ctx, input }) => ExperimentService.searchLogs(ctx.user, input)),
+  getExperimentLogContext: protectedProcedure.input(experimentLogContextSchema)
+    .query(({ ctx, input }) => ExperimentService.logContext(ctx.user, input)),
+  updateExperimentMetadata: protectedProcedure.input(experimentMetadataSchema)
+    .mutation(({ ctx, input }) => ExperimentService.updateMetadata(ctx.user, input)),
+  getExperimentLogChunks: protectedProcedure
+    .input(z.object({ experimentId: experimentIdSchema, attemptId: experimentIdSchema, sourceId: experimentIdSchema,
+      beforeOffset: z.number().int().nonnegative().safe().optional(),
+      afterOffset: z.number().int().nonnegative().safe().optional() }).refine(value =>
+        value.beforeOffset === undefined || value.afterOffset === undefined))
+    .query(({ ctx, input }) => ExperimentService.logChunks(ctx.user, input.experimentId, input.attemptId,
+      input.sourceId, input.beforeOffset, input.afterOffset)),
+  listExperiments: protectedProcedure
+    .input(listExperimentsSchema)
+    .query(({ ctx, input }) => ExperimentService.list(ctx.user, input)),
+  getExperiment: protectedProcedure
+    .input(z.object({ experimentId: experimentIdSchema }))
+    .query(({ ctx, input }) => ExperimentService.detail(ctx.user, input.experimentId)),
+  getExperimentSummary: protectedProcedure.input(z.object({ experimentId: experimentIdSchema }))
+    .query(({ ctx, input }) => ExperimentService.summary(ctx.user, input.experimentId)),
+  getExperimentConfiguration: protectedProcedure.input(z.object({ experimentId: experimentIdSchema, revision: z.string().optional() }))
+    .query(({ ctx, input }) => ExperimentService.configuration(ctx.user, input.experimentId)),
+  getExperimentAssets: protectedProcedure.input(z.object({ experimentId: experimentIdSchema, revision: z.string().optional() }))
+    .query(({ ctx, input }) => ExperimentService.assets(ctx.user, input.experimentId)),
+  getExperimentEvaluations: protectedProcedure.input(z.object({ experimentId: experimentIdSchema }))
+    .query(({ ctx, input }) => ExperimentService.evaluations(ctx.user, input.experimentId)),
+  compareExperiments: protectedProcedure
+    .input(z.object({ experimentIds: z.array(experimentIdSchema).min(2).max(5), lightweight: z.boolean().default(false) }))
+    .query(({ ctx, input }) => ExperimentService.compare(ctx.user, [...new Set(input.experimentIds)], input.lightweight)),
+  getAssetExperiments: protectedProcedure
+    .input(z.object({ assetVersionId: experimentIdSchema, scope: z.enum(['all', 'model', 'dataset', 'report']).default('all') }))
+    .query(({ ctx, input }) => ExperimentService.forAsset(ctx.user, input.assetVersionId, input.scope)),
+  launchExperimentDraft: protectedProcedure
+    .input(z.object({ experimentId: experimentIdSchema }))
+    .mutation(({ ctx, input }) => ExperimentService.launchDraft(ctx.user, input.experimentId)),
+  getPathExperiments: protectedProcedure
+    .input(z.object({ nodeId: experimentIdSchema, container: z.string().min(1).max(200), path: z.string().min(1).max(4096),
+      scope: z.enum(['all', 'model', 'dataset', 'report']).default('all') }))
+    .query(({ ctx, input }) => ExperimentService.forPath(ctx.user, input.nodeId, input.container, input.path, input.scope)),
   queryResourceNodes: protectedProcedure.query(async ({ ctx }) => {
     const user = ctx.user as SafeAuthUser;
     const visibleNodeIds = await ResourceAccessService.getVisibleNodeIds(user);
@@ -3352,6 +3422,65 @@ export const appRouter = t.router({
       }
     }),
 
+  getModelPublicationTargets: protectedProcedure
+    .input(z.object({ nodeId: resourceNodeIdSchema }))
+    .query(async ({ ctx, input }) => {
+      const user = ctx.user as SafeAuthUser;
+      const nodeId = await resolveResourceNodeIdForUser(user, input.nodeId);
+      await assertResourceNodeAccess(user, nodeId);
+      if (nodeId === 'all') throw new TRPCError({ code: 'BAD_REQUEST', message: '请选择模型所在的具体节点' });
+      const response = await remoteResourceClient.request<{ data: { containers: string[]; directory: string } }>(
+        nodeId, 'models/publication-targets');
+      const defaultContainer = await ResourceAccessService.resolveEvaluateContainerForUser(user, '', getDefaultEvaluateContainerName());
+      return { ...response.data, defaultContainer, canChooseDirectory: user.role === UserRole.ADMIN,
+        containers: user.role === UserRole.ADMIN ? response.data.containers : response.data.containers.filter(name => name === defaultContainer) };
+    }),
+
+  publishModelToInference: protectedProcedure
+    .input(z.object({
+      nodeId: resourceNodeIdSchema,
+      container: z.string().trim().min(1),
+      modelType: z.string().min(1),
+      modelName: z.string().min(1),
+      modelPath: z.string().min(1),
+      requestKey: z.string().regex(/^pub-[a-f0-9-]{36}$/),
+      destinationContainer: z.string().trim().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]*$/),
+      destinationDirectory: z.string().trim().min(2).max(4096),
+      destinationName: z.string().trim().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]*$/).max(200),
+    }))
+    .mutation(async ({ ctx, input }) => {
+      const user = ctx.user as SafeAuthUser;
+      const nodeId = await resolveResourceNodeIdForUser(user, input.nodeId);
+      await assertResourceNodeAccess(user, nodeId);
+      if (nodeId === 'all') throw new TRPCError({ code: 'BAD_REQUEST', message: '请选择模型所在的具体节点' });
+      const container = await ResourceAccessService.resolveContainerForUser(user, input.container, getDefaultContainerName());
+      const destinationContainer = await ResourceAccessService.resolveEvaluateContainerForUser(user, input.destinationContainer, getDefaultEvaluateContainerName());
+      await ResourceAccessService.assertResourceAccess(user, 'model', container, `${input.modelPath.replace(/\/+$/, '')}/${input.modelName}`);
+      const response = await remoteResourceClient.request<{ data: ModelPublication }>(nodeId, 'models/publish', {
+        method: 'POST', body: JSON.stringify({ ...input, container, destinationContainer,
+          actorUserId: user.id, allowCustomDestination: user.role === UserRole.ADMIN }),
+      });
+      await ResourceAccessService.recordAuditEvent('model_publication_requested', null, user.id,
+        { nodeId, container, source: response.data.source, destinationContainer, destination: response.data.destination,
+          requestKey: input.requestKey });
+      return response.data;
+    }),
+
+  getModelPublications: protectedProcedure
+    .input(z.object({ nodeId: resourceNodeIdSchema, container: z.string(), modelType: z.string(),
+      modelName: z.string(), modelPath: z.string() }))
+    .query(async ({ ctx, input }) => {
+      const user = ctx.user as SafeAuthUser;
+      const nodeId = await resolveResourceNodeIdForUser(user, input.nodeId);
+      await assertResourceNodeAccess(user, nodeId);
+      if (nodeId === 'all') throw new TRPCError({ code: 'BAD_REQUEST', message: '请选择模型所在的具体节点' });
+      const container = await ResourceAccessService.resolveContainerForUser(user, input.container, getDefaultContainerName());
+      await ResourceAccessService.assertResourceAccess(user, 'model', container, `${input.modelPath.replace(/\/+$/, '')}/${input.modelName}`);
+      const response = await remoteResourceClient.request<{ data: ModelPublication[] }>(nodeId, 'models/publications', undefined,
+        { actorUserId: user.id, container, modelType: input.modelType, modelName: input.modelName, modelPath: input.modelPath });
+      return response.data;
+    }),
+
   deleteModel: protectedProcedure
     .input(
       z.object({
@@ -3489,6 +3618,7 @@ export const appRouter = t.router({
             nodeId: targetNodeId,
             container,
             ownerUserId: user.role === UserRole.USER ? user.id : undefined,
+            actorUserId: user.id,
           }),
         });
         const result = response.data;

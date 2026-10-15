@@ -44,6 +44,7 @@ VLLM_OPENAI_PORT="$(yq -r '.PORTS.VLLM_OPENAI_PORT' "$CONFIG_FILE")"
 HOST_IP="$(yq -r '.ENV.HOST_IP' "$CONFIG_FILE")"
 MODEL_NAME="$(yq -r '.ENV.MODEL_NAME' "$CONFIG_FILE")"
 MODEL_PATH="$(yq -r '.ENV.MODEL_PATH' "$CONFIG_FILE")${MODEL_NAME}"
+MODEL_PATH="${MEDFLOW_MODEL_SNAPSHOT_PATH:-$MODEL_PATH}"
 CUDA_VISIBLE_DEVICES="$(yq -r '.ENV.CUDA_VISIBLE_DEVICES' "$CONFIG_FILE")"
 MASTER_PORT="$(yq -r '.ENV.MASTER_PORT // 50121' "$CONFIG_FILE")"
 TENSOR_PARALLEL_SIZE="$(yq -r '.RUNTIME.TENSOR_PARALLEL_SIZE' "$CONFIG_FILE")"
@@ -130,7 +131,7 @@ wait_for_openai_api() {
         if [[ -f "$RUN_LOG_DIR/vllm.log" ]] && \
             tail -n 120 "$RUN_LOG_DIR/vllm.log" | \
             grep -Fq "AttributeError: '_IncludedRouter' object has no attribute 'path'"; then
-            STARTUP_ERROR="vLLM OpenAI API failed: prometheus_fastapi_instrumentator cannot handle FastAPI _IncludedRouter; check that the bundled vLLM route compatibility patch loaded; see vllm.log"
+            STARTUP_ERROR="vLLM OpenAI API failed: prometheus-fastapi-instrumentator cannot handle FastAPI _IncludedRouter; check that the bundled vLLM route compatibility patch loaded; see vllm.log"
             echo "$STARTUP_ERROR" >&2
             return 1
         fi
@@ -184,9 +185,25 @@ start_process() {
     shift 3
     (
         cd "$cwd"
-        exec nohup setsid "$@"
+        if [[ "$name" == "vllm" && -n "${MEDFLOW_DEPLOYMENT_DIRECTORY:-}" ]]; then
+            exec nohup setsid "$MEDFLOW_DEPLOYMENT_PYTHON" "$MEDFLOW_DEPLOYMENT_OBSERVER" --exec "$MEDFLOW_DEPLOYMENT_DIRECTORY" "$@"
+        else
+            exec nohup setsid "$@"
+        fi
     ) > "$log_file" 2>&1 &
     echo $! > "$PID_DIR/$name.pid"
+}
+
+process_belongs_to_run() {
+    local pid="$1"
+    local deployment_dir="${MEDFLOW_DEPLOYMENT_DIRECTORY:-$RUN_LOG_DIR/experiment}"
+    local observer="${MEDFLOW_DEPLOYMENT_OBSERVER:-$OPS_ROOT/inference_ops/experiment_records.py}"
+    local observer_python="${MEDFLOW_DEPLOYMENT_PYTHON:-python3}"
+    if [[ -f "$deployment_dir/deployment.json" ]] &&
+       "$observer_python" "$observer" --owns "$deployment_dir" "$RUN_ID" "$pid" 2>/dev/null; then
+        return 0
+    fi
+    tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -Fxq "SERVICE_RUN_ID=$RUN_ID"
 }
 
 stop_recorded_processes() {
@@ -197,7 +214,7 @@ stop_recorded_processes() {
         local pid
         pid="$(tr -dc '0-9' < "$pid_file")"
         if [[ -n "$pid" && "$pid" != "$$" ]] && kill -0 "$pid" 2>/dev/null && \
-           tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -Fxq "SERVICE_RUN_ID=$RUN_ID"; then
+           process_belongs_to_run "$pid"; then
             kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
         fi
     done
@@ -208,7 +225,7 @@ stop_recorded_processes() {
         local pid
         pid="$(tr -dc '0-9' < "$pid_file")"
         if [[ -n "$pid" && "$pid" != "$$" ]] && kill -0 "$pid" 2>/dev/null && \
-           tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -Fxq "SERVICE_RUN_ID=$RUN_ID"; then
+           process_belongs_to_run "$pid"; then
             kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
         fi
     done
@@ -259,6 +276,10 @@ start_process vllm "$OPS_ROOT" "$RUN_LOG_DIR/vllm.log" env \
     --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" --enable-auto-tool-choice --tool-call-parser hermes
 wait_for_port "$VLLM_OPENAI_PORT" "vLLM OpenAI API" "vllm"
 wait_for_openai_api
+
+if [[ -n "${MEDFLOW_DEPLOYMENT_DIRECTORY:-}" ]]; then
+    "$MEDFLOW_DEPLOYMENT_PYTHON" "$MEDFLOW_DEPLOYMENT_OBSERVER" "$MEDFLOW_DEPLOYMENT_DIRECTORY"
+fi
 
 write_status "finished" "null"
 trap - EXIT

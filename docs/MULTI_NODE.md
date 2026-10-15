@@ -54,7 +54,7 @@ bash runtime.sh init --profile center --nodes node-b=http://<worker-b-host>:8099
 | `MODEL_NAME` / `MODEL_API_KEY` / `MODEL_BASE_URL` | OpenAI-compatible model name, API key, and service URL used by the center-local Agent. |
 | `INFERENCE_AGENT_URL` | Inference Agent controller `/inference_agent` URL used by the center-local Agent. Studio administrator maintenance actions use the Studio login session; restrict Inference Agent `/admin/*` to trusted Studio Server access if enabled. |
 | `INFERENCE_OPS_AUTH_MODE` | Defaults to `trusted_network`; Inference Ops Bearer authentication is enabled only when explicitly set to `token`. |
-| `INFERENCE_OPS_API_TOKEN` | Shared by the center Studio/main Agent and Inference Ops only when `INFERENCE_OPS_AUTH_MODE=token`. |
+| `INFERENCE_OPS_API_TOKEN` | Shared by the main Agent and Inference Ops for `token` mode or remote HTTP initialization; Studio also uses it in `token` mode. |
 | `STUDIO_PUBLIC_URL` | Center Studio URL opened by users in a browser. |
 | `STUDIO_URL` | Center Studio backend URL used by Runtime/Agent callbacks. |
 
@@ -81,7 +81,7 @@ bash runtime.sh init --profile node --node-id node-a --center-url http://<center
 | `MODEL_NAME` / `MODEL_API_KEY` / `MODEL_BASE_URL` | OpenAI-compatible model name, API key, and service URL used by this node's Agent. |
 | `INFERENCE_AGENT_URL` | Inference Agent controller `/inference_agent` URL used by tasks on this node. Studio administrator maintenance actions use the Studio login session; restrict Inference Agent `/admin/*` to trusted Studio Server access if enabled. |
 | `INFERENCE_OPS_AUTH_MODE` | Defaults to `trusted_network`; token mode must match the center and Inference Ops configuration. |
-| `INFERENCE_OPS_API_TOKEN` | Copied from the center node only in `token` mode. |
+| `INFERENCE_OPS_API_TOKEN` | Must match the main Agent, controller, and workers for `token` mode or remote HTTP initialization. |
 
 ## Startup Order
 

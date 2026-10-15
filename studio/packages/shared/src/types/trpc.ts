@@ -453,6 +453,19 @@ export interface DatasetInfo {
 }
 
 // Model info for model management
+export interface ModelPublication {
+  requestKey: string;
+  source: string;
+  sourceContainer: string;
+  destination: string;
+  destinationContainer: string;
+  status: 'preparing' | 'running' | 'finished' | 'failed' | 'unknown';
+  progress_percent: number;
+  message: string;
+  experiment_id?: string | null;
+  error?: string | null;
+}
+
 export interface ModelInfo {
   nodeId?: string;
   nodeName?: string;
@@ -486,6 +499,7 @@ export interface MedicalTestFile {
 
 // Evaluation result info for evaluation results
 export interface EvaluationResult {
+  experimentId?: string;
   nodeId?: string;
   nodeName?: string;
   containerName?: string;

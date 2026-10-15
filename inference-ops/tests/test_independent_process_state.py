@@ -1,11 +1,13 @@
 import ast
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, Optional
+from unittest.mock import patch
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -29,6 +31,28 @@ def load_function(path: Path, name: str, namespace: dict):
 
 
 class IndependentProcessStateTests(unittest.TestCase):
+    def test_verified_launch_identity_survives_missing_or_changed_run_environment(self):
+        dependency = SimpleNamespace(deployment_owned_identity=lambda meta, pid: {'startTicks': '1'} if pid == 101 else None)
+        namespace = {'__package__': 'inference_test_package'}
+        classify = load_function(TOOLS_PATH, 'process_instance_run_id', namespace)
+        meta = {'run_id': 'run-1', 'instance_id': 'instance-1', 'experimentDirectory': '/deployment'}
+        with patch.dict(sys.modules, {'inference_test_package.experiment_records': dependency}):
+            for environment in ('', 'changed-value'):
+                namespace['process_service_run_id'] = lambda pid: environment
+                self.assertEqual(classify(meta, 101), 'run-1')
+                self.assertEqual(classify(meta, 102), environment)
+
+    def test_shared_port_does_not_authorize_unidentified_peer_process(self):
+        namespace = {'Optional': Optional, 'SERVICE_INSTANCE_PORT_NAMES': ('vllm',),
+            'process_instance_run_id': lambda meta, pid: {101: 'run-1', 102: '', 103: 'other-run'}[pid],
+            'service_instance_recorded_pids': lambda meta: [101], 'pid_is_alive': lambda pid: True}
+        port_ownership = load_function(TOOLS_PATH, 'service_instance_port_ownership', namespace)
+        process_ownership = load_function(TOOLS_PATH, 'service_instance_process_ownership', namespace)
+        meta = {'instance_id': 'instance-1', 'run_id': 'run-1', 'ports': {'vllm': 7111}}
+        ports = port_ownership(meta, ({7111: {101, 102, 103}}, set()))
+        self.assertEqual(len(ports['owned']), 1)
+        self.assertEqual(process_ownership(meta, ports), {'owned': [101], 'unverified': [102], 'reused': [103]})
+
     def refresh_instance_status(
         self,
         *,
@@ -266,6 +290,7 @@ class IndependentProcessStateTests(unittest.TestCase):
                     STATE_DIR=str(state_dir),
                 ),
                 "JSONResponse": lambda **kwargs: kwargs,
+                "experiment_configuration_error": lambda: "",
             }
             readyz = load_function(AGENT_PATH, "readyz", namespace)
 

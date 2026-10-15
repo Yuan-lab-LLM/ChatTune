@@ -350,6 +350,8 @@ app.get("/health", (_req, res) => {
 
 app.post("/api/agent/process", async (req: Request, res: Response) => {
   const controller = new AbortController();
+  const streamStartedAt = Date.now();
+  let lastRuntimeChunkAt = streamStartedAt;
   req.on("aborted", () => {
     controller.abort();
   });
@@ -392,6 +394,7 @@ app.post("/api/agent/process", async (req: Request, res: Response) => {
     res.status(200);
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
     res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("X-Accel-Buffering", "no");
     res.setHeader("Connection", "keep-alive");
     res.setHeader("X-Agent-Backend", backend.baseUrl);
     res.setHeader("X-Agent-Backend-Index", String(backend.index));
@@ -402,10 +405,10 @@ app.post("/api/agent/process", async (req: Request, res: Response) => {
     const decoder = new TextDecoder();
     let buffer = "";
     let shouldEnd = false;
-
     while (!shouldEnd) {
       const { done, value } = await reader.read();
       if (done) break;
+      lastRuntimeChunkAt = Date.now();
 
       buffer += decoder.decode(value, { stream: true });
 
@@ -436,6 +439,12 @@ app.post("/api/agent/process", async (req: Request, res: Response) => {
     await reader.cancel().catch(() => undefined);
     res.end();
   } catch (error) {
+    console.warn("Agent Runtime stream failed", {
+      elapsedMs: Date.now() - streamStartedAt,
+      idleMs: Date.now() - lastRuntimeChunkAt,
+      aborted: controller.signal.aborted,
+      error: error instanceof Error ? error.message : String(error),
+    });
     if (controller.signal.aborted && res.headersSent) {
       res.end();
       return;

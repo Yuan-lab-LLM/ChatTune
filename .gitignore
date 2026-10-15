@@ -1,6 +1,7 @@
 # Runtime secrets and local environment
 runtime.env
 .env
+/inference-ops/runtime/credentials/
 *.env.local
 
 # Runtime state
@@ -37,4 +38,7 @@ data/workflows/
 /outputs/
 .tmp/
 tmp/
-agent/tests/
+agent/tests/*
+!agent/tests/test_experiment_records.py
+!agent/tests/test_medical_tp.py
+!agent/tests/test_vllm_tokenizer_compat.py

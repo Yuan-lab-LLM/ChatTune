@@ -1571,6 +1571,17 @@ def process_service_run_id(pid: int) -> str:
         return ""
 
 
+def process_instance_run_id(meta: dict, pid: int) -> str:
+    """Use the recorded launch identity when the serving engine rewrites environ."""
+    run_id = process_service_run_id(pid)
+    expected = str(meta.get('run_id') or meta.get('instance_id') or '')
+    if run_id != expected and meta.get('experimentDirectory'):
+        from .experiment_records import deployment_owned_identity
+        if deployment_owned_identity(meta, pid):
+            return expected
+    return run_id
+
+
 def invalidate_port_listener_cache() -> None:
     with PORT_LISTENER_CACHE_LOCK:
         PORT_LISTENER_CACHE["time"] = 0.0
@@ -1645,7 +1656,7 @@ def service_instance_port_ownership(
     listener_snapshot: Optional[tuple[dict[int, set[int]], set[int]]] = None,
 ) -> dict[str, list[dict]]:
     """Classify recorded ports as owned, reused, unverified, or closed."""
-    instance_id = str(meta.get("instance_id") or meta.get("run_id") or "").strip()
+    instance_id = str(meta.get("run_id") or meta.get("instance_id") or "").strip()
     configured_ports = {}
     for name, value in (meta.get("ports") or {}).items():
         if name not in SERVICE_INSTANCE_PORT_NAMES:
@@ -1670,7 +1681,7 @@ def service_instance_port_ownership(
         if not pids:
             category = "unverified" if port in unresolved_ports else "closed"
         else:
-            run_ids = {pid: process_service_run_id(pid) for pid in pids}
+            run_ids = {pid: process_instance_run_id(meta, pid) for pid in pids}
             entry["run_ids"] = run_ids
             if any(run_id == instance_id for run_id in run_ids.values()):
                 category = "owned"
@@ -1687,8 +1698,8 @@ def service_instance_process_ownership(
     port_ownership: Optional[dict[str, list[dict]]] = None,
     tracked_pids: Optional[list[int]] = None,
 ) -> dict[str, list[int]]:
-    """Classify live recorded and port-listener PIDs by SERVICE_RUN_ID."""
-    instance_id = str(meta.get("instance_id") or meta.get("run_id") or "").strip()
+    """Classify live PIDs by run environment or verified deployment ancestry."""
+    instance_id = str(meta.get("run_id") or meta.get("instance_id") or "").strip()
     candidates = set(service_instance_recorded_pids(meta))
     script_pid = int(meta.get("script_pid") or 0)
     if script_pid:
@@ -1702,35 +1713,39 @@ def service_instance_process_ownership(
             candidates.add(pid)
 
     port_ownership = port_ownership or service_instance_port_ownership(meta)
-    port_categories = {}
     for category in ("owned", "reused", "unverified"):
         for entry in port_ownership[category]:
             for pid in entry.get("pids") or []:
                 candidates.add(int(pid))
-                port_categories[int(pid)] = category
 
     result = {"owned": [], "reused": [], "unverified": []}
     for pid in sorted(candidates):
         if not pid_is_alive(pid):
             continue
-        run_id = process_service_run_id(pid)
+        run_id = process_instance_run_id(meta, pid)
         if run_id == instance_id:
             category = "owned"
         elif run_id:
             category = "reused"
         else:
-            category = port_categories.get(pid, "unverified")
+            # A shared listening port can have multiple owners. One verified
+            # listener never grants permission to terminate an unidentified peer.
+            category = "unverified"
         result[category].append(pid)
     return result
 
 
 def terminate_instance_owned_processes(meta: dict, timeout: float = 3.0) -> dict:
-    """Terminate only processes whose SERVICE_RUN_ID matches the instance."""
+    """Terminate processes whose run environment or launch identity proves ownership."""
     ownership = service_instance_process_ownership(meta)
     root_processes = []
     for pid in ownership["owned"]:
         try:
-            root_processes.append(psutil.Process(pid))
+            process = psutil.Process(pid)
+            # Bind psutil's PID-reuse protection before the final ownership check.
+            process.create_time()
+            if process_instance_run_id(meta, pid) == str(meta.get('run_id') or meta.get('instance_id') or ''):
+                root_processes.append(process)
         except (psutil.Error, OSError):
             continue
 
@@ -2041,6 +2056,7 @@ def service_status_data() -> dict:
             {
                 "instance_id": instance_id,
                 "owner": owner,
+                "experiment": meta.get("experiment"),
                 "status": str(meta.get("status") or ""),
                 "gpus": str(meta.get("actual_gpus") or ""),
                 "model": str(meta.get("model") or ""),
@@ -2825,11 +2841,45 @@ def get_gpu_utilization_map(
 
 
 def generate_tp_candidates(max_gpus: int) -> list[int]:
-    candidates = []
-    for tp in [1, 2, 4, 8]:
-        if tp <= max_gpus and tp not in candidates:
-            candidates.append(tp)
-    return candidates or [1]
+    return list(range(1, max_gpus + 1))
+
+
+def model_tensor_parallel_issue(profile: dict, tp: int) -> str:
+    """Check the text backbone before considering a TP memory estimate."""
+    if tp < 1:
+        return "TP 必须是正整数。"
+    cfg = profile.get("model_cfg") or {}
+
+    def dimension(*keys):
+        for key in keys:
+            value = cfg.get(key)
+            if isinstance(value, bool):
+                continue
+            try:
+                number = int(value)
+                if number > 0 and str(value).strip() == str(number):
+                    return number
+            except (TypeError, ValueError, OverflowError):
+                pass
+        return 0
+
+    heads = dimension("num_attention_heads", "n_head", "num_heads")
+    if not heads and tp > 1:
+        return "模型 config.json 缺少有效注意力头数，无法验证多卡 TP。"
+    if heads and heads % tp:
+        return f"注意力头数 {heads} 不能被 TP={tp} 整除。"
+    kv_heads = dimension("num_key_value_heads", "n_head_kv", "num_kv_heads", "multi_query_group_num")
+    kv_heads = kv_heads or (1 if cfg.get("multi_query") else heads)
+    # GQA can replicate KV heads when TP is a multiple of their count. MLA
+    # replicates a latent cache and does not use this GQA partitioning rule.
+    if kv_heads and not cfg.get("kv_lora_rank"):
+        if (kv_heads % tp if tp <= kv_heads else tp % kv_heads):
+            return f"KV 头数 {kv_heads} 与 TP={tp} 不兼容（须支持均分或完整复制）。"
+    for keys in (("hidden_size", "n_embd"), ("intermediate_size", "ffn_hidden_size")):
+        value = dimension(*keys)
+        if value and value % tp:
+            return f"模型维度 {keys[0]}={value} 不能被 TP={tp} 整除。"
+    return ""
 
 
 def parse_visible_gpus(value: str) -> list[str]:
@@ -2930,6 +2980,18 @@ def evaluate_gpu_selection(
 ) -> dict:
     required_mib, total_mib = estimate_required_memory_mib(profile, tp_size)
     margin_mib = memory_margin_mib(profile)
+    tp_issue = model_tensor_parallel_issue(profile, tp_size)
+    if tp_issue:
+        return {
+            "ok": False,
+            "reason": "model_tp_incompatible",
+            "required_mib": required_mib,
+            "recommended_mib": required_mib + margin_mib,
+            "margin_mib": margin_mib,
+            "total_mib": total_mib,
+            "analysis": tp_issue,
+            "details": [],
+        }
     missing = [gid for gid in gpu_ids if gid not in gpu_memory]
     if missing:
         return {
@@ -2993,6 +3055,7 @@ def recommend_gpu_for_config(
     cfg: Optional[dict] = None,
     reserve_instances: bool = True,
     allowed_gpus: Optional[list[str]] = None,
+    planning_only: bool = False,
 ) -> dict:
     """
     Intelligently evaluate and recommend GPU resources.
@@ -3038,7 +3101,9 @@ def recommend_gpu_for_config(
     if utilization_error:
         return {"ok": False, "analysis": utilization_error}
 
-    if allowed_gpus is None and resource_pool_managed():
+    # Pre-reservation planning estimates only a count. The resource allocator
+    # remains authoritative; service_start always rechecks its assigned GPUs.
+    if allowed_gpus is None and resource_pool_managed() and not planning_only:
         allowed_gpus = resource_context_gpu_ids()
     if allowed_gpus is not None:
         allowed = set(str(item) for item in allowed_gpus)
@@ -3103,6 +3168,8 @@ def recommend_gpu_for_config(
             utilization_threshold,
         )
         current_ok = bool(current_eval["ok"])
+        if current_eval.get("analysis"):
+            analysis_lines.append(f"- 当前配置不可用: {current_eval['analysis']}")
         analysis_lines.append(
             f"- 状态: {'可用' if current_ok else '不可用'} | "
             f"单卡最低需求≈{current_eval['required_mib']} MiB | "
@@ -3148,6 +3215,10 @@ def recommend_gpu_for_config(
         current_recommended_ok = min_budget >= current_eval["recommended_mib"]
 
     for tp in generate_tp_candidates(len(candidates)):
+        tp_issue = model_tensor_parallel_issue(profile, tp)
+        if tp_issue:
+            analysis_lines.append(f"- 排除 TP={tp}: {tp_issue}")
+            continue
         required, total_weight = estimate_required_memory_mib(profile, tp)
         recommended_need = required + memory_margin_mib(profile)
         top_tp = candidates[:tp]
@@ -3221,8 +3292,10 @@ def recommend_gpu_for_config(
         }
 
     analysis_lines.append("")
-    analysis_lines.append("所有 GPU 组合均无法满足显存需求。")
+    analysis_lines.append("所有模型兼容的 GPU 组合均无法满足显存需求。")
     for tp in generate_tp_candidates(len(candidates)):
+        if model_tensor_parallel_issue(profile, tp):
+            continue
         required, _ = estimate_required_memory_mib(profile, tp)
         recommended_need = required + memory_margin_mib(profile)
         top_tp = candidates[:tp]
@@ -3476,6 +3549,10 @@ def check_config_validity() -> dict:
             "reason": "model_size_unknown",
             "analysis": unknown_model_size_analysis(profile),
         }
+
+    tp_issue = model_tensor_parallel_issue(profile, tp_size)
+    if tp_issue:
+        return {"ok": False, "reason": "model_tp_incompatible", "analysis": tp_issue}
 
     # ------------------------------------------------
     # 2. GPU List
@@ -3856,6 +3933,15 @@ def start_service(
             f"{configured_ip or 'empty'} -> {runtime_ip}; draft unchanged",
             flush=True,
         )
+    from .experiment_records import experiment_configuration_error
+    experiment_error = experiment_configuration_error()
+    if experiment_error:
+        return (
+            "推理服务启动失败：实验记录配置检查不通过。\n"
+            f"{experiment_error}\n"
+            "请在推理 worker 进程环境中配置，或使用 python -m inference_ops --env-file /path/to/worker.env 重启。"
+            "这些设置属于部署配置，不能通过 config_update 写入用户草稿。"
+        )
     run_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
     instance_id = run_id
     instance_dir = get_service_instance_dir(instance_id)
@@ -3873,6 +3959,16 @@ def start_service(
         release_pending_instance_ports(instance_id, allocated_ports)
         return allocation_error
 
+    from .experiment_records import freeze_service_model
+    resource_context = current_request_resource_context()
+    try:
+        model_version = freeze_service_model(runtime_config, state_dir=STATE_DIR,
+            owner_id=current_request_user_id(),
+            node_id=resource_context.get('runtime_node_id') or os.getenv('MEDFLOW_RESOURCE_NODE_ID'),
+            reservation_id=resource_context.get('reservation_id'))
+    except Exception:
+        release_pending_instance_ports(instance_id, allocated_ports)
+        raise
     runtime_config_path = os.path.join(instance_dir, "service.runtime.yaml")
     write_runtime_config(runtime_config_path, runtime_config)
     ports = runtime_config["PORTS"]
@@ -3894,17 +3990,7 @@ def start_service(
     proc_env["SERVICE_RUN_ID"] = run_id
     proc_env["SERVICE_RUN_LOG_DIR"] = run_log_dir
     proc_env["SERVICE_PID_DIR"] = pid_dir
-    try:
-        proc = subprocess.Popen(
-            ["bash", runtime_env["START_SCRIPT"], "start", runtime_config_path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env=proc_env,
-            start_new_session=True,
-        )
-    except Exception:
-        release_pending_instance_ports(instance_id, allocated_ports)
-        raise
+    proc_env['MEDFLOW_MODEL_SNAPSHOT_PATH'] = runtime_env['MODEL_SNAPSHOT_PATH']
     started_at = time.strftime("%Y-%m-%d %H:%M:%S")
     instance_meta = {
         "schema_version": STATE_SCHEMA_VERSION,
@@ -3914,12 +4000,13 @@ def start_service(
         "owner_user_id": current_request_user_id(),
         "owner_aliases": current_request_user_aliases(),
         "owner_context_user_id": current_request_thread_id(),
+        "experiment_model_version": model_version,
         "actual_gpus": ",".join(
             parse_visible_gpus(runtime_env.get("CUDA_VISIBLE_DEVICES", ""))
         ),
         "gpu_allocation": gpu_allocation,
         "status": "starting",
-        "script_pid": proc.pid,
+        "script_pid": 0,
         "model": str(runtime_env.get("MODEL_NAME") or ""),
         "model_path": str(runtime_env.get("MODEL_PATH") or "")
         + str(runtime_env.get("MODEL_NAME") or ""),
@@ -3950,27 +4037,11 @@ def start_service(
                 runtime_env.get("CUDA_VISIBLE_DEVICES", "")
             ),
         }
-    save_service_instance(instance_meta)
-    try:
-        record_inference_pid(instance_meta)
-    except Exception as exc:
-        cleanup = terminate_instance_owned_processes(instance_meta)
-        instance_meta["status"] = "failed"
-        instance_meta["finished_at"] = current_time_text()
-        instance_meta["error"] = f"resource process registration failed: {exc}"
-        instance_meta["ownership_cleanup"] = cleanup
-        save_service_instance(instance_meta)
-        release_pending_instance_ports(instance_id, allocated_ports)
-        return (
-            "推理服务启动已回滚：无法向节点资源 API 登记实例。\n"
-            f"instance_id={instance_id}\nerror={exc}\ncleanup={cleanup}"
-        )
-    release_pending_instance_ports(instance_id, allocated_ports)
     status_payload = {
         "run_id": run_id,
         "instance_id": instance_id,
         "status": "starting",
-        "script_pid": proc.pid,
+        "script_pid": 0,
         "config_profile": "runtime",
         "config_file": runtime_config_path,
         "draft_config": draft_config_path,
@@ -3988,6 +4059,37 @@ def start_service(
     if resource_pool_managed():
         status_payload["resource"] = instance_meta["resource"]
     atomic_write_json(status_file, status_payload)
+    from .experiment_records import start_deployment
+    try:
+        proc = start_deployment(["bash", runtime_env["START_SCRIPT"], "start", runtime_config_path], proc_env,
+            instance=instance_meta, cfg=runtime_config, state_dir=STATE_DIR,
+            node_id=resource_context.get('runtime_node_id') or os.getenv('MEDFLOW_RESOURCE_NODE_ID'),
+            model=model_version, save_fn=save_service_instance, context=resource_context.get('experiment_context'))
+    except Exception:
+        release_pending_instance_ports(instance_id, allocated_ports)
+        raise
+    save_service_instance(instance_meta)
+    try:
+        record_inference_pid(instance_meta)
+    except Exception as exc:
+        # Persist the rollback reason before signalling the supervisor. Otherwise
+        # the archive thread can observe cancellation before registration failure.
+        instance_meta["deployment_registration"] = "failed"
+        instance_meta["status"] = "failed"
+        instance_meta["error"] = f"resource process registration failed: {exc}"
+        save_service_instance(instance_meta)
+        cleanup = terminate_instance_owned_processes(instance_meta)
+        instance_meta["finished_at"] = current_time_text()
+        instance_meta["ownership_cleanup"] = cleanup
+        save_service_instance(instance_meta)
+        release_pending_instance_ports(instance_id, allocated_ports)
+        return (
+            "推理服务启动已回滚：无法向节点资源 API 登记实例。\n"
+            f"instance_id={instance_id}\nerror={exc}\ncleanup={cleanup}"
+        )
+    instance_meta["deployment_registration"] = "confirmed"
+    save_service_instance(instance_meta)
+    release_pending_instance_ports(instance_id, allocated_ports)
     atomic_write_json(
         get_service_start_latest_path(),
         {
@@ -4022,6 +4124,7 @@ def start_service(
     )
     service_start_payload = {
         "submitted": True,
+        "experiment": instance_meta.get("experiment"),
         "instance_id": instance_id,
         "run_id": run_id,
         "status": "starting",
@@ -4236,7 +4339,7 @@ def service_stop_by_reservation_result(
         "result": result_text,
     }
 
-def stop_service() -> str:
+def stop_service(*, cause: str = 'stop') -> str:
     """Stop inference service stack."""
     scope = "all" if current_request_is_admin() else "mine"
     active_instances = active_service_instance_candidates(scope=scope)
@@ -4249,11 +4352,11 @@ def stop_service() -> str:
             or ""
         )
         if instance_id:
-            return stop_service_instance(instance_id)
+            return stop_service_instance(instance_id, cause=cause)
 
     own_latest = resolve_service_instance_id("latest", scope=scope, require_running=False)
     if own_latest:
-        return stop_service_instance(own_latest)
+        return stop_service_instance(own_latest, cause=cause)
     if list_service_instance_ids():
         return (
             "未找到当前用户可停止的推理服务实例。\n"
@@ -4632,6 +4735,7 @@ def list_service_instances_payload(scope: str = "mine", limit: int = DEFAULT_LIS
             {
                 "instance_id": instance_id,
                 "owner": owner,
+                "experiment": meta.get("experiment"),
                 "status": str(meta.get("status") or ""),
                 "gpus": str(meta.get("actual_gpus") or ""),
                 "model": str(meta.get("model") or ""),
@@ -4856,6 +4960,7 @@ def service_instance_status_payload(instance_id: str = "latest") -> dict:
             "gpus": str(meta.get("actual_gpus") or ""),
             "ports": dict(meta.get("ports") or {}),
             "services": service_instance_port_services(meta),
+            "experiment": meta.get("experiment"),
             "ready_for_tasks": service_instance_task_ready(meta),
             "started_at": str(meta.get("started_at") or ""),
             "finished_at": str(meta.get("finished_at") or ""),
@@ -4944,8 +5049,57 @@ def service_instance_is_active(meta: dict) -> bool:
     return status in {"starting", "running"} and service_instance_runtime_active(meta)
 
 
-def stop_service_instance_runtime(meta: dict):
+def stop_service_instance_runtime(meta: dict, *, cause: str = 'stop'):
+    """Keep a durable operation history without rewriting the deployment status."""
+    from .experiment_records import record_service_stop
+    operation_id = 'stop-' + uuid.uuid4().hex
+    resource = meta.get('resource') or {}
+    context = current_request_resource_context()
+    trigger = ('workflow' if (context.get('experiment_context') or {}).get('operationTrigger') == 'workflow' or
+               current_request_thread_id() == 'workflow-manager' else
+               'admin' if current_request_is_admin() else
+               'manual' if current_request_user_id() else 'system')
+    warnings = []
+
+    def record(status, result='', release_ready=None):
+        try:
+            return record_service_stop(meta, state_dir=STATE_DIR,
+                node_id=resource.get('runtime_node_id') or os.getenv('MEDFLOW_RESOURCE_NODE_ID'),
+                operation_id=operation_id, status=status, actor=current_request_user_id(), trigger=trigger, cause=cause,
+                result=result, release_ready=release_ready, return_code=meta.get('stop_return_code') if status != 'requested' else None)
+        except Exception as exc:
+            # Stopping a service must remain possible if the local journal is unavailable.
+            warnings.append(f'Experiment stop recording failed: {type(exc).__name__}')
+            return False
+
+    recorded = record('requested')
+    try:
+        response = _stop_service_instance_runtime(meta)
+    except Exception as exc:
+        if recorded:
+            record('failed', str(exc), False)
+        raise
+    try:
+        latest = load_service_instance(str(meta.get('instance_id') or ''))
+        if latest and latest.get('run_id') == meta.get('run_id'):
+            meta = latest
+    except (OSError, ValueError) as exc:
+        warnings.append(f'Experiment stop details unavailable: {type(exc).__name__}')
+    stop = local_tool_response_data(response).get('service_stop') or {}
+    if recorded:
+        record('succeeded' if stop.get('stopped') is True else 'failed',
+               '\n'.join(filter(None, [local_tool_text(response), meta.get('stop_result')])), stop.get('release_ready') is True)
+    if warnings and isinstance(response, dict):
+        response.setdefault('_response_data', {})['experiment_recording_error'] = '; '.join(sorted(set(warnings)))
+        response['_tool_text'] = local_tool_text(response) + '\n' + response['_response_data']['experiment_recording_error']
+    return response
+
+
+def _stop_service_instance_runtime(meta: dict):
     """Stop one instance after the caller has completed authorization checks."""
+    if meta.get('experimentDirectory'):
+        from .experiment_records import cancel_starting_deployment
+        cancel_starting_deployment(meta)
     instance_id = str(meta.get("instance_id") or meta.get("run_id") or "").strip()
     runtime_config = str(meta.get("runtime_config") or "")
     if not runtime_config or not os.path.exists(runtime_config):
@@ -5078,7 +5232,7 @@ def preview_service_instance_stop(instance_id: str = "latest") -> dict:
 
 
 def stop_service_instance(
-    instance_id: str, confirm: bool = False, force: bool = False
+    instance_id: str, confirm: bool = False, force: bool = False, *, cause: str = 'stop'
 ) -> str:
     meta = visible_service_instance_meta(instance_id)
     if not meta:
@@ -5096,7 +5250,7 @@ def stop_service_instance(
             if block_text:
                 return block_text
             forced_benchmarks = []
-        stop_response = stop_service_instance_runtime(meta)
+        stop_response = stop_service_instance_runtime(meta, cause=cause)
         if forced_benchmarks:
             text = local_tool_text(stop_response)
             text += "\n管理员强制停止关联 benchmark："
@@ -5137,7 +5291,7 @@ def stop_service_instance(
     )
     if block_text:
         return block_text
-    return stop_service_instance_runtime(meta)
+    return stop_service_instance_runtime(meta, cause=cause)
 
 
 def list_service_instance_tasks_text(instance_id: str = "latest") -> str:
@@ -5234,6 +5388,24 @@ def refresh_benchmark_job_meta(
     job_id: str, meta_path: str, meta: dict, persist: bool = True
 ) -> dict:
     owner_changed = backfill_task_owner_from_instance(meta)
+    if meta.get('experimentDirectory') and meta.get('status') in {'running', 'submitting', 'unknown', 'unknown_finished'}:
+        from .experiment_records import shared
+        previous = dict(meta)
+        try:
+            observed = shared('experiment_process').probe(meta['experimentDirectory'])
+            if observed['attemptId'] != (meta.get('experiment') or {}).get('attemptId'):
+                raise ValueError('Benchmark attempt identity mismatch')
+            state = observed['state']
+            meta['status'] = {'succeeded': 'finished', 'cancelled': 'stopped'}.get(state, state)
+            journal = observed.get('process') or {}
+            if journal.get('pid'):
+                meta['pid'] = journal['pid']
+            if journal.get('exitCode') is not None:
+                meta['return_code'] = journal['exitCode']
+                finish_meta_if_missing(meta, 'end_time')
+        except (OSError, ValueError, KeyError):
+            meta['status'] = 'unknown'
+        return write_meta_if_changed(meta_path, meta, persist and (owner_changed or meta != previous))
     if meta.get("status") != "running":
         return write_meta_if_changed(meta_path, meta, persist and owner_changed)
 
@@ -5352,7 +5524,7 @@ def context_log(
 
 def restart_service_stack():
     """Restart the current user's latest inference service instance."""
-    stop_response = stop_service()
+    stop_response = stop_service(cause='restart')
     stop_result = local_tool_text(stop_response)
     if any(
         marker in stop_result
@@ -5671,6 +5843,22 @@ def start_benchmark_process(cmd: list[str], log_file: str) -> subprocess.Popen:
     )
 
 
+def start_recorded_benchmark(cmd, log_file, *, job, cfg, instance, instance_id, submit_key, dataset):
+    instance = {**instance, "instance_id": instance_id}
+    from . import experiment_records
+    resource = instance.get('resource') or current_request_resource_context()
+    node_id = resource.get('runtime_node_id') or os.getenv('MEDFLOW_RESOURCE_NODE_ID')
+    pid = service_instance_recorded_pid(instance, 'vllm')
+    commands = experiment_records.shared('experiment_process').descendant_commands(pid) if pid else []
+    job['submission'] = {'submit_key': submit_key, 'dataset': dataset, 'model': cfg['ENV']['MODEL_NAME'],
+        'mode': 'general' if '--dataset-root' in cmd else cmd[cmd.index('--mode') + 1],
+        'log': log_file, 'output': job['output'], 'start_time': job['start_time'],
+        **benchmark_service_meta(instance['instance_id'], cfg, instance)}
+    return experiment_records.start_benchmark(cmd, log_file, job=job, cfg=cfg, instance=instance,
+        state_dir=STATE_DIR, node_id=node_id, owner_id=current_request_user_id(), model_commands=commands,
+        context=current_request_resource_context().get('experiment_context'))
+
+
 def benchmark_service_meta(
     resolved_instance_id: str, cfg: dict, instance_meta: dict
 ) -> dict:
@@ -5733,7 +5921,7 @@ def find_existing_benchmark_submit(submit_key: str) -> Optional[dict]:
             continue
         meta = refresh_benchmark_job_meta(job_id, meta_path, meta)
         status = str(meta.get("status") or "").lower()
-        if status in {"running", "submitting"}:
+        if status in {"running", "submitting"} or (status == 'unknown' and meta.get('experimentDirectory')):
             return meta
     return None
 
@@ -5851,12 +6039,14 @@ def run_medical_choice_benchmark(
         "--save-every",
         str(save_every),
     ]
-    proc = start_benchmark_process(cmd, log_file)
+    proc = start_recorded_benchmark(cmd, log_file, job=job, cfg=cfg, instance=instance_meta, instance_id=resolved_instance_id, submit_key=submit_key, dataset=dataset)
 
     pid = proc.pid
 
     meta = {
         "job_id": job_id,
+        "experiment": job.get("experiment"),
+        "experimentDirectory": job.get("experimentDirectory"),
         "pid": pid,
         "model": model,
         "dataset": dataset,
@@ -6576,12 +6766,14 @@ def run_medbench_benchmark(
         "--max-workers",
         str(max_workers),
     ]
-    proc = start_benchmark_process(cmd, log_file)
+    proc = start_recorded_benchmark(cmd, log_file, job=job, cfg=cfg, instance=instance_meta, instance_id=resolved_instance_id, submit_key=submit_key, dataset=dataset)
 
     pid = proc.pid
 
     meta = {
         "job_id": job_id,
+        "experiment": job.get("experiment"),
+        "experimentDirectory": job.get("experimentDirectory"),
         "pid": pid,
         "model": model,
         "mode": "medbench",
@@ -7010,13 +7202,15 @@ def run_general_benchmark_job(
     if limit is not None and limit > 0:
         cmd.extend(["--limit", str(limit)])
 
-    proc = start_benchmark_process(cmd, log_file)
+    proc = start_recorded_benchmark(cmd, log_file, job=job, cfg=cfg, instance=instance_meta, instance_id=resolved_instance_id, submit_key=submit_key, dataset=dataset)
 
     pid = proc.pid
 
     dataset_key = dataset.strip().lower().replace("_", "-")
     meta = {
         "job_id": job_id,
+        "experiment": job.get("experiment"),
+        "experimentDirectory": job.get("experimentDirectory"),
         "pid": pid,
         "model": model,
         "dataset": dataset,
@@ -7424,6 +7618,7 @@ def benchmark_report_data(job_id: str, scope: str = "mine") -> dict:
             "status": meta.get("status"),
             "mode": mode,
             "benchmark_type": benchmark_type_from_mode(mode),
+            "experiment": meta.get('experiment'),
             "dataset": meta.get("dataset"),
             "model": meta.get("model"),
             "service_instance_id": meta.get("service_instance_id"),
@@ -7613,8 +7808,16 @@ def gpu_status() -> str:
 
 
 @tool
-def gpu_recommend_allocation() -> dict:
-    """Recommend GPU allocation for starting a future new instance from the current user's draft config."""
+def gpu_recommend_allocation(for_reservation: bool = False) -> dict:
+    """Recommend the smallest model-compatible TP that fits current GPU memory.
+
+    for_reservation is a read-only count estimate before applying for resources.
+    Its GPU indexes are advisory and grant no permission to launch on those GPUs.
+    Normal startup recommendations stay within the assigned resource boundary.
+    Draft TP and the reservation GPU count are not explicit user TP requests.
+    """
+    if for_reservation:
+        return recommend_gpu_for_config(show_config(), planning_only=True)
     return recommend_gpu()
 
 
@@ -7640,7 +7843,10 @@ def service_start(
     """Start a new inference service instance.
 
     Existing instances do not need to be stopped first. When gpu_ids is empty,
-    this tool selects GPUs automatically. When users explicitly request GPUs,
+    this tool selects model-compatible GPUs and TP automatically. For ordinary
+    start requests leave gpu_ids empty and tensor_parallel_size=0; never copy
+    draft CUDA_VISIBLE_DEVICES/TP or reservation counts into these arguments.
+    When users explicitly request GPUs,
     pass the physical indexes through gpu_ids, for example "4,5". The requested
     GPUs are strictly validated and written only to the new instance runtime
     config; do not call config_update for a one-time GPU selection.
@@ -8627,6 +8833,8 @@ def node_service_start(
     This tool starts from the remote current user's draft config. For a one-time
     GPU selection, pass gpu_ids directly instead of calling node_config_update.
     The worker writes the selection only to the new instance runtime config.
+    For ordinary start requests leave gpu_ids empty and tensor_parallel_size=0.
+    Never copy draft GPUs/TP or reservation counts into these arguments.
 
     Use node_config_update first only for persistent settings such as model name,
     memory utilization, or other draft configuration.

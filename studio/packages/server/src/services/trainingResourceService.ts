@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import { TRPCError } from '@trpc/server';
 import { In } from 'typeorm';
 import { SafeAuthUser } from '../dao/Auth';
 import { UserRole } from '../models/Auth';
@@ -1183,7 +1184,7 @@ export class TrainingResourceService {
             'inference-reservations/stop-service',
             {
                 method: 'POST',
-                body: JSON.stringify({ reservationId: reservation.id, resourceContext, force: true }),
+                body: JSON.stringify({ reservationId: reservation.id, resourceContext, force: true, actorUserId: user.id }),
             },
             undefined,
             Math.max(1000, Number(process.env.MEDFLOW_RESOURCE_STOP_PROCESS_TIMEOUT_MS || 60000)),
@@ -1279,11 +1280,29 @@ export class TrainingResourceService {
         );
     }
 
+    static async inferenceAllocationForRuntime(reservationId: string, runtimeNodeId: string) {
+        const reservation = await TrainingReservationTable.findOne({ where: { id: reservationId } });
+        if (!reservation || !isInferenceReservation(reservation) ||
+            ![TrainingReservationStatus.RESERVED, TrainingReservationStatus.RUNNING].includes(reservation.status) ||
+            !(Date.parse(reservation.expiresAt) > Date.now())) {
+            throw new TRPCError({ code: 'FORBIDDEN', message: 'An active inference reservation is required for this Runtime node' });
+        }
+        const allocation = await TrainingReservationNodeTable.findOne({
+            where: { reservationId, nodeId: runtimeNodeId },
+        });
+        if (!allocation?.gpuIndexes.length) {
+            throw new TRPCError({ code: 'FORBIDDEN', message: 'Inference reservation is not allocated to this Runtime node' });
+        }
+        return reservation;
+    }
+
     private static async renewForRuntimeUnlocked(reservationId: string, runtimeNodeId: string) {
         const reservation = await TrainingReservationTable.findOne({ where: { id: reservationId } });
         if (!reservation) throw new Error('训练预约不存在');
         if (reservation.homeNodeId !== runtimeNodeId) {
-            throw new Error('当前 Runtime 无权续期该训练预约');
+            // An allocated inference worker renews while copying a large model.
+            // This does not grant release rights or access to training reservations.
+            await this.inferenceAllocationForRuntime(reservationId, runtimeNodeId);
         }
         if (![TrainingReservationStatus.RESERVED, TrainingReservationStatus.RUNNING].includes(reservation.status)) {
             throw new Error('当前训练预约状态不允许续期');

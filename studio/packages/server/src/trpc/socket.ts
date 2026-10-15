@@ -167,6 +167,9 @@ function extractRuntimeErrorMessage(payload: Record<string, any>): string {
 
 function formatRuntimeErrorMessage(rawMessage: string): string {
   const lowerMessage = rawMessage.toLowerCase();
+  if (lowerMessage.includes("runtime stream interrupted: terminated")) {
+    return "请求连接已中断，后台任务可能仍在准备或已经启动。请先查询任务状态，确认没有运行中的任务后再重试。";
+  }
   const isConnectionError =
     lowerMessage.includes("apiconnectionerror") ||
     lowerMessage.includes("connection error") ||
@@ -1687,6 +1690,8 @@ export class SocketManager {
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
+    const streamStartedAt = Date.now();
+    let lastBridgeChunkAt = streamStartedAt;
     let buffer = "";
     let assistantContentText = "";
     let assistantMetadata: object = {};
@@ -1803,6 +1808,7 @@ export class SocketManager {
           if (done) {
             break;
           }
+          lastBridgeChunkAt = Date.now();
 
           buffer += decoder.decode(value, { stream: true });
           const events = buffer.split(/\r?\n\r?\n/);
@@ -1818,6 +1824,13 @@ export class SocketManager {
       } catch (error) {
         const errorMessage =
           error instanceof Error ? error.message : String(error);
+        console.warn("[RuntimeBridge] Stream read failed", {
+          runId,
+          elapsedMs: Date.now() - streamStartedAt,
+          idleMs: Date.now() - lastBridgeChunkAt,
+          aborted: controller.signal.aborted,
+          errorMessage,
+        });
         const isTerminatedStream = errorMessage.toLowerCase().includes("terminated");
         const hasAssistantProgress =
           assistantContentText.trim().length > 0 ||

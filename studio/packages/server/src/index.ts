@@ -10,6 +10,7 @@ import { promptUser } from '../../shared/src/utils/terminal';
 import { initializeDatabase } from './database';
 import { OtelGrpcServer } from './otel/grpc-server';
 import { managementRefreshScheduler } from './services/managementRefreshScheduler';
+import { downloadExperimentLog } from './services/experimentLogDownload';
 import otelRouter from './otel/router';
 import { appRouter, createContext } from './trpc/router';
 import { SocketManager } from './trpc/socket';
@@ -102,6 +103,7 @@ async function initializeServer() {
         managementRefreshScheduler.start();
 
         // Set TRPC router
+        app.get('/api/experiments/:experimentId/attempts/:attemptId/logs/:sourceId/download', downloadExperimentLog);
         app.use(
             '/trpc',
             trpcExpress.createExpressMiddleware({

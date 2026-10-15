@@ -9,6 +9,10 @@ import traceback
 from typing import Any, Literal, Optional
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
+from .environment import load_runtime_environment
+
+load_runtime_environment()
+
 import uvicorn
 import yaml
 from fastapi import FastAPI, HTTPException, Request
@@ -28,6 +32,9 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 from . import tools as ops_tools
+from .experiment_records import experiment_configuration_error
+from .experiment_runtime import runtime_credentials
+from .runtime_configuration import authorized_backend, forward_configuration
 from .admin_manager import (
     admin_apply_benchmark_stop,
     admin_apply_cleanup,
@@ -132,6 +139,46 @@ app = FastAPI(title="Inference Ops", version="1")
 INFERENCE_OPS_AUTH_MODE = inference_ops_auth_mode()
 INFERENCE_OPS_API_TOKEN = inference_ops_api_token()
 PUBLIC_ENDPOINTS = {"/healthz", "/readyz"}
+
+
+def runtime_configuration_target(node_id: str) -> str:
+    token = set_current_request_resource_context({"runtime_node_id": node_id})
+    try:
+        _, node = ops_tools.resolve_node_config(node_id)
+        return node.get("TOOL_URL") or ops_tools.get_node_tool_url(node.get("URL", ""))
+    finally:
+        reset_current_request_resource_context(token)
+
+
+@app.get("/runtime/config/status")
+def runtime_configuration_status(runtime_node_id: str = ""):
+    if AGENT_ROLE == "controller":
+        if not runtime_node_id or not INFERENCE_OPS_API_TOKEN:
+            return {"configured": False, "runtime_node_id": "", "source": "controller"}
+        try:
+            return forward_configuration(runtime_configuration_target(runtime_node_id), INFERENCE_OPS_API_TOKEN)
+        except ValueError:
+            raise HTTPException(status_code=502, detail="无法读取目标 worker 初始化状态") from None
+    runtime_credentials.current_node_id(ops_tools.STATE_DIR)
+    return runtime_credentials.runtime_status(ops_tools.STATE_DIR)
+
+
+@app.post("/runtime/config")
+async def initialize_runtime_configuration(request: Request):
+    if not authorized_backend(request.headers.get("authorization", ""), INFERENCE_OPS_API_TOKEN):
+        raise HTTPException(status_code=403, detail="运行时初始化仅允许持有服务 Token 的后端；本机可使用 Docker 配置通道")
+    body = await request.body()
+    if len(body) > 16384:
+        raise HTTPException(status_code=413, detail="运行时初始化请求过大")
+    try:
+        values = runtime_credentials.validate(json.loads(body))
+        if AGENT_ROLE == "controller":
+            return forward_configuration(runtime_configuration_target(values["runtime_node_id"]), INFERENCE_OPS_API_TOKEN, values)
+        result = runtime_credentials.initialize(values, ops_tools.STATE_DIR)
+        runtime_credentials.current_node_id(ops_tools.STATE_DIR)
+        return result
+    except (ValueError, OSError):
+        raise HTTPException(status_code=409, detail="运行时初始化配置无效、与部署配置冲突或已绑定其他节点；请检查后端配置") from None
 
 
 @app.middleware("http")
@@ -277,6 +324,10 @@ def readyz():
             missing.append(f"{label}:{path}")
     if AGENT_ROLE not in {"controller", "worker", "both"}:
         missing.append(f"ROLE:{AGENT_ROLE}")
+    if AGENT_ROLE in {"worker", "both"}:
+        experiment_error = experiment_configuration_error()
+        if experiment_error:
+            missing.append(experiment_error)
     if not os.path.isdir(ops_tools.STATE_DIR) or not os.access(
         ops_tools.STATE_DIR, os.W_OK
     ):
@@ -296,6 +347,8 @@ def readyz():
         "service": "inference-ops",
         "role": AGENT_ROLE,
         "auth_mode": INFERENCE_OPS_AUTH_MODE,
+        "runtime_node_id": os.getenv("MEDFLOW_RESOURCE_NODE_ID", "").strip(),
+        "runtime_launch_id": os.getenv("MEDFLOW_INFERENCE_LAUNCH_ID", "").strip(),
     }
 
 def initialize_worker_node_config() -> None:
@@ -319,9 +372,19 @@ def initialize_worker_node_config() -> None:
             f"{configured_ip or 'empty'} -> {worker_ip}; source config unchanged",
             flush=True,
         )
+@app.on_event('shutdown')
+def close_experiment_workers() -> None:
+    from .experiment_records import close_workers
+    close_workers()
+
+
 @app.on_event("startup")
 def initialize_api_worker_node_config() -> None:
     os.makedirs(ops_tools.STATE_DIR, exist_ok=True)
+    os.environ.setdefault("INFERENCE_OPS_STATE_DIR", ops_tools.STATE_DIR)
+    runtime_credentials.current_node_id(ops_tools.STATE_DIR)
+    from .experiment_records import resume_workers
+    resume_workers(ops_tools.STATE_DIR)
     initialize_worker_node_config()
     if INFERENCE_OPS_AUTH_MODE == "trusted_network":
         print(
@@ -1092,7 +1155,13 @@ def llm_node(state: MessagesState):
                 "5. 当请求用户角色为 admin，且用户意图是管理员维护、清理本地残留资源、查看全部实例、跨用户停止任务时，可以调用 admin_* 工具。\n"
                 "6. 管理员说预览/查看/列出时只能调用 admin_*_preview 或 admin_*_list；只有明确说确认/执行/应用时才调用 admin_*_apply。\n"
                 "7. 普通用户不得调用 admin_* 工具；普通用户预览停止自己的实例或 benchmark 时，使用 service_instance_stop_preview、benchmark_stop_preview 或对应 node_*_preview 工具。\n"
-                "8. benchmark_stop/node_benchmark_stop 是实际停止操作；用户只说预览/查看时禁止调用，必须等用户明确说确认/执行/应用后才能调用。"
+                "8. benchmark_stop/node_benchmark_stop 是实际停止操作；用户只说预览/查看时禁止调用，必须等用户明确说确认/执行/应用后才能调用。\n"
+                "9. 普通启动推理请求调用 service_start()/node_service_start(node=...)，让工具按模型结构、显存和资源池边界自动选择 GPU 与 TP。"
+                "禁止把配置草稿的 CUDA_VISIBLE_DEVICES、TENSOR_PARALLEL_SIZE 或 resource_context 中的卡数复制为显式启动参数；"
+                "资源池 assigned_gpus 是可用边界，不表示必须全部使用。只有用户明确指定本次 GPU 时才传 gpu_ids。"
+                "\n10. config_show/config_check 返回用户配置草稿，不代表已运行实例或自动分配结果；描述时必须标明草稿。"
+                "普通启动会自动选择 GPU/TP，不能因草稿 TP 不兼容就断言本次自动启动失败或自行调用 config_update。"
+                "service_start 返回用户身份、实验记录、凭证等错误时，应报告该错误，禁止通过修改 GPU/TP 草稿修复无关问题。"
             )
         )
     ]
